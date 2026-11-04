@@ -25,3 +25,6 @@ tmp/
 # Generated data / experiment artifacts
 *.ply
 *.npz
+
+# Default 3DGS training outputs
+/output/
