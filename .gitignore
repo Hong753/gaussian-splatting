@@ -1,8 +1,27 @@
-*.pyc
-.vscode
-output
-build
-diff_rasterization/diff_rast.egg-info
-diff_rasterization/dist
-tensorboard_3d
-screenshots
+# Python cache / bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python packaging / build artifacts
+build/
+dist/
+*.egg-info/
+PKG-INFO
+
+# Native / CUDA extension build outputs
+*.so
+*.o
+*.out
+
+# IDE / editor
+.vscode/
+.spyproject/
+
+# Temporary files
+tmp/
+*.dump
+
+# Generated data / experiment artifacts
+*.ply
+*.npz

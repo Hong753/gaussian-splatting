@@ -1,0 +1,8 @@
+open3d
+plyfile
+opencv-python
+lpips
+trimesh
+scikit-image
+pycolmap==3.10.0
+hatchling
