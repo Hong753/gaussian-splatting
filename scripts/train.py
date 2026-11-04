@@ -14,9 +14,9 @@ import sys
 
 
 # Editable defaults, in the same style as the PGSR scripts.
-DATA_ROOT = Path("/workspace/colmap_scenes/DTU/dtu")
+DATA_ROOT = Path("/data/scene")
 SCENES = []  # e.g. ["scan65", "scan69"]
-OUTPUT_ROOT = Path("output")
+OUTPUT_ROOT = Path("/data/3dgs_outputs")
 RUN_NAME = "3dgs"
 GPU_ID = "0"
 ITERATIONS = 30_000
