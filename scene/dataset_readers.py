@@ -142,7 +142,8 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
+def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8,
+                        keyframe_manifest=""):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -199,6 +200,22 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
 
     train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
     test_cam_infos = [c for c in cam_infos if c.is_test]
+
+    if keyframe_manifest:
+        with open(keyframe_manifest, "r") as f:
+            manifest = json.load(f)
+        selected = manifest["selected_images"]
+        selected_set = set(selected)
+        if len(selected) != len(selected_set):
+            raise ValueError("Keyframe manifest contains duplicate image names")
+        available = {c.image_name for c in train_cam_infos}
+        missing = selected_set - available
+        if missing:
+            raise ValueError(f"Keyframe manifest includes images outside the training split: {sorted(missing)[:5]}")
+        train_cam_infos = [c for c in train_cam_infos if c.image_name in selected_set]
+        if not train_cam_infos:
+            raise ValueError("Keyframe manifest selects no training cameras")
+        print(f"Using {len(train_cam_infos)} selected training cameras; keeping {len(test_cam_infos)} test cameras")
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 

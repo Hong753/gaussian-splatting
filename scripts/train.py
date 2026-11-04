@@ -24,6 +24,8 @@ RESOLUTION = -1  # -1: Graphdeco automatic resolution; 1: full resolution.
 IMAGES = "images"
 DATA_DEVICE = "cuda"
 EVAL = False
+SELECT_KEYFRAMES = False
+KEYFRAME_GROUP_SIZE = 3
 EXTRA_ARGS = []  # e.g. ["--save_iterations", "7000", "15000", "30000"]
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -45,6 +47,10 @@ def main(argv=None):
     parser.add_argument("--images", default=IMAGES, help="Image folder relative to each scene")
     parser.add_argument("--data-device", choices=["cuda", "cpu"], default=DATA_DEVICE)
     parser.add_argument("--eval", action="store_true", default=EVAL, help="Reserve test views instead of training on all views")
+    parser.add_argument("--select-keyframes", action="store_true", default=SELECT_KEYFRAMES,
+                        help="Select the sharpest registered training image per consecutive group")
+    parser.add_argument("--keyframe-group-size", type=int, default=KEYFRAME_GROUP_SIZE)
+    parser.add_argument("--selection-only", action="store_true", help="Select keyframes without launching training")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without starting training")
     parser.add_argument("--allow-existing", action="store_true", help="Allow training in a non-empty output directory")
     parser.add_argument("extra_args", nargs=argparse.REMAINDER, help="Native train.py options after --")
@@ -56,6 +62,10 @@ def main(argv=None):
         parser.error("--iterations must be positive")
     if args.resolution == 0 or args.resolution < -1:
         parser.error("--resolution must be -1 or a positive integer")
+    if args.keyframe_group_size < 1:
+        parser.error("--keyframe-group-size must be positive")
+    if args.selection_only and not args.select_keyframes:
+        parser.error("--selection-only requires --select-keyframes")
     if args.name in ("", ".", "..") or Path(args.name).name != args.name:
         parser.error("--name must be a single directory name")
     if any(scene in ("", ".", "..") or Path(scene).name != scene for scene in args.scenes):
@@ -70,6 +80,9 @@ def main(argv=None):
     if any(x in ("-s", "--source_path", "-m", "--model_path") or
            x.startswith(("--source_path=", "--model_path=")) for x in [*EXTRA_ARGS, *extra]):
         parser.error("Set scene and output paths using launcher options, not extra train.py arguments")
+    if args.select_keyframes and any(x in ("--eval", "--train_test_exp", "-i", "--images", "--keyframe_manifest") or
+            x.startswith(("--images=", "--keyframe_manifest=")) for x in [*EXTRA_ARGS, *extra]):
+        parser.error("With keyframe selection, use launcher --eval/--images and do not pass --train_test_exp or --keyframe_manifest")
 
     root = args.data_root.expanduser().resolve()
     out_root = args.output_root.expanduser()
@@ -84,6 +97,8 @@ def main(argv=None):
             parser.error(f"Scene folder does not exist: {source}")
         if not ((source / "sparse" / "0").is_dir() or (source / "transforms_train.json").is_file()):
             parser.error(f"Expected COLMAP sparse/0 or transforms_train.json in {source}")
+        if args.select_keyframes and not (source / "sparse" / "0").is_dir():
+            parser.error("Keyframe selection currently supports COLMAP scenes only")
         if output.exists() and not output.is_dir():
             parser.error(f"Output path is not a directory: {output}")
         if output.is_dir() and any(output.iterdir()) and not args.allow_existing:
@@ -93,13 +108,28 @@ def main(argv=None):
                "-i", args.images, "--data_device", args.data_device]
         if args.eval:
             cmd.append("--eval")
+        if args.select_keyframes:
+            cmd.extend(["--keyframe_manifest", str(output / "keyframes.json")])
         cmd.extend(EXTRA_ARGS)
         cmd.extend(extra)
-        jobs.append((scene, cmd))
+        jobs.append((scene, source, output, cmd))
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = args.gpu
-    for scene, cmd in jobs:
+    for scene, source, output, cmd in jobs:
+        if args.select_keyframes:
+            if args.dry_run:
+                print(f"\n[{scene}] Would select the sharpest frame per {args.keyframe_group_size} "
+                      f"registered training frames into {output / 'keyframes.json'}", flush=True)
+            else:
+                from keyframes import select_keyframes
+                try:
+                    select_keyframes(source, args.images, output, args.keyframe_group_size, args.eval)
+                except (OSError, ValueError, ImportError) as exc:
+                    print(f"Keyframe selection failed for {scene}: {exc}", file=sys.stderr)
+                    return 1
+        if args.selection_only:
+            continue
         print(f"\n[{scene}] CUDA_VISIBLE_DEVICES={shlex.quote(args.gpu)} {shlex.join(cmd)}", flush=True)
         if args.dry_run:
             continue
