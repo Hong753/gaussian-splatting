@@ -1,6 +1,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import shutil
 import struct
 import sys
 import tempfile
@@ -71,6 +72,29 @@ class KeyframeTests(unittest.TestCase):
         binary.write_bytes(binary.read_bytes()[:-1])
         with self.assertRaisesRegex(ValueError, "Truncated"):
             keyframes.registered_names(self.scene)
+
+    def test_flat_sparse_and_sparse_zero_precedence(self):
+        nested = self.model
+        flat = self.scene / "sparse"
+        shutil.move(nested / "images.txt", flat / "images.txt")
+        shutil.move(nested / "cameras.txt", flat / "cameras.txt")
+        self.assertEqual(keyframes.colmap_model_dir(self.scene), flat)
+        self.assertEqual(len(keyframes.registered_names(self.scene)), 10)
+        # An empty sparse/0 must not mask a complete flat reconstruction.
+        self.assertTrue(nested.is_dir())
+        (nested / "cameras.txt").write_text("placeholder")
+        (nested / "images.txt").write_text("1 1 0 0 0 0 0 0 1 nested.png\n\n")
+        self.assertEqual(keyframes.colmap_model_dir(self.scene), nested)
+        self.assertEqual(keyframes.registered_names(self.scene), ["nested.png"])
+        (nested / "images.txt").unlink()
+        (nested / "cameras.txt").unlink()
+        (flat / "cameras.bin").write_bytes(b"placeholder")
+        with (flat / "images.bin").open("wb") as file:
+            file.write(struct.pack("<Q", 1))
+            file.write(struct.pack("<i7di", 1, 1, 0, 0, 0, 0, 0, 0, 1))
+            file.write(b"binary.png\0")
+            file.write(struct.pack("<Q", 0))
+        self.assertEqual(keyframes.registered_names(self.scene), ["binary.png"])
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import struct
+from utils.colmap_paths import colmap_model_dir
 
 
 def _read_exact(file, count):
@@ -17,7 +18,7 @@ def _read_exact(file, count):
 
 def registered_names(source):
     """Read only image names; skip the potentially huge COLMAP observation arrays."""
-    model = source / "sparse" / "0"
+    model = colmap_model_dir(source)
     binary = model / "images.bin"
     text = model / "images.txt"
     names = []

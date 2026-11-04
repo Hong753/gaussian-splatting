@@ -16,6 +16,7 @@ from typing import NamedTuple
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
+from utils.colmap_paths import colmap_model_dir
 import numpy as np
 import json
 from pathlib import Path
@@ -144,18 +145,19 @@ def storePly(path, xyz, rgb):
 
 def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8,
                         keyframe_manifest=""):
+    model_dir = colmap_model_dir(path)
     try:
-        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
-        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
+        cameras_extrinsic_file = os.path.join(model_dir, "images.bin")
+        cameras_intrinsic_file = os.path.join(model_dir, "cameras.bin")
         cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
     except:
-        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.txt")
-        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.txt")
+        cameras_extrinsic_file = os.path.join(model_dir, "images.txt")
+        cameras_intrinsic_file = os.path.join(model_dir, "cameras.txt")
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
-    depth_params_file = os.path.join(path, "sparse/0", "depth_params.json")
+    depth_params_file = os.path.join(model_dir, "depth_params.json")
     ## if depth_params_file isnt there AND depths file is here -> throw error
     depths_params = None
     if depths != "":
@@ -186,7 +188,7 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8,
             cam_names = sorted(cam_names)
             test_cam_names_list = [name for idx, name in enumerate(cam_names) if idx % llffhold == 0]
         else:
-            with open(os.path.join(path, "sparse/0", "test.txt"), 'r') as file:
+            with open(os.path.join(model_dir, "test.txt"), 'r') as file:
                 test_cam_names_list = [line.strip() for line in file]
     else:
         test_cam_names_list = []
@@ -219,9 +221,9 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8,
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "sparse/0/points3D.ply")
-    bin_path = os.path.join(path, "sparse/0/points3D.bin")
-    txt_path = os.path.join(path, "sparse/0/points3D.txt")
+    ply_path = os.path.join(model_dir, "points3D.ply")
+    bin_path = os.path.join(model_dir, "points3D.bin")
+    txt_path = os.path.join(model_dir, "points3D.txt")
     if not os.path.exists(ply_path):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
         try:

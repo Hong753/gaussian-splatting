@@ -29,6 +29,8 @@ KEYFRAME_GROUP_SIZE = 3
 EXTRA_ARGS = []  # e.g. ["--save_iterations", "7000", "15000", "30000"]
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+from utils.colmap_paths import colmap_model_dir
 
 
 def main(argv=None):
@@ -95,9 +97,14 @@ def main(argv=None):
         output = out_root / scene / args.name
         if not source.is_dir():
             parser.error(f"Scene folder does not exist: {source}")
-        if not ((source / "sparse" / "0").is_dir() or (source / "transforms_train.json").is_file()):
-            parser.error(f"Expected COLMAP sparse/0 or transforms_train.json in {source}")
-        if args.select_keyframes and not (source / "sparse" / "0").is_dir():
+        try:
+            colmap_model_dir(source)
+            has_colmap = True
+        except FileNotFoundError as exc:
+            has_colmap = False
+            if args.select_keyframes or not (source / "transforms_train.json").is_file():
+                parser.error(str(exc))
+        if args.select_keyframes and not has_colmap:
             parser.error("Keyframe selection currently supports COLMAP scenes only")
         if output.exists() and not output.is_dir():
             parser.error(f"Output path is not a directory: {output}")
