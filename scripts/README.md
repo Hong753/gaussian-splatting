@@ -12,7 +12,14 @@ The launcher trains scenes sequentially, with outputs in
 `OUTPUT_ROOT/SCENE/NAME`. It uses the active Python environment and the native
 `train.py` implementation. The scene must have a COLMAP `sparse/0` or `sparse` model and
 images, or a supported NeRF synthetic dataset. Use `--dry-run` to check the
-commands, and `--help` for options. Pass additional native options after `--`:
+commands, and `--help` for options.
+
+Scenes may be nested paths relative to `--data-root`, such as
+`--scenes orange_4F/1_full`; this preserves that path under the output root.
+If `--data-root` itself is a scene, use `--scenes .`; its folder name is used
+as the output scene name.
+
+Pass additional native options after `--`:
 
 ```bash
 python scripts/train.py --scenes scan65 -- --antialiasing

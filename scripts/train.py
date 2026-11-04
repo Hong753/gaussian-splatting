@@ -39,7 +39,8 @@ def main(argv=None):
         epilog="Pass extra native train.py options after --; e.g. -- --antialiasing",
     )
     parser.add_argument("--data-root", type=Path, default=DATA_ROOT, help="Parent directory containing scene folders")
-    parser.add_argument("--scenes", nargs="+", default=SCENES, help="Scene folder names under --data-root")
+    parser.add_argument("--scenes", nargs="+", default=SCENES,
+                        help="Scene paths relative to --data-root; use . for --data-root itself")
     parser.add_argument("--output-root", type=Path, default=OUTPUT_ROOT, help="Outputs go to ROOT/SCENE/NAME")
     parser.add_argument("--name", default=RUN_NAME, help="Experiment name")
     parser.add_argument("--gpu", default=GPU_ID, help="GPU ID passed through CUDA_VISIBLE_DEVICES")
@@ -70,10 +71,12 @@ def main(argv=None):
         parser.error("--selection-only requires --select-keyframes")
     if args.name in ("", ".", "..") or Path(args.name).name != args.name:
         parser.error("--name must be a single directory name")
-    if any(scene in ("", ".", "..") or Path(scene).name != scene for scene in args.scenes):
-        parser.error("Each scene must be a single directory name under --data-root")
-    if len(args.scenes) != len(set(args.scenes)):
-        parser.error("Scene names must be unique")
+    scene_paths = [Path(scene) for scene in args.scenes]
+    if any(not scene or path.is_absolute() or ".." in path.parts
+           for scene, path in zip(args.scenes, scene_paths)):
+        parser.error("Scene paths must be relative to --data-root and must not contain '..'")
+    if len(scene_paths) != len(set(scene_paths)):
+        parser.error("Scene paths must be unique")
 
     extra = args.extra_args
     if extra and extra[0] == "--":
@@ -87,14 +90,19 @@ def main(argv=None):
         parser.error("With keyframe selection, use launcher --eval/--images and do not pass --train_test_exp or --keyframe_manifest")
 
     root = args.data_root.expanduser().resolve()
+    if Path(".") in scene_paths and not root.name:
+        parser.error("Cannot derive an output scene name from the filesystem root")
     out_root = args.output_root.expanduser()
     if not out_root.is_absolute():
         out_root = REPO_ROOT / out_root
     out_root = out_root.resolve()
     jobs = []
-    for scene in args.scenes:
-        source = root / scene
-        output = out_root / scene / args.name
+    output_scenes = [Path(root.name) if path == Path(".") else path for path in scene_paths]
+    if len(output_scenes) != len(set(output_scenes)):
+        parser.error("Scene paths resolve to the same output directory")
+    for scene, scene_path, output_scene in zip(args.scenes, scene_paths, output_scenes):
+        source = root / scene_path
+        output = out_root / output_scene / args.name
         if not source.is_dir():
             parser.error(f"Scene folder does not exist: {source}")
         try:
