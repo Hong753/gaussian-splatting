@@ -44,12 +44,7 @@ conda install spyder -y
 pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
 pip install --no-build-isolation git+https://github.com/camenduru/simple-knn
-pip install --no-build-isolation git+https://github.com/ByteDance-Seed/depth-anything-3.git
-pip install --no-build-isolation submodules/diff-plane-rasterization-ambisur
-
-# DA3 priors
-bash scripts/run_da3.sh /workspace/colmap_scenes/DTU/dtu 50000 0.01
-bash scripts/run_da3.sh /workspace/colmap_scenes/TnT 500000 0.05
+pip install --no-build-isolation submodules/diff-gaussian-rasterization
 ```
 
 ## Funding and Acknowledgments
