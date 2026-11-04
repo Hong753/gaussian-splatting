@@ -35,6 +35,9 @@ Abstract: *Radiance Field methods have recently revolutionized novel-view synthe
 git clone git@github.com:Hong753/gaussian-splatting.git
 cd gaussian-splatting
 
+# Initialize the rasterizer and its nested dependencies (e.g. GLM).
+git submodule update --init --recursive -- submodules/diff-gaussian-rasterization
+
 conda create -n 3dgs python=3.12 -y
 conda activate 3dgs
 
