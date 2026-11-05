@@ -20,6 +20,23 @@ class TrainLauncherTests(unittest.TestCase):
         (model / "cameras.bin").touch()
         self.output = Path(self.temp.name) / "output"
 
+    def test_absgs_routed_to_3dgs_with_aa(self):
+        result = self.run_launcher(self.root, "orange_4F/1_full", extra=(
+            "--absgs", "--absgs-split-threshold", "0.0004", "--no-exposure-compensation"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--antialiasing", result.stdout)
+        self.assertIn("--absgs", result.stdout)
+        self.assertIn("--absgs_split_threshold 0.0004", result.stdout)
+        self.assertNotIn("--train_test_exp", result.stdout)
+        self.assertIn("scripts/eval_all_frames.py", result.stdout)
+
+    def test_absgs_rejects_unsupported_model_optimizer_and_threshold(self):
+        for extra in (("--model-type", "scaffold", "--absgs"),
+                      ("--absgs", "--optimizer-type", "sparse_adam"),
+                      ("--absgs", "--absgs-split-threshold", "0")):
+            result = self.run_launcher(self.root, "orange_4F/1_full", extra=extra)
+            self.assertNotEqual(result.returncode, 0)
+
     def run_launcher(self, root, *scenes, extra=()):
         return subprocess.run(
             [sys.executable, str(SCRIPT), "--data-root", str(root),
@@ -146,6 +163,7 @@ class TrainLauncherTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

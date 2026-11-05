@@ -62,6 +62,7 @@ class GaussianModel:
         self.denom = torch.empty(0)
         self.optimizer = None
         self.percent_dense = 0
+        self.use_absgs = False
         self.spatial_lr_scale = 0
         self.setup_functions()
 
@@ -95,6 +96,8 @@ class GaussianModel:
         opt_dict, 
         self.spatial_lr_scale) = model_args
         self.training_setup(training_args)
+        if xyz_gradient_accum.shape[1] != self.xyz_gradient_accum.shape[1]:
+            raise ValueError("Checkpoint densification statistics do not match the requested AbsGS setting")
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
@@ -177,7 +180,8 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.use_absgs = getattr(training_args, "absgs", False)
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 2 if self.use_absgs else 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         l = [
@@ -402,7 +406,7 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 2 if self.use_absgs else 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
@@ -449,13 +453,20 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, max_grad_abs=None):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
+        clone_grads = grads[:, :1]
+        if self.use_absgs:
+            if max_grad_abs is None:
+                raise ValueError("AbsGS requires a split gradient threshold")
+            split_grads, split_threshold = grads[:, 1:2], max_grad_abs
+        else:
+            split_grads, split_threshold = clone_grads, max_grad
 
         self.tmp_radii = radii
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        self.densify_and_clone(clone_grads, max_grad, extent)
+        self.densify_and_split(split_grads, split_threshold, extent)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
@@ -469,5 +480,11 @@ class GaussianModel:
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+        grad = viewspace_point_tensor.grad
+        if self.use_absgs and (grad is None or grad.shape[-1] != 4):
+            raise RuntimeError("AbsGS requires the four-component absolute-gradient rasterizer")
+        self.xyz_gradient_accum[update_filter, :1] += torch.norm(grad[update_filter,:2], dim=-1, keepdim=True)
+        if self.use_absgs:
+            self.xyz_gradient_accum[update_filter, 1:2] += torch.norm(grad[update_filter,2:4], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+

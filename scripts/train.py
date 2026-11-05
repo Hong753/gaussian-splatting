@@ -79,6 +79,9 @@ def main(argv=None):
     parser.add_argument("--optimizer-type", choices=["default", "sparse_adam"], default=OPTIMIZER_TYPE,
                         help="sparse_adam requires the accelerated rasterizer")
     parser.add_argument("--depths", default=DEPTHS, help="Optional depth-prior directory for native depth regularization")
+    parser.add_argument("--absgs", action="store_true", help="Use AbsGS per-pixel absolute gradients for splitting (3DGS only)")
+    parser.add_argument("--absgs-split-threshold", type=float, default=0.0004,
+                        help="Absolute-gradient split threshold for AbsGS")
     parser.add_argument("--select-keyframes", action="store_true", default=SELECT_KEYFRAMES,
                         help="Select the sharpest registered training image per consecutive group")
     parser.add_argument("--keyframe-manifest", type=Path,
@@ -98,6 +101,10 @@ def main(argv=None):
 
     if not args.scenes:
         parser.error("Set SCENES in scripts/train.py or pass --scenes SCENE [SCENE ...]")
+    if args.absgs and (args.model_type != "3dgs" or args.optimizer_type != "default"):
+        parser.error("--absgs requires --model-type 3dgs and --optimizer-type default")
+    if args.absgs_split_threshold <= 0:
+        parser.error("--absgs-split-threshold must be positive")
     if args.model_type == "scaffold" and not args.evaluate_only:
         if args.eval or args.depths or args.optimizer_type != "default":
             parser.error("Scaffold-GS does not yet support --eval, --depths or sparse_adam")
@@ -215,6 +222,8 @@ def main(argv=None):
             cmd.extend(["--optimizer_type", args.optimizer_type])
         if args.depths:
             cmd.extend(["--depths", args.depths])
+        if args.absgs:
+            cmd.extend(["--absgs", "--absgs_split_threshold", str(args.absgs_split_threshold)])
         if (args.select_keyframes or args.keyframe_manifest) and not args.evaluate_only:
             cmd.extend(["--keyframe_manifest", str(output / "keyframes.json")])
         cmd.extend(EXTRA_ARGS)
@@ -277,6 +286,7 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 

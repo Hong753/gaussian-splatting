@@ -200,6 +200,41 @@ iteration for both; `-1` selects each model's latest, which may differ.
 
 
 
+### AbsGS densification
+
+`--absgs` enables the AbsGS homodirectional gradient for splitting large
+Gaussians. The signed gradients continue to guide cloning of small Gaussians;
+all other 3DGS settings, including the anti-aliasing filter, remain configurable.
+The absolute gradient is accumulated **per pixel inside the backward CUDA
+kernel**, before different contributions can cancel; taking the absolute
+value after ordinary backpropagation is not equivalent.
+
+The optional backend is a separate package adapted from Graphdeco rasterizer
+commit `9c5c2028f6fbee2be239bc4c9421ff894fe4fbe0` with the gradient
+accumulation approach of [AbsGS](https://github.com/TY424/AbsGS). It retains
+the Graphdeco rasterizer's non-commercial license, included in the backend
+folder. Build once in the existing environment:
+
+```bash
+python -m pip install --no-build-isolation --no-deps ./submodules/diff-gaussian-rasterization-abs
+CUDA_VISIBLE_DEVICES=0 python scripts/check_absgs.py
+```
+
+The build needs a CUDA toolkit, compiler, and GLM. It normally reuses
+`submodules/diff-gaussian-rasterization/third_party/glm`; if the GLM headers
+are elsewhere, set `ABSGS_GLM_PATH` to the folder containing `glm/glm.hpp`
+before installation. The smoke test checks AA rendering and signed/absolute
+gradient consistency against the installed standard rasterizer on a small
+scene; run it before starting a long experiment.
+
+The default `--absgs-split-threshold 0.0004` is the AbsGS repository's
+default; the standard clone threshold stays at 0.0002. This run retains the
+baseline's `percent_dense`, pruning, and opacity reset settings to isolate
+the splitting change; it is not a full reproduction of every AbsGS
+hyperparameter. The AbsGS backend uses the default optimizer, not sparse Adam.
+Saved models remain standard 3DGS PLYs, and the usual all-frame PSNR evaluator
+uses the normal 3DGS renderer.
+
 ### Monocular depth aligned to a registered point cloud
 
 `scripts/preprocess_depth.py` predicts single-image relative inverse depth
@@ -298,6 +333,7 @@ offsets, source segment, generated poses, AA flags, and model iterations. As
 with the original-trajectory comparison, models use base appearance without
 per-image exposure transforms. Set AA for each model explicitly and use an
 empty output folder.
+
 
 
 

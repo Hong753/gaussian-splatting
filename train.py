@@ -44,6 +44,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
+    if opt.absgs:
+        if opt.optimizer_type != "default":
+            raise ValueError("AbsGS currently supports the default optimizer only")
+        if opt.absgs_split_threshold <= 0:
+            raise ValueError("AbsGS split threshold must be positive")
+        try:
+            import diff_gaussian_rasterization_abs
+        except ImportError as exc:
+            raise ImportError("Install the separate AbsGS rasterizer; see scripts/README.md") from exc
+    pipe.absgs = opt.absgs
+    dataset.absgs = opt.absgs
+    dataset.absgs_split_threshold = opt.absgs_split_threshold
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -170,7 +182,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent,
+                                                size_threshold, radii,
+                                                max_grad_abs=opt.absgs_split_threshold if opt.absgs else None)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -287,4 +301,5 @@ if __name__ == "__main__":
 
     # All done
     print("\nTraining complete.")
+
 
