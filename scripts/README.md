@@ -337,8 +337,37 @@ with the original-trajectory comparison, models use base appearance without
 per-image exposure transforms. Set AA for each model explicitly and use an
 empty output folder.
 
+### Experimental LiDAR surface-aware AbsGS
 
+`preprocess_surface.py` estimates PCA normals, planarity confidence and local
+support radius in the exact vertex order of the input COLMAP `points3D.ply`.
+It stores a hash of the ordered coordinates; training rejects a mismatched PLY.
+Optionally set `--max-support` in scene units to reject large sparse patches.
+Fit once and reuse the same patch directory for multiple runs. PCA can mistake
+mixed or under-sampled neighborhoods for planes, so inspect confidence and
+renderings. The kd-tree uses substantial CPU memory for large point clouds.
 
+Pass the following native arguments after `--` in `scripts/train.py`:
 
+- `--surface_patches PATH --surface_mode tangent`: trusted initial Gaussians
+  are flattened and aligned, and AbsGS split offsets are projected into the
+  LiDAR tangent plane. Existing clone behavior is colocated. Others keep the
+  usual 3D behavior.
+- `--surface_patches PATH --surface_mode constrained`: additionally use
+  confidence-weighted losses on sampled visible Gaussians to penalize normal
+  displacement, orientation mismatch, and excessive thickness.
 
+Use `--absgs` in the launcher for either variant. The default threshold is
+`--surface_confidence 0.6`; `--surface_thickness 0.2` controls initial normal
+scale. The loss weights are `--surface_position_weight`,
+`--surface_normal_weight`, and `--surface_thickness_weight` (each 0.01 by
+default). Normal displacement is divided by local patch radius before
+squaring; the weights are experimental. `--surface_loss_samples` defaults to
+100000 visible Gaussians per step.
 
+References are inherited during splitting and cloning, pruned with their
+Gaussians, and saved in training checkpoints. Constraints are disabled beyond
+an inherited patch's support; there is no periodic reassociation. The final
+PLY remains a standard 3DGS model. `measure_lidar_distance.py` measures
+sampled Gaussian-center distance to the nearest input point, in scene units;
+this is not a point-to-surface distance and is sensitive to LiDAR density.

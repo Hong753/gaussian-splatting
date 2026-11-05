@@ -53,6 +53,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             import diff_gaussian_rasterization_abs
         except ImportError as exc:
             raise ImportError("Install the separate AbsGS rasterizer; see scripts/README.md") from exc
+    if opt.surface_mode not in ("off", "tangent", "constrained"):
+        raise ValueError("surface_mode must be off, tangent, or constrained")
+    if opt.surface_mode != "off":
+        if not opt.surface_patches or opt.optimizer_type != "default":
+            raise ValueError("Surface mode requires patch data and the default optimizer")
+        if not (0 <= opt.surface_confidence <= 1 and 0 < opt.surface_thickness <= 1):
+            raise ValueError("Invalid surface confidence or thickness")
+        if opt.surface_loss_samples < 1 or min(opt.surface_position_weight, opt.surface_normal_weight, opt.surface_thickness_weight) < 0:
+            raise ValueError("Invalid surface loss weights or sample count")
+    for name in ("surface_mode", "surface_patches", "surface_confidence", "surface_thickness",
+                 "surface_position_weight", "surface_normal_weight", "surface_thickness_weight", "surface_loss_samples"):
+        setattr(dataset, name, getattr(opt, name))
     pipe.absgs = opt.absgs
     dataset.absgs = opt.absgs
     dataset.absgs_split_threshold = opt.absgs_split_threshold
@@ -61,6 +73,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
+    if opt.surface_mode != "off":
+        gaussians.initialize_surface(opt.surface_patches, opt.surface_mode, opt.surface_confidence, opt.surface_thickness)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -153,6 +167,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
+        if opt.surface_mode == "constrained":
+            surface_loss = gaussians.surface_loss(visibility_filter, opt.surface_position_weight,
+                opt.surface_normal_weight, opt.surface_thickness_weight, opt.surface_loss_samples)
+            loss = loss + surface_loss
+            if tb_writer and iteration % 100 == 0:
+                tb_writer.add_scalar('train_loss_patches/surface_loss', surface_loss.item(), iteration)
         loss.backward()
 
         iter_end.record()

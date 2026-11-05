@@ -63,6 +63,8 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.use_absgs = False
+        self.surface_mode = "off"
+        self.surface_refs = None
         self.spatial_lr_scale = 0
         self.setup_functions()
 
@@ -80,9 +82,19 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self.surface_refs,
+            self.surface_mode,
         )
     
     def restore(self, model_args, training_args):
+        saved_surface_refs = model_args[12] if len(model_args) > 12 else None
+        saved_surface_mode = model_args[13] if len(model_args) > 13 else "off"
+        model_args = model_args[:12]
+        if saved_surface_refs is not None and saved_surface_mode != training_args.surface_mode:
+            raise ValueError("Checkpoint surface mode differs from requested mode")
+        if (saved_surface_refs is None) != (training_args.surface_mode == "off"):
+            raise ValueError("Checkpoint surface settings do not match requested surface mode")
+        self.surface_refs = saved_surface_refs
         (self.active_sh_degree, 
         self._xyz, 
         self._features_dc, 
@@ -178,7 +190,62 @@ class GaussianModel:
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
 
+    def initialize_surface(self, directory, mode, confidence_threshold=0.6, thickness=0.2):
+        """Attach immutable input-point patches and initialize trusted Gaussians thin."""
+        from pathlib import Path
+        from utils.surface_geometry import points_digest
+        directory = Path(directory)
+        metadata = json.loads((directory / "metadata.json").read_text())
+        xyz = self._xyz.detach().cpu().numpy()
+        if metadata.get("points") != len(xyz) or metadata.get("points_sha256_float32") != points_digest(xyz):
+            raise ValueError("Surface patches do not match the ordered input point cloud")
+        normal = torch.from_numpy(np.load(directory / "normals.npy")).to(self._xyz.device)
+        confidence = torch.from_numpy(np.load(directory / "confidence.npy")).to(self._xyz.device)
+        support = torch.from_numpy(np.load(directory / "support.npy")).to(self._xyz.device)
+        if normal.shape != self._xyz.shape or confidence.shape != self._xyz.shape[:1] or support.shape != confidence.shape:
+            raise ValueError("Invalid surface patch array shapes")
+        if not (torch.isfinite(normal).all() and torch.isfinite(confidence).all() and torch.isfinite(support).all()):
+            raise ValueError("Surface patches contain non-finite values")
+        confidence = torch.where((confidence >= confidence_threshold) & (support > 0), confidence, 0)
+        self.surface_refs = {"anchor": self._xyz.detach().clone(), "normal": normal,
+                             "confidence": confidence, "support": support}
+        self.surface_mode = mode
+        # Quaternion rotating the local +z axis onto the PCA normal (sign arbitrary).
+        # Flip normals with negative z to avoid the anti-parallel singularity.
+        normal = torch.where((normal[:, 2] < 0)[:, None], -normal, normal)
+        w = torch.sqrt(torch.clamp((1 + normal[:, 2]) * 0.5, min=1e-8))
+        quat = torch.stack((w, -normal[:, 1] / (2*w), normal[:, 0] / (2*w), torch.zeros_like(w)), dim=1)
+        trusted = confidence > 0
+        with torch.no_grad():
+            self._rotation[trusted] = quat[trusted]
+            self._scaling[trusted, 2] += np.log(thickness)
+        print(f"Surface patches: {int(trusted.sum())}/{len(trusted)} trusted; mode={mode}")
+
+    def surface_loss(self, visible, position_weight, normal_weight, thickness_weight, max_samples):
+        refs = self.surface_refs
+        idx = visible.reshape(-1)
+        if idx.numel() > max_samples:
+            idx = idx[torch.randint(idx.numel(), (max_samples,), device=idx.device)]
+        if idx.numel() == 0:
+            return self._xyz.sum() * 0
+        confidence = refs["confidence"][idx]
+        delta = self._xyz[idx] - refs["anchor"][idx]
+        normal = refs["normal"][idx]
+        support = refs["support"][idx].clamp_min(1e-8)
+        distance = (delta * normal).sum(-1)
+        tangential = delta - distance[:, None] * normal
+        confidence = confidence * (tangential.detach().norm(dim=1) <= support).to(confidence.dtype)
+        denominator = confidence.sum().clamp_min(1)
+        position = (confidence * (distance / support).square()).sum() / denominator
+        zaxis = build_rotation(self._rotation[idx])[:, :, 2]
+        alignment = (confidence * (1 - (zaxis * normal).sum(-1).square()).clamp_min(0)).sum() / denominator
+        scales = self.get_scaling[idx]
+        ratio = scales[:, 2] / scales[:, :2].amax(dim=1).clamp_min(1e-8)
+        thinness = (confidence * (ratio - 0.25).clamp_min(0).square()).sum() / denominator
+        return position_weight * position + normal_weight * alignment + thickness_weight * thinness
+
     def training_setup(self, training_args):
+        self.surface_mode = training_args.surface_mode
         self.percent_dense = training_args.percent_dense
         self.use_absgs = getattr(training_args, "absgs", False)
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 2 if self.use_absgs else 1), device="cuda")
@@ -361,6 +428,8 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
+        if self.surface_refs is not None:
+            self.surface_refs = {k: v[valid_points_mask] for k, v in self.surface_refs.items()}
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
         self.denom = self.denom[valid_points_mask]
@@ -389,7 +458,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_surface_refs=None):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -405,6 +474,10 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
+        if self.surface_refs is not None:
+            if new_surface_refs is None:
+                raise ValueError("Surface references are required for every new Gaussian")
+            self.surface_refs = {k: torch.cat((v, new_surface_refs[k]), dim=0) for k, v in self.surface_refs.items()}
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 2 if self.use_absgs else 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -423,15 +496,37 @@ class GaussianModel:
         means =torch.zeros((stds.size(0), 3),device="cuda")
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
-        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+        offsets = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1)
+        new_surface_refs = None
+        if self.surface_refs is not None:
+            new_surface_refs = {k: v[selected_pts_mask].repeat((N,) + (1,) * (v.ndim - 1)) for k, v in self.surface_refs.items()}
+            normals = new_surface_refs["normal"]
+            parent_delta = self.get_xyz[selected_pts_mask].repeat(N, 1) - new_surface_refs["anchor"]
+            parent_normal = (parent_delta * normals).sum(dim=1, keepdim=True) * normals
+            inside = (parent_delta - parent_normal).norm(dim=1) <= new_surface_refs["support"]
+            new_surface_refs["confidence"] = new_surface_refs["confidence"] * inside
+            trusted = new_surface_refs["confidence"] > 0
+            tangent = offsets - (offsets * normals).sum(dim=1, keepdim=True) * normals
+            offsets = torch.where(trusted[:, None], tangent, offsets)
+        new_xyz = offsets + self.get_xyz[selected_pts_mask].repeat(N, 1)
+        if new_surface_refs is not None:
+            # An inherited planar patch is only valid locally, particularly at edges/curves.
+            delta = new_xyz - new_surface_refs["anchor"]
+            normal_component = (delta * new_surface_refs["normal"]).sum(dim=1, keepdim=True) * new_surface_refs["normal"]
+            inside = (delta - normal_component).norm(dim=1) <= new_surface_refs["support"]
+            new_surface_refs["confidence"] = new_surface_refs["confidence"] * inside
         new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
+        if new_surface_refs is not None:
+            # Keep normal thickness on split; shrink only tangential scales.
+            trusted = new_surface_refs["confidence"] > 0
+            new_scaling[trusted, 2] = self._scaling[selected_pts_mask].repeat(N, 1)[trusted, 2]
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii, new_surface_refs)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -451,7 +546,10 @@ class GaussianModel:
 
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+        # The upstream clone is colocated, so its displacement is already tangent.
+        new_surface_refs = ({k: v[selected_pts_mask] for k, v in self.surface_refs.items()}
+                            if self.surface_refs is not None else None)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_surface_refs)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, max_grad_abs=None):
         grads = self.xyz_gradient_accum / self.denom

@@ -100,6 +100,14 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold = 0.0002
         self.absgs = False
         self.absgs_split_threshold = 0.0004
+        self.surface_mode = "off"
+        self.surface_patches = ""
+        self.surface_confidence = 0.6
+        self.surface_thickness = 0.2
+        self.surface_position_weight = 0.01
+        self.surface_normal_weight = 0.01
+        self.surface_thickness_weight = 0.01
+        self.surface_loss_samples = 100000
         self.depth_l1_weight_init = 1.0
         self.depth_l1_weight_final = 0.01
         self.random_background = False
