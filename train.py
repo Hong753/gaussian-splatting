@@ -270,6 +270,8 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
+    if args.model_type != "3dgs":
+        parser.error("Use scripts/train.py --model-type scaffold for Scaffold-GS")
     args.save_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)
@@ -285,3 +287,4 @@ if __name__ == "__main__":
 
     # All done
     print("\nTraining complete.")
+

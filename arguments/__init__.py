@@ -46,6 +46,10 @@ class ParamGroup:
 
 class ModelParams(ParamGroup): 
     def __init__(self, parser, sentinel=False):
+        self.model_type = "3dgs"
+        self.scaffold_voxel_size = 0.001
+        self.scaffold_n_offsets = 10
+        self.scaffold_feat_dim = 32
         self.sh_degree = 3
         self._source_path = ""
         self._model_path = ""
@@ -121,3 +125,4 @@ def get_combined_args(parser : ArgumentParser):
         if v != None:
             merged_dict[k] = v
     return Namespace(**merged_dict)
+

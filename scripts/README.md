@@ -95,3 +95,38 @@ to select a saved PLY instead of the latest. Evaluation can use substantial GPU
 memory and time. It overwrites prior PSNR files for the same saved iteration.
 Use a free GPU and evaluate an iteration after the model has finished saving.
 Pass `--no-eval-all-frames` to skip automatic evaluation for a new training run.
+
+
+### Scaffold-GS
+
+Select the anchor-based model with `--model-type scaffold` on `scripts/train.py`.
+The existing model remains `--model-type 3dgs` (the default). Scaffold-GS uses a
+separate model, renderer, and training loop. Keyframe selection, COLMAP data,
+CPU image storage, antialiasing, per-training-image exposure optimization, and
+all-frame PSNR are supported. The all-frame evaluator detects the model type from
+`cfg_args` and evaluates the base appearance without per-image exposure.
+
+Defaults follow the official Scaffold-GS model for 32-dimensional anchor features,
+10 offsets and a voxel size of 0.001. Override them with `--scaffold-feat-dim`,
+`--scaffold-n-offsets`, and `--scaffold-voxel-size`; voxel size is in COLMAP's
+coordinate units. The per-camera appearance embedding is disabled so unseen views
+have a well-defined appearance; optional exposure compensation is independent.
+The implementation adapts the [official Scaffold-GS source](https://github.com/city-super/Scaffold-GS)
+at commit `59c833b56bbbf510f3f64d40f81721995caced66`, under the 3DGS license.
+It uses PyTorch's `scatter_reduce_` instead of `torch_scatter` and a frustum
+prefilter compatible with this repository's rasterizer.
+
+A saved Scaffold model consists of anchor `point_cloud.ply` and the three MLP
+files in the same `point_cloud/iteration_N/` directory. This PLY is **not** an
+ordinary 3DGS PLY and cannot be opened directly in SuperSplat. Keep the entire
+iteration folder when moving a model. Live SIBR viewing, training resumption,
+depth regularization, held-out `--eval` training, and sparse Adam are not yet
+implemented for Scaffold-GS. The regular all-frame PSNR evaluation works.
+
+Example smoke run before longer training:
+
+```bash
+python scripts/train.py --data-root /path/to/data --scenes my_scene \
+  --model-type scaffold --name scaffold_smoke --gpu 0 --data-device cpu \
+  --select-keyframes --keyframe-group-size 15 --iterations 100 --no-eval-all-frames
+```

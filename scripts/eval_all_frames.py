@@ -92,8 +92,21 @@ def main():
     if selected is not None and not selected.issubset({c.image_name for c in cameras}):
         raise ValueError("Some selected training images are absent from the current COLMAP model")
 
-    gaussians = GaussianModel(cfg.get("sh_degree", 3))
-    gaussians.load_ply(str(ply))
+    model_type = cfg.get("model_type", "3dgs")
+    if model_type == "scaffold":
+        from models.scaffold_gaussian import ScaffoldGaussianModel
+        from models.scaffold_renderer import render as render_scaffold, prefilter_voxel
+        gaussians = ScaffoldGaussianModel(feat_dim=cfg.get("scaffold_feat_dim", 32),
+                                           n_offsets=cfg.get("scaffold_n_offsets", 10),
+                                           voxel_size=cfg.get("scaffold_voxel_size", 0.001),
+                                           update_init_factor=16, appearance_dim=0)
+        gaussians.load_ply(str(ply))
+        gaussians.eval()
+    elif model_type == "3dgs":
+        gaussians = GaussianModel(cfg.get("sh_degree", 3))
+        gaussians.load_ply(str(ply))
+    else:
+        raise ValueError(f"Unsupported saved model type: {model_type}")
     pipeline = SimpleNamespace(convert_SHs_python=False, compute_cov3D_python=False,
                                debug=False, antialiasing=args.antialiasing)
     camera_args = SimpleNamespace(resolution=cfg.get("resolution", -1), data_device="cpu", train_test_exp=False)
@@ -108,8 +121,12 @@ def main():
         writer.writerow(["image_name", "selected_for_training", "psnr_db"])
         for idx, info in enumerate(tqdm(cameras, desc="Evaluating all frames", unit="frame")):
             camera = loadCam(camera_args, idx, info, 1.0, False, False)
-            pred = render(camera, gaussians, pipeline, background, separate_sh=separate_sh,
-                          use_trained_exp=False)["render"].clamp(0, 1)
+            if model_type == "scaffold":
+                visible = prefilter_voxel(camera, gaussians, pipeline, background)
+                pred = render_scaffold(camera, gaussians, pipeline, background, visible_mask=visible)["render"].clamp(0, 1)
+            else:
+                pred = render(camera, gaussians, pipeline, background, separate_sh=separate_sh,
+                              use_trained_exp=False)["render"].clamp(0, 1)
             target = camera.original_image.to("cuda").clamp(0, 1)
             value = psnr(pred, target).mean().item()
             is_selected = (info.image_name in selected) if selected is not None else None
@@ -123,7 +140,7 @@ def main():
             del camera, pred, target
     means = {k: sums[k] / counts[k] if counts[k] else None for k in sums}
     means = {k: "inf" if value == float("inf") else value for k, value in means.items()}
-    summary = {"iteration": iteration, "source": str(source), "model": str(model),
+    summary = {"iteration": iteration, "source": str(source), "model": str(model), "model_type": model_type,
                "exposure_protocol": "base appearance; no per-image exposure applied",
                "antialiasing": args.antialiasing, "resolution_setting": camera_args.resolution,
                "selection_manifest": str(manifest_path) if manifest_name else None,
@@ -137,3 +154,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

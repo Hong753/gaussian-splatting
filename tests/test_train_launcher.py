@@ -76,6 +76,24 @@ class TrainLauncherTests(unittest.TestCase):
         bad = self.run_launcher(self.root, "orange_4F/1_full", extra=("--viewer-port", "65536"))
         self.assertNotEqual(bad.returncode, 0)
 
+    def test_scaffold_model_routes_to_separate_trainer(self):
+        result = self.run_launcher(self.root, "orange_4F/1_full", extra=(
+            "--model-type", "scaffold", "--scaffold-voxel-size", "0.02", "--scaffold-n-offsets", "5"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("models/train_scaffold.py", result.stdout)
+        self.assertIn("--model_type scaffold", result.stdout)
+        self.assertIn("--scaffold_voxel_size 0.02", result.stdout)
+        self.assertIn("--scaffold_n_offsets 5", result.stdout)
+        self.assertIn("--train_test_exp", result.stdout)
+        self.assertIn("scripts/eval_all_frames.py", result.stdout)
+
+    def test_scaffold_rejects_unsupported_depth_and_optimizer(self):
+        for option in (("--depths", "depth"), ("--optimizer-type", "sparse_adam"),
+                       ("--eval", "--no-exposure-compensation")):
+            result = self.run_launcher(self.root, "orange_4F/1_full", extra=("--model-type", "scaffold", *option))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Scaffold-GS does not yet support", result.stderr)
+
     def test_evaluate_only_reuses_output_without_training_or_selection(self):
         (self.output / "orange_4F/1_full/test").mkdir(parents=True)
         result = self.run_launcher(self.root, "orange_4F/1_full",
@@ -90,4 +108,5 @@ class TrainLauncherTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 
