@@ -24,6 +24,10 @@ RESOLUTION = -1  # -1: Graphdeco automatic resolution; 1: full resolution.
 IMAGES = "images"
 DATA_DEVICE = "cuda"
 EVAL = False
+ANTIALIASING = True
+EXPOSURE_COMPENSATION = True
+OPTIMIZER_TYPE = "default"  # sparse_adam requires the accelerated rasterizer.
+DEPTHS = ""  # Optional depth-prior directory; empty means RGB-only.
 SELECT_KEYFRAMES = False
 KEYFRAME_GROUP_SIZE = 3
 EXTRA_ARGS = []  # e.g. ["--save_iterations", "7000", "15000", "30000"]
@@ -36,7 +40,7 @@ from utils.colmap_paths import colmap_model_dir
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Train scenes sequentially. Edit defaults in this file or pass CLI options.",
-        epilog="Pass extra native train.py options after --; e.g. -- --antialiasing",
+        epilog="Pass additional native train.py options after --.",
     )
     parser.add_argument("--data-root", type=Path, default=DATA_ROOT, help="Parent directory containing scene folders")
     parser.add_argument("--scenes", nargs="+", default=SCENES,
@@ -50,6 +54,14 @@ def main(argv=None):
     parser.add_argument("--images", default=IMAGES, help="Image folder relative to each scene")
     parser.add_argument("--data-device", choices=["cuda", "cpu"], default=DATA_DEVICE)
     parser.add_argument("--eval", action="store_true", default=EVAL, help="Reserve test views instead of training on all views")
+    parser.add_argument("--antialiasing", action=argparse.BooleanOptionalAction, default=ANTIALIASING,
+                        help="Use the Graphdeco antialiasing filter (default: enabled)")
+    parser.add_argument("--exposure-compensation", action=argparse.BooleanOptionalAction,
+                        default=EXPOSURE_COMPENSATION,
+                        help="Optimize per-image exposure (default: enabled; incompatible with --eval)")
+    parser.add_argument("--optimizer-type", choices=["default", "sparse_adam"], default=OPTIMIZER_TYPE,
+                        help="sparse_adam requires the accelerated rasterizer")
+    parser.add_argument("--depths", default=DEPTHS, help="Optional depth-prior directory for native depth regularization")
     parser.add_argument("--select-keyframes", action="store_true", default=SELECT_KEYFRAMES,
                         help="Select the sharpest registered training image per consecutive group")
     parser.add_argument("--keyframe-group-size", type=int, default=KEYFRAME_GROUP_SIZE)
@@ -69,6 +81,8 @@ def main(argv=None):
         parser.error("--keyframe-group-size must be positive")
     if args.selection_only and not args.select_keyframes:
         parser.error("--selection-only requires --select-keyframes")
+    if args.eval and args.exposure_compensation:
+        parser.error("--eval requires --no-exposure-compensation: the native exposure flag changes the test split")
     if args.name in ("", ".", "..") or Path(args.name).name != args.name:
         parser.error("--name must be a single directory name")
     scene_paths = [Path(scene) for scene in args.scenes]
@@ -123,6 +137,16 @@ def main(argv=None):
                "-i", args.images, "--data_device", args.data_device]
         if args.eval:
             cmd.append("--eval")
+        if args.antialiasing:
+            cmd.append("--antialiasing")
+        if args.exposure_compensation:
+            # Graphdeco couples exposure optimization to --train_test_exp.
+            # With --eval off, this enables exposure without changing the split.
+            cmd.append("--train_test_exp")
+        if args.optimizer_type != "default":
+            cmd.extend(["--optimizer_type", args.optimizer_type])
+        if args.depths:
+            cmd.extend(["--depths", args.depths])
         if args.select_keyframes:
             cmd.extend(["--keyframe_manifest", str(output / "keyframes.json")])
         cmd.extend(EXTRA_ARGS)

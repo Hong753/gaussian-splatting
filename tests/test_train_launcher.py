@@ -20,11 +20,11 @@ class TrainLauncherTests(unittest.TestCase):
         (model / "cameras.bin").touch()
         self.output = Path(self.temp.name) / "output"
 
-    def run_launcher(self, root, *scenes):
+    def run_launcher(self, root, *scenes, extra=()):
         return subprocess.run(
             [sys.executable, str(SCRIPT), "--data-root", str(root),
              "--output-root", str(self.output), "--scenes", *scenes,
-             "--name", "test", "--select-keyframes", "--dry-run"],
+             "--name", "test", "--select-keyframes", "--dry-run", *extra],
             text=True, capture_output=True,
         )
 
@@ -33,6 +33,8 @@ class TrainLauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(str(self.scene), result.stdout)
         self.assertIn(str(self.output / "orange_4F/1_full/test/keyframes.json"), result.stdout)
+        self.assertIn("--antialiasing", result.stdout)
+        self.assertIn("--train_test_exp", result.stdout)
         self.assertFalse(self.output.exists())
 
     def test_data_root_itself_can_be_scene(self):
@@ -45,6 +47,22 @@ class TrainLauncherTests(unittest.TestCase):
                        ("orange_4F/1_full", "orange_4F//1_full")):
             with self.subTest(scenes=scenes):
                 self.assertNotEqual(self.run_launcher(self.root, *scenes).returncode, 0)
+
+    def test_eval_requires_disabling_exposure_to_preserve_split(self):
+        fail = self.run_launcher(self.root, "orange_4F/1_full", extra=("--eval",))
+        self.assertNotEqual(fail.returncode, 0)
+        self.assertIn("--no-exposure-compensation", fail.stderr)
+        ok = self.run_launcher(self.root, "orange_4F/1_full", extra=("--eval", "--no-exposure-compensation", "--no-antialiasing"))
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertIn("--eval", ok.stdout)
+        self.assertNotIn("--train_test_exp", ok.stdout)
+        self.assertNotIn("--antialiasing", ok.stdout)
+
+    def test_optional_depths_and_sparse_optimizer_are_forwarded(self):
+        result = self.run_launcher(self.root, "orange_4F/1_full", extra=("--optimizer-type", "sparse_adam", "--depths", "depth_maps"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--optimizer_type sparse_adam", result.stdout)
+        self.assertIn("--depths depth_maps", result.stdout)
 
 
 if __name__ == "__main__":

@@ -19,10 +19,25 @@ Scenes may be nested paths relative to `--data-root`, such as
 If `--data-root` itself is a scene, use `--scenes .`; its folder name is used
 as the output scene name.
 
+The launcher enables Graphdeco's anti-aliasing and exposure compensation by
+default. Use `--no-antialiasing` or `--no-exposure-compensation` to disable
+them. Exposure uses the native `--train_test_exp` option. Since that option
+changes the test split, `--eval` requires `--no-exposure-compensation`.
+For ordinary training without a held-out split, exposure uses the full image.
+
+Native `render.py` requires `--antialiasing` separately when rendering a model
+trained with anti-aliasing. Per-image exposures are saved to `exposure.json`;
+they are not baked into the Gaussian PLY.
+
+The default optimizer remains Graphdeco's regular Adam. Optionally specify
+`--optimizer-type sparse_adam` after installing the compatible accelerated
+rasterizer. Depth regularization is off unless `--depths` is supplied; it
+requires the appropriate depth maps and COLMAP depth parameters.
+
 Pass additional native options after `--`:
 
 ```bash
-python scripts/train.py --scenes scan65 -- --antialiasing
+python scripts/train.py --scenes scan65 -- --densify_grad_threshold 0.0001
 ```
 
 The launcher refuses to use a nonempty output directory unless
