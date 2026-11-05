@@ -130,3 +130,31 @@ python scripts/train.py --data-root /path/to/data --scenes my_scene \
   --model-type scaffold --name scaffold_smoke --gpu 0 --data-device cpu \
   --select-keyframes --keyframe-group-size 15 --iterations 100 --no-eval-all-frames
 ```
+
+
+### Interactive Scaffold-GS viewer
+
+Install the browser viewer dependency once in the existing `3dgs` environment:
+
+```bash
+python -m pip install 'viser==1.0.30'
+```
+
+Run `python scripts/view_scaffold.py --gpu 0 --port 8080` and open
+`http://127.0.0.1:8080` in a browser on the **same machine**. The viewer binds
+to localhost and the file picker browses the viewer machine's filesystem.
+Use `--browse-root /path/to/folder` to change the initial folder; it defaults to
+`/data/3dgs_outputs`. On a remote headless machine, forward the port over SSH
+from your computer (`ssh -L 8080:127.0.0.1:8080 USER@HOST`) and open the same
+URL in your local browser. A GPU on the machine running Python does the rendering.
+
+In the left panel, select a folder and click **Open selected** to navigate. Select
+`point_cloud.ply` and click **Open selected** to load it. Alternatively paste
+its full path and click **Load PLY path**. The PLY must be from a Scaffold run
+in this repository and have `opacity_mlp.pt`, `cov_mlp.pt`, and `color_mlp.pt`
+beside it; its model run directory must retain `cfg_args` and `cameras.json`.
+The starting camera comes from that file. Drag to orbit and scroll to zoom; use
+**Go to first training camera** to reset. Toggle AA to match training and adjust
+render width to trade quality for responsiveness. The viewer uses the base
+appearance without per-training-image exposure compensation. Rendering a saved
+iteration is separate from training; select a different PLY to inspect another.
