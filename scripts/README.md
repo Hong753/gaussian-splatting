@@ -69,3 +69,29 @@ Use `--selection-only` together with `--select-keyframes` to select without
 training. To train afterwards, run the same command without `--selection-only`
 and add `--allow-existing`; the existing matching manifest is reused. The
 option currently supports COLMAP scenes, not NeRF synthetic scenes.
+
+
+### PSNR on all registered COLMAP frames
+
+After training, the launcher evaluates the final saved PLY on every COLMAP-registered
+frame. It loads one image at a time and prints progress. Results are written under
+`<run>/psnr_all_frames/iteration_<N>/`: `per_frame.csv` contains one PSNR per
+frame and whether it was selected for training, and `summary.json` contains
+frame counts and mean per-image PSNR for all, selected, and unselected frames.
+The source images use the run's saved resolution setting. Failure to read a frame
+fails evaluation rather than silently changing the evaluated set.
+
+All frames are rendered **without** per-image exposure transforms, including
+training frames, so every image uses the same base-appearance protocol. This is
+not the same metric as the five-view exposure-adjusted training PSNR. Antialiasing
+is set from the launcher option; use `--no-antialiasing` for models trained without
+it. Mean over all frames includes training images and thus is not held-out PSNR.
+For a fair held-out comparison across runs, compare the same filenames excluded
+from every model's training selection.
+
+For a saved model (including a run already in progress), use the normal scene,
+output, name, and GPU arguments with `--evaluate-only`; add `--eval-iteration N`
+to select a saved PLY instead of the latest. Evaluation can use substantial GPU
+memory and time. It overwrites prior PSNR files for the same saved iteration.
+Use a free GPU and evaluate an iteration after the model has finished saving.
+Pass `--no-eval-all-frames` to skip automatic evaluation for a new training run.

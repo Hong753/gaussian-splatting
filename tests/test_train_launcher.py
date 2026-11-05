@@ -76,6 +76,18 @@ class TrainLauncherTests(unittest.TestCase):
         bad = self.run_launcher(self.root, "orange_4F/1_full", extra=("--viewer-port", "65536"))
         self.assertNotEqual(bad.returncode, 0)
 
+    def test_evaluate_only_reuses_output_without_training_or_selection(self):
+        (self.output / "orange_4F/1_full/test").mkdir(parents=True)
+        result = self.run_launcher(self.root, "orange_4F/1_full",
+                                   extra=("--evaluate-only", "--eval-iteration", "7000", "--no-antialiasing"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Would select", result.stdout)
+        self.assertIn("scripts/eval_all_frames.py", result.stdout)
+        self.assertIn("--iteration 7000", result.stdout)
+        self.assertIn("--no-antialiasing", result.stdout)
+        self.assertNotIn("--train_test_exp", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
+

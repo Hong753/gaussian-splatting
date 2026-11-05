@@ -31,6 +31,7 @@ OPTIMIZER_TYPE = "default"  # sparse_adam requires the accelerated rasterizer.
 DEPTHS = ""  # Optional depth-prior directory; empty means RGB-only.
 SELECT_KEYFRAMES = False
 KEYFRAME_GROUP_SIZE = 3
+EVAL_ALL_FRAMES = True
 EXTRA_ARGS = []  # e.g. ["--save_iterations", "7000", "15000", "30000"]
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -70,6 +71,12 @@ def main(argv=None):
                         help="Select the sharpest registered training image per consecutive group")
     parser.add_argument("--keyframe-group-size", type=int, default=KEYFRAME_GROUP_SIZE)
     parser.add_argument("--selection-only", action="store_true", help="Select keyframes without launching training")
+    parser.add_argument("--eval-all-frames", action=argparse.BooleanOptionalAction, default=EVAL_ALL_FRAMES,
+                        help="Evaluate every COLMAP frame after training (default: enabled)")
+    parser.add_argument("--evaluate-only", action="store_true",
+                        help="Evaluate an existing saved model without starting training")
+    parser.add_argument("--eval-iteration", type=int, default=-1,
+                        help="Saved iteration for --evaluate-only (-1: latest)")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without starting training")
     parser.add_argument("--allow-existing", action="store_true", help="Allow training in a non-empty output directory")
     parser.add_argument("extra_args", nargs=argparse.REMAINDER, help="Native train.py options after --")
@@ -87,6 +94,12 @@ def main(argv=None):
         parser.error("--keyframe-group-size must be positive")
     if args.selection_only and not args.select_keyframes:
         parser.error("--selection-only requires --select-keyframes")
+    if args.evaluate_only and args.selection_only:
+        parser.error("--evaluate-only cannot be combined with --selection-only")
+    if args.evaluate_only and not args.eval_all_frames:
+        parser.error("--evaluate-only requires --eval-all-frames")
+    if args.eval_iteration != -1 and args.eval_iteration < 1:
+        parser.error("--eval-iteration must be -1 or positive")
     if args.eval and args.exposure_compensation:
         parser.error("--eval requires --no-exposure-compensation: the native exposure flag changes the test split")
     if args.name in ("", ".", "..") or Path(args.name).name != args.name:
@@ -134,10 +147,14 @@ def main(argv=None):
                 parser.error(str(exc))
         if args.select_keyframes and not has_colmap:
             parser.error("Keyframe selection currently supports COLMAP scenes only")
+        if args.evaluate_only and not has_colmap:
+            parser.error("All-frame PSNR currently supports COLMAP scenes only")
         if output.exists() and not output.is_dir():
             parser.error(f"Output path is not a directory: {output}")
-        if output.is_dir() and any(output.iterdir()) and not args.allow_existing:
+        if output.is_dir() and any(output.iterdir()) and not args.allow_existing and not args.evaluate_only:
             parser.error(f"Output directory is not empty: {output} (choose another --name or use --allow-existing)")
+        if args.evaluate_only and not output.is_dir():
+            parser.error(f"Output directory does not exist: {output}")
         cmd = [sys.executable, str(REPO_ROOT / "train.py"), "-s", str(source), "-m", str(output),
                "--iterations", str(args.iterations), "-r", str(args.resolution),
                "-i", args.images, "--data_device", args.data_device]
@@ -157,16 +174,16 @@ def main(argv=None):
             cmd.extend(["--optimizer_type", args.optimizer_type])
         if args.depths:
             cmd.extend(["--depths", args.depths])
-        if args.select_keyframes:
+        if args.select_keyframes and not args.evaluate_only:
             cmd.extend(["--keyframe_manifest", str(output / "keyframes.json")])
         cmd.extend(EXTRA_ARGS)
         cmd.extend(extra)
-        jobs.append((scene, source, output, cmd))
+        jobs.append((scene, source, output, cmd, has_colmap))
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = args.gpu
-    for scene, source, output, cmd in jobs:
-        if args.select_keyframes:
+    for scene, source, output, cmd, has_colmap in jobs:
+        if args.select_keyframes and not args.evaluate_only:
             if args.dry_run:
                 print(f"\n[{scene}] Would select the sharpest frame per {args.keyframe_group_size} "
                       f"registered training frames into {output / 'keyframes.json'}", flush=True)
@@ -179,16 +196,31 @@ def main(argv=None):
                     return 1
         if args.selection_only:
             continue
-        print(f"\n[{scene}] CUDA_VISIBLE_DEVICES={shlex.quote(args.gpu)} {shlex.join(cmd)}", flush=True)
-        if args.dry_run:
-            continue
-        try:
-            subprocess.run(cmd, cwd=REPO_ROOT, env=env, check=True)
-        except subprocess.CalledProcessError as exc:
-            print(f"Training failed for {scene} (exit {exc.returncode}); remaining scenes were not started.", file=sys.stderr)
-            return exc.returncode or 1
+        if not args.evaluate_only:
+            print(f"\n[{scene}] CUDA_VISIBLE_DEVICES={shlex.quote(args.gpu)} {shlex.join(cmd)}", flush=True)
+            if not args.dry_run:
+                try:
+                    subprocess.run(cmd, cwd=REPO_ROOT, env=env, check=True)
+                except subprocess.CalledProcessError as exc:
+                    print(f"Training failed for {scene} (exit {exc.returncode}); remaining scenes were not started.", file=sys.stderr)
+                    return exc.returncode or 1
+        if args.eval_all_frames and not has_colmap:
+            print(f"[{scene}] Skipping all-frame PSNR: only COLMAP scenes are supported.", flush=True)
+        if args.eval_all_frames and has_colmap:
+            iteration = args.eval_iteration if args.evaluate_only else args.iterations
+            eval_cmd = [sys.executable, str(REPO_ROOT / "scripts/eval_all_frames.py"),
+                        "--source", str(source), "--model", str(output), "--iteration", str(iteration),
+                        "--antialiasing" if args.antialiasing else "--no-antialiasing"]
+            print(f"\n[{scene}] CUDA_VISIBLE_DEVICES={shlex.quote(args.gpu)} {shlex.join(eval_cmd)}", flush=True)
+            if not args.dry_run:
+                try:
+                    subprocess.run(eval_cmd, cwd=REPO_ROOT, env=env, check=True)
+                except subprocess.CalledProcessError as exc:
+                    print(f"All-frame evaluation failed for {scene} (exit {exc.returncode}).", file=sys.stderr)
+                    return exc.returncode or 1
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
