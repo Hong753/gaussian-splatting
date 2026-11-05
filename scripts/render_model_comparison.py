@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Render 3DGS and Scaffold-GS along exactly the same registered COLMAP cameras.
 
-No images are loaded into memory. The two videos use a shared camera manifest
-and are accompanied by a side-by-side video (3DGS left, Scaffold right).
+Original images are read one at a time. Both renders use a shared camera
+manifest and are accompanied by a three-panel video: input | 3DGS | Scaffold.
 """
 import argparse
 import hashlib
@@ -110,16 +110,38 @@ def write_video(path, frames, width, height, fps, crf):
         raise
 
 
-def compare_side_by_side(left, right, output, crf):
+def compare_side_by_side(original, gs3d, scaffold, output, crf):
     temp = output.with_name(output.stem + ".partial.mp4")
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(left), "-i", str(right),
-           "-filter_complex", "[0:v][1:v]hstack=inputs=2[v]", "-map", "[v]", "-an",
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+           "-i", str(original), "-i", str(gs3d), "-i", str(scaffold),
+           "-filter_complex", "[0:v][1:v][2:v]hstack=inputs=3[v]", "-map", "[v]", "-an",
            "-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(temp)]
     try:
         subprocess.run(cmd, check=True)
         os.replace(temp, output)
     finally:
         temp.unlink(missing_ok=True)
+
+
+def validate_originals(images, cameras):
+    """Fail before model rendering when a matching input image is missing."""
+    missing = [str(images / info.image_name) for info in cameras if not (images / info.image_name).is_file()]
+    if missing:
+        raise FileNotFoundError(f"{len(missing)} input frames are missing; first: {missing[0]}")
+
+
+def original_frames(images, cameras, width, height):
+    """Read matching RGB images in the exact camera order, one at a time."""
+    import numpy as np
+    from PIL import Image
+    from tqdm import tqdm
+    for info in tqdm(cameras, desc="Encoding original images", unit="frame"):
+        path = images / info.image_name
+        try:
+            with Image.open(path) as image:
+                yield np.asarray(image.convert("RGB").resize((width, height)), dtype=np.uint8)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"Cannot read original image {path}: {exc}") from exc
 
 
 def read_cameras(source):
@@ -202,6 +224,7 @@ def rendered_frames(spec, cameras, width, height, aa):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True, type=Path)
+    parser.add_argument("--images", default="images", help="Input image folder within --source, or absolute path")
     parser.add_argument("--model-3dgs", required=True, type=Path)
     parser.add_argument("--model-scaffold", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
@@ -228,7 +251,12 @@ def main(argv=None):
     if not source.is_dir():
         parser.error(f"Scene not found: {source}")
     output = args.output_dir.expanduser().resolve()
-    output_files = [output / "3dgs.mp4", output / "scaffold.mp4", output / "side_by_side.mp4", output / "trajectory.json"]
+    original_video = output / "original.mp4"
+    gs_video = output / "3dgs.mp4"
+    scaffold_video = output / "scaffold.mp4"
+    comparison_video = output / "side_by_side.mp4"
+    trajectory_file = output / "trajectory.json"
+    output_files = [original_video, gs_video, scaffold_video, comparison_video, trajectory_file]
     if not args.overwrite and any(path.exists() for path in output_files):
         parser.error(f"Comparison outputs already exist in {output}; choose a new folder or use --overwrite")
     try:
@@ -238,6 +266,8 @@ def main(argv=None):
             raise ValueError("The runs use different background colors; comparisons require the same background")
         cameras = make_trajectory(read_cameras(source), args.start, args.stride, args.max_frames)
         width, height = video_dimensions(cameras, args.width)
+        images = (source / Path(args.images).expanduser()).resolve()
+        validate_originals(images, cameras)
     except (OSError, ValueError, KeyError) as exc:
         parser.error(str(exc))
     output.mkdir(parents=True, exist_ok=True)
@@ -247,19 +277,22 @@ def main(argv=None):
                "start_index": args.start, "stride": args.stride, "frame_count": len(records),
                "fps": args.fps, "width": width, "height": height, "trajectory_sha256": trajectory_hash,
                "color_protocol": "base model appearance; no per-image exposure transforms",
-               "side_by_side": {"left": "3dgs", "right": "scaffold"},
+               "original_images": str(images),
+               "side_by_side": {"left": "original", "middle": "3dgs", "right": "scaffold"},
                "models": {s["type"]: {"path": str(s["path"]), "iteration": s["iteration"],
                           "antialiasing": aa == "on"} for s, aa in zip(specs, [args.aa_3dgs, args.scaffold_aa])},
                "cameras": records}
-    (output / "trajectory.json").write_text(json.dumps(details, indent=2, allow_nan=False) + "\n")
+    trajectory_file.write_text(json.dumps(details, indent=2, allow_nan=False) + "\n")
     print(f"Rendering {len(cameras)} frames at {width}x{height}, {args.fps:g} fps on GPU {args.gpu}", flush=True)
-    for spec, aa, destination in zip(specs, [args.aa_3dgs, args.scaffold_aa], output_files[:2]):
+    write_video(original_video, original_frames(images, cameras, width, height), width, height, args.fps, args.crf)
+    for spec, aa, destination in zip(specs, [args.aa_3dgs, args.scaffold_aa], [gs_video, scaffold_video]):
         frames = rendered_frames(spec, cameras, width, height, aa == "on")
         write_video(destination, frames, width, height, args.fps, args.crf)
-    compare_side_by_side(output_files[0], output_files[1], output_files[2], args.crf)
+    compare_side_by_side(original_video, gs_video, scaffold_video, comparison_video, args.crf)
     for path in output_files:
         print(path)
 
 
 if __name__ == "__main__":
     main()
+

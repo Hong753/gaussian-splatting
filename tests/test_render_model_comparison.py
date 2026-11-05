@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
@@ -56,15 +57,21 @@ class ComparisonTests(unittest.TestCase):
                         (ply.parent / name).touch()
                 paths.append(run)
             cams = [camera('frame10.png'), camera('frame2.png'), camera('frame1.png')]
+            image_dir = source / 'images'
+            image_dir.mkdir()
+            for info in cams:
+                Image.new('RGB', (100, 50), (255, 0, 0)).save(image_dir / info.image_name)
             calls = []
             def fake_frames(spec, sequence, width, height, aa):
                 calls.append((spec['type'], [c.image_name for c in sequence], aa))
-                for idx, _ in enumerate(sequence):
-                    yield np.full((height, width, 3), idx * 40, dtype=np.uint8)
+                color = [0, 255, 0] if spec['type'] == '3dgs' else [0, 0, 255]
+                for _ in sequence:
+                    yield np.broadcast_to(np.array(color, dtype=np.uint8), (height, width, 3)).copy()
             output = root / 'comparison'
             argv = ['--source', str(source), '--model-3dgs', str(paths[0]), '--model-scaffold', str(paths[1]),
                     '--output-dir', str(output), '--3dgs-aa', 'on', '--scaffold-aa', 'off', '--width', '64', '--fps', '10']
-            with patch.object(mod, 'read_cameras', return_value=cams), patch.object(mod, 'rendered_frames', side_effect=fake_frames):
+            fake_tqdm = types.SimpleNamespace(tqdm=lambda xs, **kwargs: xs)
+            with patch.object(mod, 'read_cameras', return_value=cams), patch.object(mod, 'rendered_frames', side_effect=fake_frames), patch.dict(sys.modules, {'tqdm': fake_tqdm}):
                 mod.main(argv)
                 with self.assertRaises(SystemExit):
                     mod.main(argv)
@@ -72,14 +79,29 @@ class ComparisonTests(unittest.TestCase):
                                      ('scaffold', ['frame1.png','frame2.png','frame10.png'], False)])
             details = json.loads((output / 'trajectory.json').read_text())
             self.assertEqual(details['frame_count'], 3)
-            self.assertEqual(details['side_by_side'], {'left': '3dgs', 'right': 'scaffold'})
-            for name, expected_width in [('3dgs.mp4',64), ('scaffold.mp4',64), ('side_by_side.mp4',128)]:
+            self.assertEqual(details['side_by_side'], {'left': 'original', 'middle': '3dgs', 'right': 'scaffold'})
+            self.assertEqual(details['original_images'], str(image_dir))
+            for name, expected_width in [('original.mp4',64), ('3dgs.mp4',64), ('scaffold.mp4',64), ('side_by_side.mp4',192)]:
                 result = subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
                         '-count_frames', '-show_entries', 'stream=width,height,nb_read_frames',
                         '-of', 'json', str(output / name)], text=True)
                 stream = json.loads(result)['streams'][0]
                 self.assertEqual((stream['width'], stream['height'], int(stream['nb_read_frames'])),
                                  (expected_width, 32, 3))
+            raw = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(output / 'side_by_side.mp4'),
+                                           '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'])
+            image = np.frombuffer(raw, dtype=np.uint8).reshape(32, 192, 3)
+            for x, dominant in [(32, 0), (96, 1), (160, 2)]:
+                pixel = image[16, x]
+                self.assertGreater(pixel[dominant], 200)
+                self.assertLess(max(pixel[(dominant + 1) % 3], pixel[(dominant + 2) % 3]), 30)
+            # Missing input frames must be rejected before either model renders.
+            (image_dir / 'frame2.png').unlink()
+            argv[argv.index('--output-dir') + 1] = str(root / 'missing_test')
+            with patch.object(mod, 'read_cameras', return_value=cams), patch.object(mod, 'rendered_frames', side_effect=AssertionError('must not render')):
+                with self.assertRaises(SystemExit):
+                    mod.main(argv)
+            self.assertFalse((root / 'missing_test').exists())
 
     def test_rejects_wrong_model_and_missing_mlps(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -96,3 +118,4 @@ class ComparisonTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
