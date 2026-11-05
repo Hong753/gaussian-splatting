@@ -313,8 +313,11 @@ headers; install them in the compiler include path or provide its expected
 original image pixels. By default it picks a seeded random continuous segment of
 the naturally sorted COLMAP cameras, interpolates a capture-guided path, and
 adds smooth random translation and camera pan. Both models use the exact same
-poses. `side_by_side.mp4` shows 3DGS on the left and Scaffold-GS on the right;
-individual videos and `trajectory.json` are also saved.
+poses. `side_by_side.mp4` shows 3DGS on the left and the model selected with
+`--model-scaffold`, `--model-textured`, or `--model-absgs` on the right;
+individual videos and `trajectory.json` are also saved. AbsGS uses the standard
+3DGS renderer: pass its training run with `--model-absgs` and set
+`--absgs-aa on` to compare it with an anti-aliased 3DGS baseline.
 
 Defaults are 20 seconds at 30 fps, up to 600 source cameras and a control point
 every 24 images. Change `--seed` for a different reproducible path and increase
@@ -333,6 +336,7 @@ offsets, source segment, generated poses, AA flags, and model iterations. As
 with the original-trajectory comparison, models use base appearance without
 per-image exposure transforms. Set AA for each model explicitly and use an
 empty output folder.
+
 
 
 

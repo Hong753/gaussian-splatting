@@ -27,6 +27,67 @@ def cam(i, center, rotation=None):
 
 class TestNovelComparison(unittest.TestCase):
     @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg needed')
+    def test_absgs_and_3dgs_are_distinct_models_with_the_same_poses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'scene'
+            source.mkdir()
+            models = []
+            for label in ('baseline', 'absgs'):
+                model = root / label
+                folder = model / 'point_cloud/iteration_30000'
+                folder.mkdir(parents=True)
+                (folder / 'point_cloud.ply').touch()
+                (model / 'cfg_args').write_text(
+                    f"Namespace(model_type='3dgs', absgs={label == 'absgs'}, source_path={str(source)!r}, white_background=False)")
+                models.append(model)
+            cameras = [cam(i, [i*0.1, 0, 0]) for i in range(24)]
+            output = root / 'out'
+            seen = []
+            def fake_frames(spec, seq, width, height, aa):
+                seen.append((spec['path'], [(c.R.tolist(), c.T.tolist()) for c in seq], aa))
+                value = 32 if spec['path'] == models[0] else 224
+                for _ in seq:
+                    yield np.full((height, width, 3), value, dtype=np.uint8)
+            args = ['--source', str(source), '--model-3dgs', str(models[0]), '--model-absgs', str(models[1]),
+                    '--output-dir', str(output), '--3dgs-aa', 'on', '--absgs-aa', 'on',
+                    '--width', '64', '--fps', '5', '--duration', '1', '--source-window', '20']
+            with patch.object(mod.core, 'read_cameras', return_value=cameras), patch.object(mod.core, 'rendered_frames', side_effect=fake_frames):
+                mod.main(args)
+            self.assertEqual(seen[0][1], seen[1][1])
+            self.assertEqual([(entry[0], entry[2]) for entry in seen], [(models[0], True), (models[1], True)])
+            data = json.loads((output / 'trajectory.json').read_text())
+            self.assertEqual(data['side_by_side'], {'left': '3dgs', 'right': 'absgs'})
+            self.assertEqual(data['models']['3dgs']['path'], str(models[0]))
+            self.assertEqual(data['models']['absgs']['path'], str(models[1]))
+            self.assertTrue((output / 'absgs.mp4').is_file())
+            self.assertFalse((output / 'original.mp4').exists())
+            video = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(output/'side_by_side.mp4'),
+                                             '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'])
+            frame = np.frombuffer(video, dtype=np.uint8).reshape(32, 128, 3)
+            self.assertLess(frame[:, :64].mean(), 50)
+            self.assertGreater(frame[:, 64:].mean(), 200)
+
+    def test_model_absgs_rejects_an_ordinary_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'scene'
+            source.mkdir()
+            models = []
+            for label in ('baseline', 'other'):
+                model = root / label
+                folder = model / 'point_cloud/iteration_30000'
+                folder.mkdir(parents=True)
+                (folder / 'point_cloud.ply').touch()
+                (model / 'cfg_args').write_text(
+                    f"Namespace(model_type='3dgs', source_path={str(source)!r}, white_background=False)")
+                models.append(model)
+            args = ['--source', str(source), '--model-3dgs', str(models[0]), '--model-absgs', str(models[1]),
+                    '--output-dir', str(root / 'out'), '--3dgs-aa', 'on']
+            with self.assertRaises(SystemExit):
+                mod.main(args)
+
+    @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg needed')
     def test_textured_checkpoint_uses_same_poses_and_disables_aa(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -151,5 +212,6 @@ class TestNovelComparison(unittest.TestCase):
             self.assertEqual((stream['width'],stream['height'],int(stream['nb_read_frames'])), (128,32,5))
 
 if __name__ == '__main__': unittest.main()
+
 
 
