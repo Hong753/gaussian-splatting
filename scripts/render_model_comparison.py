@@ -153,11 +153,6 @@ def read_cameras(source):
     if (model / "images.bin").is_file() and (model / "cameras.bin").is_file():
         images = read_extrinsics_binary(str(model / "images.bin"))
         cameras = read_intrinsics_binary(str(model / "cameras.bin"))
-    elif spec["type"] == "textured":
-        if aa:
-            raise ValueError("Textured Gaussians does not support Graphdeco anti-aliasing")
-        from models.textured_gaussian import TexturedGaussianModel
-        gaussians = TexturedGaussianModel.load(spec["ply"])
     else:
         images = read_extrinsics_text(str(model / "images.txt"))
         cameras = read_intrinsics_text(str(model / "cameras.txt"))
@@ -185,6 +180,11 @@ def load_renderer(spec, aa):
                         update_init_factor=16, appearance_dim=0)
         gaussians.load_ply(str(spec["ply"]))
         gaussians.eval()
+    elif spec["type"] == "textured":
+        if aa:
+            raise ValueError("Textured Gaussians does not support Graphdeco anti-aliasing")
+        from models.textured_gaussian import TexturedGaussianModel
+        gaussians = TexturedGaussianModel.load(spec["ply"])
     else:
         gaussians = GaussianModel(cfg.get("sh_degree", 3))
         gaussians.load_ply(str(spec["ply"]))

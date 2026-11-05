@@ -26,6 +26,73 @@ def camera(name, width=100, height=50):
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_read_cameras_supports_colmap_binary_and_text(self):
+        def module(name, **kwargs):
+            result = types.ModuleType(name)
+            result.__dict__.update(kwargs)
+            return result
+        calls = []
+        def reader(kind):
+            def read(path):
+                calls.append((kind, Path(path).name))
+                return kind
+            return read
+        expected = [camera('frame.png')]
+        loader = module('scene.colmap_loader',
+                        read_extrinsics_binary=reader('extrinsics_binary'),
+                        read_intrinsics_binary=reader('intrinsics_binary'),
+                        read_extrinsics_text=reader('extrinsics_text'),
+                        read_intrinsics_text=reader('intrinsics_text'))
+        def read_cameras(images, cameras, *rest):
+            calls.append(('passed', images, cameras))
+            return expected
+        modules = {'scene': module('scene'), 'scene.colmap_loader': loader,
+                   'scene.dataset_readers': module('scene.dataset_readers', readColmapCameras=read_cameras),
+                   'utils': module('utils'),
+                   'utils.colmap_paths': module('utils.colmap_paths', colmap_model_dir=lambda root: root / 'sparse')}
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(sys.modules, modules):
+            source = Path(tmp)
+            sparse = source / 'sparse'
+            sparse.mkdir()
+            for extension in ('txt', 'bin'):
+                calls.clear()
+                (sparse / f'images.{extension}').touch()
+                (sparse / f'cameras.{extension}').touch()
+                self.assertIs(mod.read_cameras(source), expected)
+                suffix = 'text' if extension == 'txt' else 'binary'
+                self.assertEqual(calls[-1], ('passed', f'extrinsics_{suffix}', f'intrinsics_{suffix}'))
+
+    def test_textured_renderer_loads_textured_checkpoint(self):
+        def module(name, **kwargs):
+            result = types.ModuleType(name)
+            result.__dict__.update(kwargs)
+            return result
+        calls = []
+        class Textured:
+            @classmethod
+            def load(cls, path):
+                calls.append(('load', path))
+                return cls()
+            def render(self, cam, background):
+                calls.append(('render', cam, background))
+                return 'textured pixels', {}
+        def wrong_model(*args, **kwargs):
+            raise AssertionError('3DGS model must not be loaded for textured checkpoint')
+        modules = {
+            'torch': module('torch', tensor=lambda *a, **kw: 'background', float32=object()),
+            'scene': module('scene'), 'scene.gaussian_model': module('scene.gaussian_model', GaussianModel=wrong_model),
+            'gaussian_renderer': module('gaussian_renderer', render=wrong_model),
+            'diff_gaussian_rasterization': module('diff_gaussian_rasterization'),
+            'models': module('models'),
+            'models.textured_gaussian': module('models.textured_gaussian', TexturedGaussianModel=Textured)}
+        spec = {'type': 'textured', 'cfg': {}, 'ply': Path('/model/textured.pt')}
+        with patch.dict(sys.modules, modules):
+            render = mod.load_renderer(spec, False)
+            self.assertEqual(render('camera'), 'textured pixels')
+            with self.assertRaisesRegex(ValueError, 'anti-aliasing'):
+                mod.load_renderer(spec, True)
+        self.assertEqual(calls, [('load', Path('/model/textured.pt')), ('render', 'camera', 'background')])
+
     def test_synthetic_minicam_retains_pose_for_textured_renderer(self):
         class FakeTensor:
             def __init__(self, array=None):
