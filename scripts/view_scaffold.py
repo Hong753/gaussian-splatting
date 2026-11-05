@@ -124,12 +124,14 @@ class Viewer:
         self.last_camera = None
 
         gui = server.gui
-        gui.add_markdown("## Scaffold-GS Viewer\nBrowse the viewer machine's files and open a saved Scaffold PLY.")
-        self.directory = gui.add_text("Folder", str(Path(start_dir).expanduser().resolve()))
+        gui.add_markdown("## Scaffold-GS Viewer\nBrowse the viewer machine's files and open a saved Scaffold PLY. "
+                         "Enter a folder below, or paste the PLY path directly.")
+        self.directory = gui.add_text("Folder", str(Path(start_dir).expanduser().resolve()),
+                                      hint="Enter a folder path, then click Open folder")
         self.entries = gui.add_dropdown("Folder / PLY", ("(empty)",), initial_value="(empty)")
         self.open_button = gui.add_button("Open selected")
         self.parent_button = gui.add_button("Parent folder")
-        self.refresh_button = gui.add_button("Refresh folder")
+        self.refresh_button = gui.add_button("Open folder / refresh")
         self.path_text = gui.add_text("Or enter PLY path", "", hint="Path on the machine running this viewer")
         self.load_button = gui.add_button("Load PLY path")
         self.status = gui.add_markdown("Choose a `point_cloud.ply` to begin.")
@@ -286,19 +288,23 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpu", default="0", help="CUDA GPU index")
     parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--browse-root", type=Path, default=Path("/data/3dgs_outputs"), help="Initial folder in the file picker")
+    parser.add_argument("--browse-root", type=Path, default=None,
+                        help="Optional initial folder (default: home directory)")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
-    if not args.browse_root.expanduser().is_dir():
-        parser.error(f"Initial folder does not exist: {args.browse_root}")
+    start_dir = args.browse_root.expanduser() if args.browse_root is not None else Path.home()
+    if not start_dir.is_dir():
+        fallback = Path.cwd()
+        print(f"Initial folder {start_dir} not available; starting in {fallback}.", flush=True)
+        start_dir = fallback
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     try:
         import viser
     except ImportError:
         parser.exit(1, "Install the viewer dependency: python -m pip install 'viser==1.0.30'\n")
     server = viser.ViserServer(host="127.0.0.1", port=args.port, label="Scaffold-GS Viewer")
-    Viewer(server, args.browse_root)
+    Viewer(server, start_dir)
     print(f"Open http://127.0.0.1:{server.get_port()} in a browser on this machine.", flush=True)
     try:
         while True:
@@ -309,3 +315,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

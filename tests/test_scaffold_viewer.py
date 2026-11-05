@@ -8,6 +8,7 @@ import time
 import types
 import unittest
 import urllib.request
+from unittest.mock import patch
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +33,21 @@ class ScaffoldViewerTests(unittest.TestCase):
         (self.run / "cfg_args").write_text("Namespace(model_type='scaffold', scaffold_n_offsets=10)")
         (self.run / "cameras.json").write_text(json.dumps([{"position": [2, 3, 4],
             "rotation": [[1, 0, 0], [0, 1, 0], [0, 0, 1]], "height": 1000, "fy": 500}]))
+
+    def test_starts_in_home_without_data_directory_or_browse_argument(self):
+        captured = []
+        class Server:
+            def __init__(self, **kwargs): captured.append(kwargs)
+            def get_port(self): return 8080
+            def stop(self): captured.append("stopped")
+        with patch.object(Path, "home", return_value=self.root), \
+             patch.object(sys, "argv", ["view_scaffold.py", "--gpu", "0", "--port", "8080"]), \
+             patch.dict(sys.modules, {"viser": types.SimpleNamespace(ViserServer=Server)}), \
+             patch.object(viewer_mod, "Viewer") as viewer, \
+             patch.object(viewer_mod.time, "sleep", side_effect=KeyboardInterrupt):
+            viewer_mod.main()
+        self.assertEqual(viewer.call_args.args[1], self.root)
+        self.assertEqual(captured[-1], "stopped")
 
     def test_model_selection_requires_matching_mlp_and_config(self):
         ply, root, cfg = viewer_mod.model_paths(self.ply)
@@ -78,6 +94,12 @@ class ScaffoldViewerTests(unittest.TestCase):
                 return np.zeros((height, width, 3), dtype=np.uint8)
         app = viewer_mod.Viewer(server, self.folder, backend_factory=Backend)
         self.assertIn("point_cloud.ply", app.entries.options)
+        app.directory.value = str(self.root)
+        app.refresh()
+        self.assertIn("run/", app.entries.options)
+        app.directory.value = str(self.folder)
+        app.refresh()
+        self.assertIn("point_cloud.ply", app.entries.options)
         app.load(self.ply)
         self.assertIn("Loaded", app.status.content)
         with urllib.request.urlopen(f"http://127.0.0.1:{server.get_port()}/", timeout=5) as response:
@@ -97,3 +119,4 @@ class ScaffoldViewerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
