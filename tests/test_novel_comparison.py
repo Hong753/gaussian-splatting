@@ -51,6 +51,29 @@ class TestNovelComparison(unittest.TestCase):
         self.assertEqual(info['continuous_segment_length'], 20)
         self.assertTrue(all(int(x.image_name[5:9]) < 20 for x in segment))
 
+    def test_random_path_is_seeded_smooth_and_within_camera_bounds(self):
+        cameras = [cam(i, [5*np.cos(i/40), 5*np.sin(i/40), 1+0.3*np.sin(i/27)]) for i in range(400)]
+        segment, _ = mod.choose_source_segment(cameras, window=150, seed=42)
+        other_segment, _ = mod.choose_source_segment(cameras, window=150, seed=43)
+        self.assertNotEqual(segment[0].image_name, other_segment[0].image_name)
+        first, meta = mod.synthesize_random_path(segment, cameras, 100, control_step=12, seed=42)
+        repeat, _ = mod.synthesize_random_path(segment, cameras, 100, control_step=12, seed=42)
+        different, _ = mod.synthesize_random_path(segment, cameras, 100, control_step=12, seed=43)
+        centers = np.array([-c.R @ c.T for c in first])
+        repeated_centers = np.array([-c.R @ c.T for c in repeat])
+        other_centers = np.array([-c.R @ c.T for c in different])
+        np.testing.assert_allclose(centers, repeated_centers)
+        self.assertGreater(np.linalg.norm(centers - other_centers), 1e-4)
+        self.assertGreater(meta['max_actual_offset'], 0)
+        self.assertTrue(np.all(centers >= np.array(meta['camera_bounds_min']) - 1e-8))
+        self.assertTrue(np.all(centers <= np.array(meta['camera_bounds_max']) + 1e-8))
+        support = np.array([-c.R @ c.T for c in cameras])
+        distances = mod._nearest_camera_distances(centers, support)
+        self.assertLessEqual(float(distances.max()), meta['nearest_camera_distance_limit'] + 1e-8)
+        self.assertFalse(meta['collision_checked'])
+        for c in first:
+            np.testing.assert_allclose(c.R.T @ c.R, np.eye(3), atol=1e-6)
+
     @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg needed')
     def test_two_panel_encoding_uses_shared_synthetic_poses(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -94,3 +117,4 @@ class TestNovelComparison(unittest.TestCase):
             self.assertEqual((stream['width'],stream['height'],int(stream['nb_read_frames'])), (128,32,5))
 
 if __name__ == '__main__': unittest.main()
+

@@ -202,23 +202,28 @@ iteration for both; `-1` selects each model's latest, which may differ.
 
 ### Novel-view side-by-side video
 
-`scripts/render_novel_comparison.py` creates a synthetic, smooth camera path
-near the capture without using original image pixels. It sorts registered
-COLMAP cameras naturally, finds a continuous segment without large adjacent
-pose jumps, takes a central window, and interpolates it using cubic B-spline
-positions and normalized quaternion blends. A small sinusoidal lateral motion
-makes the path deviate from the recorded camera positions. The two models are
-rendered on the same synthetic poses; `side_by_side.mp4` contains 3DGS on the
-left and Scaffold-GS on the right. The individual videos and `trajectory.json`
-are also saved.
+`scripts/render_novel_comparison.py` synthesizes a smooth path without using
+original image pixels. By default it picks a seeded random continuous segment of
+the naturally sorted COLMAP cameras, interpolates a capture-guided path, and
+adds smooth random translation and camera pan. Both models use the exact same
+poses. `side_by_side.mp4` shows 3DGS on the left and Scaffold-GS on the right;
+individual videos and `trajectory.json` are also saved.
 
-The default is 10 seconds at 30 fps, using up to 180 source cameras and a
-control point every 12 images. Adjust with `--duration`, `--fps`,
-`--source-window`, and `--control-step`; `--lateral-fraction 0` disables the
-lateral movement. This path is kept near the captured trajectory but is **not
-collision checked**; it can pass through an object or poorly reconstructed
-space. Filename ordering must reflect the capture sequence. The manifest records
-the chosen source segment, control image names, all generated poses, AA flags,
-and the model iterations. As with the original-trajectory comparison, the
-models use base appearance without per-image exposure transforms. Set AA for
-each model explicitly and use an empty output folder.
+Defaults are 20 seconds at 30 fps, up to 600 source cameras and a control point
+every 24 images. Change `--seed` for a different reproducible path and increase
+`--deviation` for larger excursions; `--max-distance-fraction` controls the
+approximate camera-coverage radius as a fraction of the camera-position bounding
+box diagonal. The actual deviation may be smaller because of these bounds.
+`--view-degrees` controls additional random camera pan. Use `--path-mode smooth`
+for the earlier central capture-guided path with a small lateral excursion
+controlled by `--lateral-fraction`.
+
+The camera-position bounding box and distance to registered cameras are only
+coverage heuristics, not a map of free space. The path is **not collision
+checked** and may cross walls or objects. Filename ordering must reflect the
+capture sequence. The manifest records the random seed, constraints, actual
+offsets, source segment, generated poses, AA flags, and model iterations. As
+with the original-trajectory comparison, models use base appearance without
+per-image exposure transforms. Set AA for each model explicitly and use an
+empty output folder.
+
