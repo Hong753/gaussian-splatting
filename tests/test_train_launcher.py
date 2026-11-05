@@ -35,6 +35,7 @@ class TrainLauncherTests(unittest.TestCase):
         self.assertIn(str(self.output / "orange_4F/1_full/test/keyframes.json"), result.stdout)
         self.assertIn("--antialiasing", result.stdout)
         self.assertIn("--train_test_exp", result.stdout)
+        self.assertIn("--port 6009", result.stdout)
         self.assertFalse(self.output.exists())
 
     def test_data_root_itself_can_be_scene(self):
@@ -63,6 +64,17 @@ class TrainLauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--optimizer_type sparse_adam", result.stdout)
         self.assertIn("--depths depth_maps", result.stdout)
+
+    def test_viewer_port_and_disable_are_forwarded(self):
+        port = self.run_launcher(self.root, "orange_4F/1_full", extra=("--viewer-port", "6010"))
+        self.assertEqual(port.returncode, 0, port.stderr)
+        self.assertIn("--port 6010", port.stdout)
+        disabled = self.run_launcher(self.root, "orange_4F/1_full", extra=("--disable-viewer",))
+        self.assertEqual(disabled.returncode, 0, disabled.stderr)
+        self.assertIn("--disable_viewer", disabled.stdout)
+        self.assertNotIn("--port 6009", disabled.stdout)
+        bad = self.run_launcher(self.root, "orange_4F/1_full", extra=("--viewer-port", "65536"))
+        self.assertNotEqual(bad.returncode, 0)
 
 
 if __name__ == "__main__":

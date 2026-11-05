@@ -19,6 +19,7 @@ SCENES = []  # e.g. ["scan65", "scan69"]
 OUTPUT_ROOT = Path("/data/3dgs_outputs")
 RUN_NAME = "3dgs"
 GPU_ID = "0"
+VIEWER_PORT = 6009
 ITERATIONS = 30_000
 RESOLUTION = -1  # -1: Graphdeco automatic resolution; 1: full resolution.
 IMAGES = "images"
@@ -48,6 +49,9 @@ def main(argv=None):
     parser.add_argument("--output-root", type=Path, default=OUTPUT_ROOT, help="Outputs go to ROOT/SCENE/NAME")
     parser.add_argument("--name", default=RUN_NAME, help="Experiment name")
     parser.add_argument("--gpu", default=GPU_ID, help="GPU ID passed through CUDA_VISIBLE_DEVICES")
+    parser.add_argument("--viewer-port", type=int, default=VIEWER_PORT,
+                        help="Live SIBR network viewer port (default: 6009)")
+    parser.add_argument("--disable-viewer", action="store_true", help="Do not open the live viewer socket")
     parser.add_argument("--iterations", type=int, default=ITERATIONS)
     parser.add_argument("--resolution", type=int, default=RESOLUTION,
                         help="-1 for automatic, 1/2/4/8 for downscale, or another positive target width")
@@ -75,6 +79,8 @@ def main(argv=None):
         parser.error("Set SCENES in scripts/train.py or pass --scenes SCENE [SCENE ...]")
     if args.iterations < 1:
         parser.error("--iterations must be positive")
+    if not 1 <= args.viewer_port <= 65535:
+        parser.error("--viewer-port must be between 1 and 65535")
     if args.resolution == 0 or args.resolution < -1:
         parser.error("--resolution must be -1 or a positive integer")
     if args.keyframe_group_size < 1:
@@ -135,6 +141,10 @@ def main(argv=None):
         cmd = [sys.executable, str(REPO_ROOT / "train.py"), "-s", str(source), "-m", str(output),
                "--iterations", str(args.iterations), "-r", str(args.resolution),
                "-i", args.images, "--data_device", args.data_device]
+        if args.disable_viewer:
+            cmd.append("--disable_viewer")
+        else:
+            cmd.extend(["--port", str(args.viewer_port)])
         if args.eval:
             cmd.append("--eval")
         if args.antialiasing:

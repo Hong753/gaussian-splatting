@@ -40,6 +40,12 @@ Pass additional native options after `--`:
 python scripts/train.py --scenes scan65 -- --densify_grad_threshold 0.0001
 ```
 
+The live SIBR viewer socket uses port 6009 by default. For concurrent runs,
+set a different `--viewer-port` for each run and connect the SIBR remote
+viewer to the same port. Use `--disable-viewer` when live viewing is not
+needed. Free-viewpoint GUI renders do not use per-image exposure transforms;
+training image exposure optimization is unaffected.
+
 The launcher refuses to use a nonempty output directory unless
 `--allow-existing` is specified; that option does not resume training by
 itself. Native `--start_checkpoint` is required to resume a checkpoint.
