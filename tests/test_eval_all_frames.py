@@ -24,7 +24,7 @@ class Tensor:
 
 class EvalAllFramesTests(unittest.TestCase):
     def test_streams_all_frames_without_exposure_and_reports_groups(self):
-        for model_type in ("3dgs", "scaffold"):
+        for model_type in ("3dgs", "scaffold", "textured"):
             with self.subTest(model_type=model_type):
                 self._check_streaming(model_type)
 
@@ -40,7 +40,8 @@ class EvalAllFramesTests(unittest.TestCase):
             sparse.mkdir(parents=True)
             (sparse / "images.bin").touch()
             (sparse / "cameras.bin").touch()
-            ply = model / "point_cloud/iteration_7000/point_cloud.ply"
+            filename = "textured.pt" if model_type == "textured" else "point_cloud.ply"
+            ply = model / "point_cloud/iteration_7000" / filename
             ply.parent.mkdir(parents=True)
             ply.touch()
             (model / "cfg_args").write_text(f"Namespace(resolution=2, images='images', sh_degree=3, keyframe_manifest='keyframes.json', model_type='{model_type}')")
@@ -61,6 +62,15 @@ class EvalAllFramesTests(unittest.TestCase):
                 def __init__(self, **kwargs): self.config = kwargs
                 def load_ply(self, path): self.ply = path
                 def eval(self): pass
+            class TexturedModel:
+                @classmethod
+                def load(cls, path):
+                    self = cls()
+                    self.path = path
+                    return self
+                def render(self, camera, background):
+                    calls.append(("render", camera.image_name, False, False))
+                    return Tensor(0), {}
             def load_cam(args, idx, info, *unused):
                 calls.append(("load", info.image_name, args.resolution, args.data_device))
                 return types.SimpleNamespace(image_name=info.image_name, original_image=Tensor(idx))
@@ -81,6 +91,7 @@ class EvalAllFramesTests(unittest.TestCase):
                 "models": module("models"),
                 "models.scaffold_gaussian": module("models.scaffold_gaussian", ScaffoldGaussianModel=ScaffoldModel),
                 "models.scaffold_renderer": module("models.scaffold_renderer", render=render_scaffold, prefilter_voxel=lambda *args: True),
+                "models.textured_gaussian": module("models.textured_gaussian", TexturedGaussianModel=TexturedModel),
                 "utils": module("utils"),
                 "utils.camera_utils": module("utils.camera_utils", loadCam=load_cam),
                 "utils.colmap_paths": module("utils.colmap_paths", colmap_model_dir=lambda p: sparse),
@@ -104,4 +115,5 @@ class EvalAllFramesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 

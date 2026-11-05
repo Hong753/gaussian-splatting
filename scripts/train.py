@@ -53,7 +53,10 @@ def main(argv=None):
                         help="Scene paths relative to --data-root; use . for --data-root itself")
     parser.add_argument("--output-root", type=Path, default=OUTPUT_ROOT, help="Outputs go to ROOT/SCENE/NAME")
     parser.add_argument("--name", default=RUN_NAME, help="Experiment name")
-    parser.add_argument("--model-type", choices=["3dgs", "scaffold"], default=MODEL_TYPE)
+    parser.add_argument("--model-type", choices=["3dgs", "scaffold", "textured"], default=MODEL_TYPE)
+    parser.add_argument("--textured-pretrain-iterations", type=int, default=30000)
+    parser.add_argument("--textured-max-gaussians", type=int, default=10000)
+    parser.add_argument("--textured-resolution", type=int, default=50)
     parser.add_argument("--scaffold-voxel-size", type=float, default=SCAFFOLD_VOXEL_SIZE)
     parser.add_argument("--scaffold-n-offsets", type=int, default=SCAFFOLD_N_OFFSETS)
     parser.add_argument("--scaffold-feat-dim", type=int, default=SCAFFOLD_FEAT_DIM)
@@ -97,6 +100,11 @@ def main(argv=None):
             parser.error("Scaffold-GS does not yet support --eval, --depths or sparse_adam")
         if args.scaffold_voxel_size <= 0 or args.scaffold_n_offsets < 1 or args.scaffold_feat_dim < 1:
             parser.error("Scaffold voxel size, offsets and feature dimension must be positive")
+    if args.model_type == "textured" and not args.evaluate_only:
+        if args.eval or args.depths or args.exposure_compensation or args.antialiasing or args.optimizer_type != "default":
+            parser.error("Textured backend requires --no-antialiasing --no-exposure-compensation and does not support --eval, --depths or sparse_adam")
+        if min(args.textured_pretrain_iterations, args.textured_max_gaussians, args.textured_resolution) < 1:
+            parser.error("Textured pretraining iterations, Gaussian cap and texture resolution must be positive")
     if args.iterations < 1:
         parser.error("--iterations must be positive")
     if not 1 <= args.viewer_port <= 65535:
@@ -168,13 +176,20 @@ def main(argv=None):
             parser.error(f"Output directory is not empty: {output} (choose another --name or use --allow-existing)")
         if args.evaluate_only and not output.is_dir():
             parser.error(f"Output directory does not exist: {output}")
-        trainer = REPO_ROOT / ("models/train_scaffold.py" if args.model_type == "scaffold" else "train.py")
+        trainer_name = {"3dgs": "train.py", "scaffold": "models/train_scaffold.py",
+                        "textured": "models/train_textured.py"}[args.model_type]
+        trainer = REPO_ROOT / trainer_name
         cmd = [sys.executable, str(trainer), "-s", str(source), "-m", str(output),
                "--iterations", str(args.iterations), "-r", str(args.resolution),
                "-i", args.images, "--data_device", args.data_device]
         if args.model_type == "scaffold":
             cmd.extend(["--model_type", "scaffold", "--scaffold_voxel_size", str(args.scaffold_voxel_size),
                         "--scaffold_n_offsets", str(args.scaffold_n_offsets), "--scaffold_feat_dim", str(args.scaffold_feat_dim)])
+        if args.model_type == "textured":
+            cmd.extend(["--model_type", "textured",
+                        "--textured_pretrain_iterations", str(args.textured_pretrain_iterations),
+                        "--textured_max_gaussians", str(args.textured_max_gaussians),
+                        "--textured_resolution", str(args.textured_resolution)])
         if args.disable_viewer:
             cmd.append("--disable_viewer")
         else:
@@ -216,6 +231,8 @@ def main(argv=None):
         if not args.evaluate_only:
             if args.model_type == "scaffold":
                 print(f"[{scene}] Scaffold-GS live viewer is not supported.", flush=True)
+            if args.model_type == "textured":
+                print(f"[{scene}] Textured Gaussians runs 2DGS pretraining followed by texture refinement; live viewer is not supported.", flush=True)
             print(f"\n[{scene}] CUDA_VISIBLE_DEVICES={shlex.quote(args.gpu)} {shlex.join(cmd)}", flush=True)
             if not args.dry_run:
                 try:
@@ -242,5 +259,6 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 

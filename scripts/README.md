@@ -200,6 +200,46 @@ iteration for both; `-1` selects each model's latest, which may differ.
 
 
 
+### Textured Gaussians
+
+`--model-type textured` uses the public [Textured Gaussians
+reimplementation](https://github.com/bchao1/textured_gaussians), not the
+unreleased code used for the paper's experiments. It uses the upstream custom
+2DGS textured CUDA rasterizer and MCMC strategy, with this repository's camera
+and keyframe pipeline. Two training stages run sequentially: 2DGS pretraining
+for `--textured-pretrain-iterations` steps, then texture refinement for
+`--iterations` steps. Defaults are 30,000 steps each, up to 10,000 initial
+and MCMC Gaussians, and 50 x 50 RGBA textures per Gaussian. RGB and alpha
+textures are enabled. Initial points are sampled when the input exceeds the cap.
+
+The texture stage disables relocation and growth but retains the upstream MCMC
+position noise and trains the other Gaussian attributes. These settings do not
+freeze Gaussian centers. It is a different optimization setup from Graphdeco
+3DGS and is not a direct reproduction of the paper's internal implementation.
+Graphdeco anti-aliasing, exposure compensation and depth regularization are not
+supported; explicitly pass `--no-antialiasing --no-exposure-compensation`.
+The live SIBR viewer and existing 3DGS/Scaffold trajectory renderers do not
+support this model. A texture-aware all-frame PSNR evaluator is run after
+training and saves per-frame and aggregate results in the usual output folder.
+The checkpoint `point_cloud/iteration_<refinement steps>/textured.pt` contains
+both Gaussian attributes and textures; it is not a SuperSplat-compatible PLY.
+
+Install the backend in the existing 3dgs environment (requires a compatible
+CUDA toolkit, a C++ compiler, and the GLM headers):
+
+```bash
+git clone https://github.com/bchao1/textured_gaussians.git ~/textured_gaussians
+git -C ~/textured_gaussians checkout b7ed080d4bb5436204ca7e94598d26ff54ead5ff
+python -m pip install ninja jaxtyping rich
+BUILD_NO_CUDA=1 python -m pip install --no-build-isolation --no-deps -e ~/textured_gaussians
+```
+
+The upstream package JIT-compiles CUDA kernels on first use. Its CUDA backend
+uses a generic extension name shared with gsplat, so set a dedicated
+`TORCH_EXTENSIONS_DIR` for this backend. The upstream source expects GLM
+headers; install them in the compiler include path or provide its expected
+`textured_gaussians/cuda/csrc/third_party/glm` checkout.
+
 ### Novel-view side-by-side video
 
 `scripts/render_novel_comparison.py` synthesizes a smooth path without using
@@ -226,4 +266,5 @@ offsets, source segment, generated poses, AA flags, and model iterations. As
 with the original-trajectory comparison, models use base appearance without
 per-image exposure transforms. Set AA for each model explicitly and use an
 empty output folder.
+
 

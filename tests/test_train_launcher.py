@@ -94,6 +94,28 @@ class TrainLauncherTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Scaffold-GS does not yet support", result.stderr)
 
+    def test_textured_model_routes_to_two_stage_trainer_and_evaluator(self):
+        result = self.run_launcher(self.root, "orange_4F/1_full", extra=(
+            "--model-type", "textured", "--no-antialiasing", "--no-exposure-compensation",
+            "--textured-pretrain-iterations", "1200", "--textured-max-gaussians", "5000",
+            "--textured-resolution", "16"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("models/train_textured.py", result.stdout)
+        self.assertIn("--model_type textured", result.stdout)
+        self.assertIn("--textured_pretrain_iterations 1200", result.stdout)
+        self.assertIn("--textured_max_gaussians 5000", result.stdout)
+        self.assertIn("--textured_resolution 16", result.stdout)
+        self.assertIn("--no-antialiasing", result.stdout)
+        self.assertIn("scripts/eval_all_frames.py", result.stdout)
+        self.assertNotIn("--train_test_exp", result.stdout)
+
+    def test_textured_rejects_unsupported_settings(self):
+        for extra in ((), ("--no-antialiasing",),
+                      ("--no-antialiasing", "--no-exposure-compensation", "--depths", "maps")):
+            result = self.run_launcher(self.root, "orange_4F/1_full", extra=("--model-type", "textured", *extra))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Textured backend requires", result.stderr)
+
     def test_evaluate_only_reuses_output_without_training_or_selection(self):
         (self.output / "orange_4F/1_full/test").mkdir(parents=True)
         result = self.run_launcher(self.root, "orange_4F/1_full",
@@ -108,5 +130,6 @@ class TrainLauncherTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

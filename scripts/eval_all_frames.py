@@ -26,15 +26,16 @@ def read_config(path):
     return {k.arg: ast.literal_eval(k.value) for k in node.keywords}
 
 
-def choose_iteration(model, iteration):
+def choose_iteration(model, iteration, model_type="3dgs"):
     root = model / "point_cloud"
+    filename = "textured.pt" if model_type == "textured" else "point_cloud.ply"
     if iteration < 0:
         available = [int(p.name.removeprefix("iteration_")) for p in root.glob("iteration_*")
-                     if p.name.removeprefix("iteration_").isdigit() and (p / "point_cloud.ply").is_file()]
+                     if p.name.removeprefix("iteration_").isdigit() and (p / filename).is_file()]
         if not available:
-            raise FileNotFoundError(f"No saved point_cloud.ply under {root}")
+            raise FileNotFoundError(f"No saved {filename} under {root}")
         iteration = max(available)
-    ply = root / f"iteration_{iteration}" / "point_cloud.ply"
+    ply = root / f"iteration_{iteration}" / filename
     if not ply.is_file():
         raise FileNotFoundError(f"Saved Gaussian model not found: {ply}")
     return iteration, ply
@@ -49,7 +50,8 @@ def main():
     args = parser.parse_args()
     model, source = args.model.resolve(), args.source.resolve()
     cfg = read_config(model / "cfg_args")
-    iteration, ply = choose_iteration(model, args.iteration)
+    model_type = cfg.get("model_type", "3dgs")
+    iteration, ply = choose_iteration(model, args.iteration, model_type)
     manifest_path = model / "keyframes.json"
     manifest_name = cfg.get("keyframe_manifest", "")
     if manifest_name and not manifest_path.is_file():
@@ -92,7 +94,6 @@ def main():
     if selected is not None and not selected.issubset({c.image_name for c in cameras}):
         raise ValueError("Some selected training images are absent from the current COLMAP model")
 
-    model_type = cfg.get("model_type", "3dgs")
     if model_type == "scaffold":
         from models.scaffold_gaussian import ScaffoldGaussianModel
         from models.scaffold_renderer import render as render_scaffold, prefilter_voxel
@@ -105,6 +106,11 @@ def main():
     elif model_type == "3dgs":
         gaussians = GaussianModel(cfg.get("sh_degree", 3))
         gaussians.load_ply(str(ply))
+    elif model_type == "textured":
+        if args.antialiasing:
+            raise ValueError("Textured Gaussians does not support Graphdeco anti-aliasing; pass --no-antialiasing")
+        from models.textured_gaussian import TexturedGaussianModel
+        gaussians = TexturedGaussianModel.load(ply)
     else:
         raise ValueError(f"Unsupported saved model type: {model_type}")
     pipeline = SimpleNamespace(convert_SHs_python=False, compute_cov3D_python=False,
@@ -124,6 +130,8 @@ def main():
             if model_type == "scaffold":
                 visible = prefilter_voxel(camera, gaussians, pipeline, background)
                 pred = render_scaffold(camera, gaussians, pipeline, background, visible_mask=visible)["render"].clamp(0, 1)
+            elif model_type == "textured":
+                pred = gaussians.render(camera, background)[0].clamp(0, 1)
             else:
                 pred = render(camera, gaussians, pipeline, background, separate_sh=separate_sh,
                               use_trained_exp=False)["render"].clamp(0, 1)
@@ -154,4 +162,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
