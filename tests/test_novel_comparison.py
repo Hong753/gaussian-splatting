@@ -26,6 +26,40 @@ def cam(i, center, rotation=None):
 
 
 class TestNovelComparison(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg needed')
+    def test_textured_checkpoint_uses_same_poses_and_disables_aa(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'scene'
+            source.mkdir()
+            models = []
+            for kind in ('3dgs', 'textured'):
+                model = root / kind
+                folder = model / 'point_cloud/iteration_30000'
+                folder.mkdir(parents=True)
+                (folder / ('textured.pt' if kind == 'textured' else 'point_cloud.ply')).touch()
+                (model / 'cfg_args').write_text(f"Namespace(model_type='{kind}', source_path={str(source)!r}, white_background=False)")
+                models.append(model)
+            cameras = [cam(i, [i*0.1, 0, 0]) for i in range(24)]
+            output = root / 'out'
+            seen = []
+            def fake_frames(spec, seq, width, height, aa):
+                seen.append((spec['type'], [(c.R.tolist(), c.T.tolist()) for c in seq], aa))
+                for _ in seq:
+                    yield np.zeros((height, width, 3), dtype=np.uint8)
+            args = ['--source', str(source), '--model-3dgs', str(models[0]), '--model-textured', str(models[1]),
+                    '--output-dir', str(output), '--3dgs-aa', 'on', '--width', '64',
+                    '--fps', '5', '--duration', '1', '--source-window', '20']
+            with patch.object(mod.core, 'read_cameras', return_value=cameras), patch.object(mod.core, 'rendered_frames', side_effect=fake_frames):
+                mod.main(args)
+            self.assertEqual(seen[0][1], seen[1][1])
+            self.assertEqual([(x[0], x[2]) for x in seen], [('3dgs', True), ('textured', False)])
+            data = json.loads((output / 'trajectory.json').read_text())
+            self.assertEqual(data['side_by_side'], {'left': '3dgs', 'right': 'textured'})
+            self.assertFalse(data['models']['textured']['antialiasing'])
+            self.assertTrue((output / 'textured.mp4').is_file())
+            self.assertFalse((output / 'original.mp4').exists())
+
     def test_rotation_roundtrip_and_camera_convention(self):
         for angle in [0, 0.5, 2, np.pi]:
             r = np.array([[np.cos(angle), -np.sin(angle), 0],
@@ -117,4 +151,5 @@ class TestNovelComparison(unittest.TestCase):
             self.assertEqual((stream['width'],stream['height'],int(stream['nb_read_frames'])), (128,32,5))
 
 if __name__ == '__main__': unittest.main()
+
 

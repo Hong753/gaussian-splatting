@@ -256,12 +256,14 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--model-3dgs", required=True, type=Path)
-    parser.add_argument("--model-scaffold", required=True, type=Path)
+    second_model = parser.add_mutually_exclusive_group(required=True)
+    second_model.add_argument("--model-scaffold", type=Path)
+    second_model.add_argument("--model-textured", type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--iteration", type=int, default=30000)
     parser.add_argument("--3dgs-aa", dest="aa_3dgs", choices=["on", "off"], required=True)
-    parser.add_argument("--scaffold-aa", choices=["on", "off"], required=True)
+    parser.add_argument("--scaffold-aa", choices=["on", "off"])
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--fps", type=float, default=30)
     parser.add_argument("--duration", type=float, default=20, help="Video duration in seconds")
@@ -279,6 +281,10 @@ def main(argv=None):
     parser.add_argument("--crf", type=int, default=18)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
+    if args.model_scaffold and args.scaffold_aa is None:
+        parser.error("--scaffold-aa is required with --model-scaffold")
+    if args.model_textured and args.scaffold_aa is not None:
+        parser.error("--scaffold-aa applies only to --model-scaffold")
     if not all(math.isfinite(x) and x > 0 for x in (args.fps, args.duration)) or not 0 <= args.crf <= 51:
         parser.error("fps and duration must be positive, and crf must be between 0 and 51")
     if args.iteration != -1 and args.iteration < 1:
@@ -290,12 +296,15 @@ def main(argv=None):
     if not source.is_dir():
         parser.error(f"Scene not found: {source}")
     output = args.output_dir.expanduser().resolve()
-    outputs = [output / '3dgs.mp4', output / 'scaffold.mp4', output / 'side_by_side.mp4', output / 'trajectory.json']
+    other_type = "scaffold" if args.model_scaffold else "textured"
+    other_model = args.model_scaffold if args.model_scaffold else args.model_textured
+    other_aa = args.scaffold_aa if args.model_scaffold else "off"
+    outputs = [output / '3dgs.mp4', output / f'{other_type}.mp4', output / 'side_by_side.mp4', output / 'trajectory.json']
     if not args.overwrite and any(p.exists() for p in outputs):
         parser.error(f"Outputs already exist in {output}; choose another folder or use --overwrite")
     try:
         specs = [core.model_spec(args.model_3dgs, "3dgs", args.iteration, source),
-                 core.model_spec(args.model_scaffold, "scaffold", args.iteration, source)]
+                 core.model_spec(other_model, other_type, args.iteration, source)]
         if specs[0]['cfg'].get('white_background', False) != specs[1]['cfg'].get('white_background', False):
             raise ValueError("Models use different backgrounds")
         all_cameras = core.read_cameras(source)
@@ -316,11 +325,11 @@ def main(argv=None):
     details = {"source": str(source), "frame_count": len(cameras), "fps": args.fps,
                "duration_seconds": len(cameras) / args.fps, "width": width, "height": height,
                "source_segment": selection, "synthesis": synthesis, "trajectory_sha256": digest,
-               "side_by_side": {"left": "3dgs", "right": "scaffold"},
+               "side_by_side": {"left": "3dgs", "right": other_type},
                "color_protocol": "base model appearance; no per-image exposure transforms",
                "models": {s['type']: {"path": str(s['path']), "iteration": s['iteration'],
                                       "antialiasing": aa == 'on'}
-                          for s, aa in zip(specs, [args.aa_3dgs, args.scaffold_aa])}, "cameras": records}
+                          for s, aa in zip(specs, [args.aa_3dgs, other_aa])}, "cameras": records}
     outputs[3].write_text(json.dumps(details, indent=2, allow_nan=False) + '\n')
     print(f"Synthesized {len(cameras)} views from {len(segment)} cameras "
           f"({segment[0].image_name} to {segment[-1].image_name}).", flush=True)
@@ -328,7 +337,7 @@ def main(argv=None):
         print(f"Seed {args.seed}; max offset: {synthesis['max_actual_offset']:.5g} COLMAP units; "
               f"nearest-camera limit: {synthesis['nearest_camera_distance_limit']:.5g}. "
               "Bounds are approximate; path is not collision checked.", flush=True)
-    for spec, aa, destination in zip(specs, [args.aa_3dgs, args.scaffold_aa], outputs[:2]):
+    for spec, aa, destination in zip(specs, [args.aa_3dgs, other_aa], outputs[:2]):
         core.write_video(destination, core.rendered_frames(spec, cameras, width, height, aa == 'on'),
                          width, height, args.fps, args.crf)
     stack_two(outputs[0], outputs[1], outputs[2], args.crf)
@@ -338,4 +347,5 @@ def main(argv=None):
 
 if __name__ == '__main__':
     main()
+
 

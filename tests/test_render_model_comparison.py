@@ -26,6 +26,54 @@ def camera(name, width=100, height=50):
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_synthetic_minicam_retains_pose_for_textured_renderer(self):
+        class FakeTensor:
+            def __init__(self, array=None):
+                self.array = np.zeros((2, 4, 3), dtype=np.uint8) if array is None else np.asarray(array)
+            def transpose(self, *args): return self
+            def cuda(self): return self
+            def __matmul__(self, other): return self
+            def clamp(self, *args): return self
+            def permute(self, *args): return self
+            def mul(self, *args): return self
+            def byte(self): return self
+            def cpu(self): return self
+            def numpy(self): return self.array
+        class NoGrad:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+        class MiniCam:
+            def __init__(self, width, height, fovy, fovx, near, far, view, projection):
+                self.image_width, self.image_height = width, height
+                self.FoVx, self.FoVy = fovx, fovy
+        seen = []
+        def render(c):
+            seen.append(c)
+            return FakeTensor()
+        def module(name, **kwargs):
+            result = types.ModuleType(name)
+            result.__dict__.update(kwargs)
+            return result
+        torch = module('torch', tensor=lambda *a, **kw: FakeTensor(),
+                       float32=object(), no_grad=NoGrad,
+                       cuda=types.SimpleNamespace(empty_cache=lambda: None))
+        modules = {'torch': torch,
+                   'tqdm': module('tqdm', tqdm=lambda xs, **kw: xs),
+                   'scene': module('scene'),
+                   'scene.cameras': module('scene.cameras', MiniCam=MiniCam),
+                   'utils': module('utils'),
+                   'utils.graphics_utils': module('utils.graphics_utils',
+                       getWorld2View2=lambda r, t: np.eye(4),
+                       getProjectionMatrix=lambda **kw: FakeTensor())}
+        info = camera('frame')
+        info.T = np.array([1., 2., 3.])
+        with patch.dict(sys.modules, modules), patch.object(mod, 'load_renderer', return_value=render):
+            images = list(mod.rendered_frames({'type': 'textured'}, [info], 4, 2, False))
+        self.assertEqual(len(images), 1)
+        np.testing.assert_array_equal(seen[0].R, info.R)
+        np.testing.assert_array_equal(seen[0].T, info.T)
+        self.assertEqual((seen[0].FoVx, seen[0].FoVy), (info.FovX, info.FovY))
+
     def test_natural_order_selection_and_dimensions(self):
         cams = [camera('frame10.png'), camera('frame2.png'), camera('frame1.png'), camera('frame3.png')]
         selected = mod.make_trajectory(cams, 1, 2, None)
@@ -118,4 +166,5 @@ class ComparisonTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
 

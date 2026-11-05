@@ -31,7 +31,7 @@ def model_spec(path, expected_type, iteration, source):
     if not saved_source or Path(saved_source).expanduser().resolve() != source:
         raise ValueError(f"{path}: saved source {saved_source!r} does not match {source}; "
                          "camera coordinate systems must match")
-    saved_iteration, ply = choose_iteration(path, iteration)
+    saved_iteration, ply = choose_iteration(path, iteration, actual)
     if expected_type == "scaffold":
         missing = [name for name in ("opacity_mlp.pt", "cov_mlp.pt", "color_mlp.pt")
                    if not (ply.parent / name).is_file()]
@@ -153,6 +153,11 @@ def read_cameras(source):
     if (model / "images.bin").is_file() and (model / "cameras.bin").is_file():
         images = read_extrinsics_binary(str(model / "images.bin"))
         cameras = read_intrinsics_binary(str(model / "cameras.bin"))
+    elif spec["type"] == "textured":
+        if aa:
+            raise ValueError("Textured Gaussians does not support Graphdeco anti-aliasing")
+        from models.textured_gaussian import TexturedGaussianModel
+        gaussians = TexturedGaussianModel.load(spec["ply"])
     else:
         images = read_extrinsics_text(str(model / "images.txt"))
         cameras = read_intrinsics_text(str(model / "cameras.txt"))
@@ -194,6 +199,8 @@ def load_renderer(spec, aa):
             if not bool(visible.any()):
                 return bg[:, None, None].expand(3, cam.image_height, cam.image_width)
             return render_scaffold(cam, gaussians, pipe, bg, visible_mask=visible)["render"]
+        if spec["type"] == "textured":
+            return gaussians.render(cam, bg)[0]
         return render_3dgs(cam, gaussians, pipe, bg, separate_sh=separate_sh,
                            use_trained_exp=False)["render"]
     return render
@@ -214,6 +221,9 @@ def rendered_frames(spec, cameras, width, height, aa):
                                                  fovY=info.FovY).transpose(0, 1).cuda()
                 cam = MiniCam(width, height, info.FovY, info.FovX, 0.01, 100.0,
                               world_view, world_view @ projection)
+                # The texture renderer needs the original COLMAP pose to form
+                # its world-to-camera matrix; MiniCam normally stores only GPU transforms.
+                cam.R, cam.T = info.R, info.T
                 image = render(cam).clamp(0, 1).permute(1, 2, 0).mul(255).byte().cpu().numpy()
                 yield image
     finally:
@@ -295,4 +305,5 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+
 

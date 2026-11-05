@@ -218,8 +218,12 @@ freeze Gaussian centers. It is a different optimization setup from Graphdeco
 3DGS and is not a direct reproduction of the paper's internal implementation.
 Graphdeco anti-aliasing, exposure compensation and depth regularization are not
 supported; explicitly pass `--no-antialiasing --no-exposure-compensation`.
-The live SIBR viewer and existing 3DGS/Scaffold trajectory renderers do not
-support this model. A texture-aware all-frame PSNR evaluator is run after
+The live SIBR viewer and the three-panel original-image comparison renderer do
+not support this model. The two-panel novel-view renderer accepts
+`--model-textured` instead of `--model-scaffold`; it renders 3DGS on the
+left and Textured Gaussians on the right using exactly the same synthetic
+poses. Set `--3dgs-aa` for the 3DGS model; Graphdeco AA is unavailable for
+the textured renderer. A texture-aware all-frame PSNR evaluator is run after
 training and saves per-frame and aggregate results in the usual output folder.
 The checkpoint `point_cloud/iteration_<refinement steps>/textured.pt` contains
 both Gaussian attributes and textures; it is not a SuperSplat-compatible PLY.
@@ -266,5 +270,6 @@ offsets, source segment, generated poses, AA flags, and model iterations. As
 with the original-trajectory comparison, models use base appearance without
 per-image exposure transforms. Set AA for each model explicitly and use an
 empty output folder.
+
 
 
