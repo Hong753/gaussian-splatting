@@ -160,3 +160,37 @@ render width to trade quality for responsiveness. The viewer uses the base
 appearance without per-training-image exposure compensation. Rendering a saved
 iteration is separate from training; select a different PLY to inspect another.
 
+
+
+### Compare 3DGS and Scaffold-GS along one camera trajectory
+
+`scripts/render_model_comparison.py` renders the same COLMAP-registered camera
+sequence for both saved models, in natural filename order. It saves `3dgs.mp4`,
+`scaffold.mp4`, `side_by_side.mp4` (3DGS left), and `trajectory.json`, including
+all camera poses, frame order, rendering settings and a SHA-256 fingerprint.
+Both runs must have been trained from the specified scene path. Rendering uses the
+base scene appearance; per-image exposure transforms are not applied.
+
+The script requires `ffmpeg` with the `libx264` encoder. Images are not loaded;
+the COLMAP camera intrinsics and poses supply the trajectory. The default video
+width is 1280 pixels and all source cameras must have the same aspect ratio.
+Set the AA option for each model explicitly: saved 3DGS configs do not record
+whether AA was enabled. Use an empty output directory for each comparison.
+For a short check use `--max-frames 60`; omit it for the full trajectory. Output
+fps defines playback speed; it is not derived from the original timestamps.
+
+```bash
+python scripts/render_model_comparison.py \
+  --source /path/to/scene \
+  --model-3dgs /path/to/3dgs_run \
+  --model-scaffold /path/to/scaffold_run \
+  --output-dir /path/to/comparison \
+  --iteration 30000 --gpu 0 --3dgs-aa on --scaffold-aa off \
+  --width 1280 --fps 30
+```
+
+`--start`, `--stride`, and `--max-frames` choose a subset from the natural-order
+COLMAP trajectory. A stride larger than 1 omits frames (and therefore changes
+playback speed unless fps is adjusted). The two models are loaded and rendered
+sequentially on the same GPU. Default `--iteration 30000` selects the same
+iteration for both; `-1` selects each model's latest, which may differ.

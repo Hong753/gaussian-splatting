@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Render 3DGS and Scaffold-GS along exactly the same registered COLMAP cameras.
+
+No images are loaded into memory. The two videos use a shared camera manifest
+and are accompanied by a side-by-side video (3DGS left, Scaffold right).
+"""
+import argparse
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+from types import SimpleNamespace
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from eval_all_frames import read_config, choose_iteration
+from keyframes import natural_key
+
+
+def model_spec(path, expected_type, iteration, source):
+    path = Path(path).expanduser().resolve()
+    cfg = read_config(path / "cfg_args")
+    actual = cfg.get("model_type", "3dgs")
+    if actual != expected_type:
+        raise ValueError(f"{path} is model type {actual!r}, expected {expected_type!r}")
+    saved_source = cfg.get("source_path")
+    if not saved_source or Path(saved_source).expanduser().resolve() != source:
+        raise ValueError(f"{path}: saved source {saved_source!r} does not match {source}; "
+                         "camera coordinate systems must match")
+    saved_iteration, ply = choose_iteration(path, iteration)
+    if expected_type == "scaffold":
+        missing = [name for name in ("opacity_mlp.pt", "cov_mlp.pt", "color_mlp.pt")
+                   if not (ply.parent / name).is_file()]
+        if missing:
+            raise FileNotFoundError(f"Missing Scaffold MLPs in {ply.parent}: {', '.join(missing)}")
+    return {"path": path, "cfg": cfg, "iteration": saved_iteration, "ply": ply, "type": actual}
+
+
+def make_trajectory(cameras, start, stride, max_frames):
+    if start < 0 or stride < 1 or (max_frames is not None and max_frames < 1):
+        raise ValueError("start must be nonnegative; stride and max-frames must be positive")
+    names = [camera.image_name for camera in cameras]
+    if len(names) != len(set(names)):
+        raise ValueError("COLMAP contains duplicate image names")
+    ordered = sorted(cameras, key=lambda camera: natural_key(camera.image_name))
+    chosen = ordered[start::stride]
+    if max_frames is not None:
+        chosen = chosen[:max_frames]
+    if not chosen:
+        raise ValueError("No camera frames selected")
+    # A single output video must keep its field-of-view and aspect well-defined.
+    aspect = chosen[0].width / chosen[0].height
+    if any(not math.isclose(c.width / c.height, aspect, rel_tol=1e-4) for c in chosen):
+        raise ValueError("COLMAP cameras have different aspect ratios; use a same-aspect camera subset")
+    if any(not all(math.isfinite(float(value)) for value in (c.FovX, c.FovY))
+           or c.FovX <= 0 or c.FovY <= 0 for c in chosen):
+        raise ValueError("Invalid COLMAP field of view")
+    return chosen
+
+
+def trajectory_record(cameras):
+    return [{"image_name": c.image_name, "width": int(c.width), "height": int(c.height),
+             "fov_x": float(c.FovX), "fov_y": float(c.FovY),
+             "R": c.R.tolist(), "T": c.T.tolist()} for c in cameras]
+
+
+def video_dimensions(cameras, width):
+    if width < 2 or width % 2:
+        raise ValueError("--width must be a positive even integer of at least 2 pixels")
+    height = max(2, 2 * round(width * cameras[0].height / cameras[0].width / 2))
+    return width, height
+
+
+def ffmpeg_command(path, width, height, fps, crf):
+    return ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo",
+            "-pixel_format", "rgb24", "-video_size", f"{width}x{height}",
+            "-framerate", str(fps), "-i", "pipe:0", "-an", "-c:v", "libx264",
+            "-crf", str(crf), "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(path)]
+
+
+def write_video(path, frames, width, height, fps, crf):
+    """Stream frames to a temporary MP4 and publish it only after encoding succeeds."""
+    temp = path.with_name(path.stem + ".partial.mp4")
+    proc = subprocess.Popen(ffmpeg_command(temp, width, height, fps, crf), stdin=subprocess.PIPE)
+    try:
+        for image in frames:
+            if image.shape != (height, width, 3) or str(image.dtype) != "uint8":
+                raise ValueError(f"Invalid frame shape/dtype {image.shape}/{image.dtype}")
+            proc.stdin.write(image.tobytes())
+        proc.stdin.close()
+        proc.stdin = None
+        code = proc.wait()
+        if code:
+            raise RuntimeError(f"ffmpeg failed for {path.name} (exit {code})")
+        os.replace(temp, path)
+    except BaseException:
+        if proc.stdin is not None:
+            try:
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
+        if proc.poll() is None:
+            proc.terminate()
+        proc.wait()
+        temp.unlink(missing_ok=True)
+        raise
+
+
+def compare_side_by_side(left, right, output, crf):
+    temp = output.with_name(output.stem + ".partial.mp4")
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(left), "-i", str(right),
+           "-filter_complex", "[0:v][1:v]hstack=inputs=2[v]", "-map", "[v]", "-an",
+           "-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(temp)]
+    try:
+        subprocess.run(cmd, check=True)
+        os.replace(temp, output)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def read_cameras(source):
+    from scene.colmap_loader import (read_extrinsics_binary, read_intrinsics_binary,
+                                     read_extrinsics_text, read_intrinsics_text)
+    from scene.dataset_readers import readColmapCameras
+    from utils.colmap_paths import colmap_model_dir
+    model = Path(colmap_model_dir(source))
+    if (model / "images.bin").is_file() and (model / "cameras.bin").is_file():
+        images = read_extrinsics_binary(str(model / "images.bin"))
+        cameras = read_intrinsics_binary(str(model / "cameras.bin"))
+    else:
+        images = read_extrinsics_text(str(model / "images.txt"))
+        cameras = read_intrinsics_text(str(model / "cameras.txt"))
+    result = readColmapCameras(images, cameras, None, str(source / "images"), "", [])
+    del images, cameras
+    return result
+
+
+def load_renderer(spec, aa):
+    import torch
+    from scene.gaussian_model import GaussianModel
+    from gaussian_renderer import render as render_3dgs
+    try:
+        from diff_gaussian_rasterization import SparseGaussianAdam
+        separate_sh = True
+    except ImportError:
+        separate_sh = False
+    cfg = spec["cfg"]
+    if spec["type"] == "scaffold":
+        from models.scaffold_gaussian import ScaffoldGaussianModel
+        from models.scaffold_renderer import render as render_scaffold, prefilter_voxel
+        gaussians = ScaffoldGaussianModel(feat_dim=cfg.get("scaffold_feat_dim", 32),
+                        n_offsets=cfg.get("scaffold_n_offsets", 10),
+                        voxel_size=cfg.get("scaffold_voxel_size", 0.001),
+                        update_init_factor=16, appearance_dim=0)
+        gaussians.load_ply(str(spec["ply"]))
+        gaussians.eval()
+    else:
+        gaussians = GaussianModel(cfg.get("sh_degree", 3))
+        gaussians.load_ply(str(spec["ply"]))
+    pipe = SimpleNamespace(convert_SHs_python=False, compute_cov3D_python=False,
+                           debug=False, antialiasing=aa)
+    bg_color = [1, 1, 1] if cfg.get("white_background", False) else [0, 0, 0]
+    bg = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+    def render(cam):
+        if spec["type"] == "scaffold":
+            visible = prefilter_voxel(cam, gaussians, pipe, bg)
+            if not bool(visible.any()):
+                return bg[:, None, None].expand(3, cam.image_height, cam.image_width)
+            return render_scaffold(cam, gaussians, pipe, bg, visible_mask=visible)["render"]
+        return render_3dgs(cam, gaussians, pipe, bg, separate_sh=separate_sh,
+                           use_trained_exp=False)["render"]
+    return render
+
+
+def rendered_frames(spec, cameras, width, height, aa):
+    import torch
+    from tqdm import tqdm
+    from scene.cameras import MiniCam
+    from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+    render = load_renderer(spec, aa)
+    try:
+        with torch.no_grad():
+            for info in tqdm(cameras, desc=f"Rendering {spec['type']}", unit="frame"):
+                world_view = torch.tensor(getWorld2View2(info.R, info.T), dtype=torch.float32,
+                                          device="cuda").transpose(0, 1)
+                projection = getProjectionMatrix(znear=0.01, zfar=100.0, fovX=info.FovX,
+                                                 fovY=info.FovY).transpose(0, 1).cuda()
+                cam = MiniCam(width, height, info.FovY, info.FovX, 0.01, 100.0,
+                              world_view, world_view @ projection)
+                image = render(cam).clamp(0, 1).permute(1, 2, 0).mul(255).byte().cpu().numpy()
+                yield image
+    finally:
+        del render
+        torch.cuda.empty_cache()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", required=True, type=Path)
+    parser.add_argument("--model-3dgs", required=True, type=Path)
+    parser.add_argument("--model-scaffold", required=True, type=Path)
+    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--iteration", type=int, default=30000, help="Use same iteration for both; -1 = latest in each")
+    parser.add_argument("--gpu", default="0")
+    parser.add_argument("--3dgs-aa", choices=["on", "off"], required=True, dest="aa_3dgs")
+    parser.add_argument("--scaffold-aa", choices=["on", "off"], required=True)
+    parser.add_argument("--width", type=int, default=1280)
+    parser.add_argument("--fps", type=float, default=30)
+    parser.add_argument("--start", type=int, default=0, help="Starting index in naturally sorted COLMAP images")
+    parser.add_argument("--stride", type=int, default=1, help="Keep every Nth registered camera")
+    parser.add_argument("--max-frames", type=int, default=None, help="Optional limit after start/stride")
+    parser.add_argument("--crf", type=int, default=18, help="H.264 quality; lower is higher quality")
+    parser.add_argument("--overwrite", action="store_true")
+    args = parser.parse_args(argv)
+    if not math.isfinite(args.fps) or args.fps <= 0 or not 0 <= args.crf <= 51:
+        parser.error("--fps must be positive and --crf must be between 0 and 51")
+    if args.iteration != -1 and args.iteration < 1:
+        parser.error("--iteration must be positive or -1")
+    if shutil.which("ffmpeg") is None:
+        parser.error("ffmpeg is required (including an H.264 libx264 encoder)")
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    source = args.source.expanduser().resolve()
+    if not source.is_dir():
+        parser.error(f"Scene not found: {source}")
+    output = args.output_dir.expanduser().resolve()
+    output_files = [output / "3dgs.mp4", output / "scaffold.mp4", output / "side_by_side.mp4", output / "trajectory.json"]
+    if not args.overwrite and any(path.exists() for path in output_files):
+        parser.error(f"Comparison outputs already exist in {output}; choose a new folder or use --overwrite")
+    try:
+        specs = [model_spec(args.model_3dgs, "3dgs", args.iteration, source),
+                 model_spec(args.model_scaffold, "scaffold", args.iteration, source)]
+        if specs[0]["cfg"].get("white_background", False) != specs[1]["cfg"].get("white_background", False):
+            raise ValueError("The runs use different background colors; comparisons require the same background")
+        cameras = make_trajectory(read_cameras(source), args.start, args.stride, args.max_frames)
+        width, height = video_dimensions(cameras, args.width)
+    except (OSError, ValueError, KeyError) as exc:
+        parser.error(str(exc))
+    output.mkdir(parents=True, exist_ok=True)
+    records = trajectory_record(cameras)
+    trajectory_hash = hashlib.sha256(json.dumps(records, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    details = {"source": str(source), "ordering": "natural sort of COLMAP image names",
+               "start_index": args.start, "stride": args.stride, "frame_count": len(records),
+               "fps": args.fps, "width": width, "height": height, "trajectory_sha256": trajectory_hash,
+               "color_protocol": "base model appearance; no per-image exposure transforms",
+               "side_by_side": {"left": "3dgs", "right": "scaffold"},
+               "models": {s["type"]: {"path": str(s["path"]), "iteration": s["iteration"],
+                          "antialiasing": aa == "on"} for s, aa in zip(specs, [args.aa_3dgs, args.scaffold_aa])},
+               "cameras": records}
+    (output / "trajectory.json").write_text(json.dumps(details, indent=2, allow_nan=False) + "\n")
+    print(f"Rendering {len(cameras)} frames at {width}x{height}, {args.fps:g} fps on GPU {args.gpu}", flush=True)
+    for spec, aa, destination in zip(specs, [args.aa_3dgs, args.scaffold_aa], output_files[:2]):
+        frames = rendered_frames(spec, cameras, width, height, aa == "on")
+        write_video(destination, frames, width, height, args.fps, args.crf)
+    compare_side_by_side(output_files[0], output_files[1], output_files[2], args.crf)
+    for path in output_files:
+        print(path)
+
+
+if __name__ == "__main__":
+    main()
