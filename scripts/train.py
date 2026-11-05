@@ -9,6 +9,7 @@ import argparse
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 
@@ -80,6 +81,8 @@ def main(argv=None):
     parser.add_argument("--depths", default=DEPTHS, help="Optional depth-prior directory for native depth regularization")
     parser.add_argument("--select-keyframes", action="store_true", default=SELECT_KEYFRAMES,
                         help="Select the sharpest registered training image per consecutive group")
+    parser.add_argument("--keyframe-manifest", type=Path,
+                        help="Reuse an existing keyframe manifest and copy it into the new run")
     parser.add_argument("--keyframe-group-size", type=int, default=KEYFRAME_GROUP_SIZE)
     parser.add_argument("--selection-only", action="store_true", help="Select keyframes without launching training")
     parser.add_argument("--eval-all-frames", action=argparse.BooleanOptionalAction, default=EVAL_ALL_FRAMES,
@@ -113,6 +116,10 @@ def main(argv=None):
         parser.error("--resolution must be -1 or a positive integer")
     if args.keyframe_group_size < 1:
         parser.error("--keyframe-group-size must be positive")
+    if args.keyframe_manifest and (args.select_keyframes or args.evaluate_only):
+        parser.error("--keyframe-manifest cannot be combined with --select-keyframes or --evaluate-only")
+    if args.keyframe_manifest and not args.keyframe_manifest.expanduser().is_file():
+        parser.error(f"Keyframe manifest does not exist: {args.keyframe_manifest}")
     if args.selection_only and not args.select_keyframes:
         parser.error("--selection-only requires --select-keyframes")
     if args.evaluate_only and args.selection_only:
@@ -139,9 +146,9 @@ def main(argv=None):
     if any(x in ("-s", "--source_path", "-m", "--model_path") or
            x.startswith(("--source_path=", "--model_path=")) for x in [*EXTRA_ARGS, *extra]):
         parser.error("Set scene and output paths using launcher options, not extra train.py arguments")
-    if args.select_keyframes and any(x in ("--eval", "--train_test_exp", "-i", "--images", "--keyframe_manifest") or
+    if (args.select_keyframes or args.keyframe_manifest) and any(x in ("--eval", "--train_test_exp", "-i", "--images", "--keyframe_manifest") or
             x.startswith(("--images=", "--keyframe_manifest=")) for x in [*EXTRA_ARGS, *extra]):
-        parser.error("With keyframe selection, use launcher --eval/--images and do not pass --train_test_exp or --keyframe_manifest")
+        parser.error("With keyframes, use launcher --eval/--images and do not pass --train_test_exp or --keyframe_manifest")
 
     root = args.data_root.expanduser().resolve()
     if Path(".") in scene_paths and not root.name:
@@ -168,6 +175,8 @@ def main(argv=None):
                 parser.error(str(exc))
         if args.select_keyframes and not has_colmap:
             parser.error("Keyframe selection currently supports COLMAP scenes only")
+        if args.keyframe_manifest and not has_colmap:
+            parser.error("Keyframe manifests currently support COLMAP scenes only")
         if args.evaluate_only and not has_colmap:
             parser.error("All-frame PSNR currently supports COLMAP scenes only")
         if output.exists() and not output.is_dir():
@@ -206,7 +215,7 @@ def main(argv=None):
             cmd.extend(["--optimizer_type", args.optimizer_type])
         if args.depths:
             cmd.extend(["--depths", args.depths])
-        if args.select_keyframes and not args.evaluate_only:
+        if (args.select_keyframes or args.keyframe_manifest) and not args.evaluate_only:
             cmd.extend(["--keyframe_manifest", str(output / "keyframes.json")])
         cmd.extend(EXTRA_ARGS)
         cmd.extend(extra)
@@ -215,6 +224,15 @@ def main(argv=None):
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = args.gpu
     for scene, source, output, cmd, has_colmap in jobs:
+        if args.keyframe_manifest:
+            manifest_source = args.keyframe_manifest.expanduser().resolve()
+            manifest_destination = output / "keyframes.json"
+            if args.dry_run:
+                print(f"\n[{scene}] Would copy keyframe manifest {manifest_source} to {manifest_destination}", flush=True)
+            else:
+                output.mkdir(parents=True, exist_ok=True)
+                if manifest_source != manifest_destination:
+                    shutil.copyfile(manifest_source, manifest_destination)
         if args.select_keyframes and not args.evaluate_only:
             if args.dry_run:
                 print(f"\n[{scene}] Would select the sharpest frame per {args.keyframe_group_size} "
@@ -259,6 +277,7 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 

@@ -200,6 +200,34 @@ iteration for both; `-1` selects each model's latest, which may differ.
 
 
 
+### Monocular depth aligned to a registered point cloud
+
+`scripts/preprocess_depth.py` predicts single-image relative inverse depth
+with Depth Anything V2 Large for the exact images listed in a keyframe manifest.
+It saves 16-bit PNGs and fits a per-image affine transform to inverse
+camera-space z values of the point cloud. The default cloud is the scene's
+COLMAP `points3D.ply`; pass `--point-cloud` to use another PLY that is
+already registered in the exact same coordinate system. The script cannot
+determine whether the default PLY actually came from LiDAR.
+
+Each image is calibrated using projected points and a coarse nearest-point
+z-buffer. This approximates visibility; it does not guarantee correct
+occlusion, registration, synchronization, or static-scene assumptions. A
+random point holdout and relative residual checks flag some unreliable frames,
+but are not independent multi-view geometric validation. Training disables
+the depth loss for those frames and masks nonpositive aligned values.
+`alignment_report.json` lists the accepted frames and diagnostics. By default
+the preparation exits with an error if fewer than 80% pass.
+
+The first invocation downloads a pinned DA-v2 checkout and approximately 1.3 GB
+of pretrained weights into `~/.cache/3dgs_depth`. DA-v2 Large weights have
+their own non-commercial license. A working GPU PyTorch, torchvision, OpenCV,
+and internet access are required. The output folder must be empty or contain an
+interrupted preparation with the same inputs and settings. The command
+does not modify the original images, point cloud, COLMAP reconstruction, or the
+original `depth_params.json`. Passing the output directory to the training
+launcher with `--depths` selects its own alignment file.
+
 ### Textured Gaussians
 
 `--model-type textured` uses the public [Textured Gaussians
@@ -270,6 +298,7 @@ offsets, source segment, generated poses, AA flags, and model iterations. As
 with the original-trajectory comparison, models use base appearance without
 per-image exposure transforms. Set AA for each model explicitly and use an
 empty output folder.
+
 
 
 

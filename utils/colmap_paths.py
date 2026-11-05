@@ -19,3 +19,10 @@ def colmap_model_dir(source_path):
         f"No COLMAP image/camera pair found in {sparse / '0'} or {sparse}; "
         "expected matching images.bin + cameras.bin or images.txt + cameras.txt"
     )
+
+
+def depth_params_path(source_path, model_dir, depths):
+    """Prefer parameters stored with depth maps, falling back to legacy COLMAP."""
+    local = Path(source_path) / depths / "depth_params.json"
+    return local if local.is_file() else Path(model_dir) / "depth_params.json"
+

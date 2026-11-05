@@ -38,6 +38,22 @@ class TrainLauncherTests(unittest.TestCase):
         self.assertIn("--port 6009", result.stdout)
         self.assertFalse(self.output.exists())
 
+    def test_existing_keyframe_manifest_is_forwarded_without_reselection(self):
+        manifest = Path(self.temp.name) / "baseline_keyframes.json"
+        manifest.write_text('{"selected_images":["frame.png"]}')
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--data-root", str(self.root),
+             "--output-root", str(self.output), "--scenes", "orange_4F/1_full",
+             "--name", "depth", "--keyframe-manifest", str(manifest),
+             "--depths", "/tmp/depths", "--no-exposure-compensation", "--dry-run"],
+            text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Would copy keyframe manifest", result.stdout)
+        self.assertIn(str(self.output / "orange_4F/1_full/depth/keyframes.json"), result.stdout)
+        self.assertIn("--depths /tmp/depths", result.stdout)
+        self.assertNotIn("Would select", result.stdout)
+        self.assertFalse(self.output.exists())
+
     def test_data_root_itself_can_be_scene(self):
         result = self.run_launcher(self.scene, ".")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -130,6 +146,7 @@ class TrainLauncherTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

@@ -14,6 +14,7 @@ from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 from utils.general_utils import PILtoTorch
+from utils.depth_alignment import apply_alignment
 import cv2
 
 class Camera(nn.Module):
@@ -61,20 +62,9 @@ class Camera(nn.Module):
         self.depth_reliable = False
         if invdepthmap is not None:
             self.depth_mask = torch.ones_like(self.alpha_mask)
-            self.invdepthmap = cv2.resize(invdepthmap, resolution)
-            self.invdepthmap[self.invdepthmap < 0] = 0
-            self.depth_reliable = True
-
-            if depth_params is not None:
-                if depth_params["scale"] < 0.2 * depth_params["med_scale"] or depth_params["scale"] > 5 * depth_params["med_scale"]:
-                    self.depth_reliable = False
-                    self.depth_mask *= 0
-                
-                if depth_params["scale"] > 0:
-                    self.invdepthmap = self.invdepthmap * depth_params["scale"] + depth_params["offset"]
-
-            if self.invdepthmap.ndim != 2:
-                self.invdepthmap = self.invdepthmap[..., 0]
+            resized_depth = cv2.resize(invdepthmap, resolution)
+            self.invdepthmap, valid_depth, self.depth_reliable = apply_alignment(resized_depth, depth_params)
+            self.depth_mask *= torch.from_numpy(valid_depth.astype(np.float32)[None]).to(self.data_device)
             self.invdepthmap = torch.from_numpy(self.invdepthmap[None]).to(self.data_device)
 
         self.zfar = 100.0
@@ -100,4 +90,5 @@ class MiniCam:
         self.full_proj_transform = full_proj_transform
         view_inv = torch.inverse(self.world_view_transform)
         self.camera_center = view_inv[3][:3]
+
 

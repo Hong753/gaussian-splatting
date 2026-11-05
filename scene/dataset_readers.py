@@ -16,7 +16,7 @@ from typing import NamedTuple
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
-from utils.colmap_paths import colmap_model_dir
+from utils.colmap_paths import colmap_model_dir, depth_params_path
 import numpy as np
 import json
 from pathlib import Path
@@ -101,10 +101,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         n_remove = len(extr.name.split('.')[-1]) + 1
         depth_params = None
         if depths_params is not None:
-            try:
-                depth_params = depths_params[extr.name[:-n_remove]]
-            except:
-                print("\n", key, "not found in depths_params")
+            depth_params = depths_params.get(extr.name[:-n_remove])
 
         image_path = os.path.join(images_folder, extr.name)
         image_name = extr.name
@@ -157,7 +154,9 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8,
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
-    depth_params_file = os.path.join(model_dir, "depth_params.json")
+    # Prefer the alignment accompanying a particular depth-map set; retain
+    # the upstream location as a fallback for existing datasets.
+    depth_params_file = depth_params_path(path, model_dir, depths) if depths else ""
     ## if depth_params_file isnt there AND depths file is here -> throw error
     depths_params = None
     if depths != "":
@@ -218,6 +217,11 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8,
         if not train_cam_infos:
             raise ValueError("Keyframe manifest selects no training cameras")
         print(f"Using {len(train_cam_infos)} selected training cameras; keeping {len(test_cam_infos)} test cameras")
+
+    if depths_params is not None:
+        missing_depth_params = sum(c.depth_params is None for c in train_cam_infos)
+        if missing_depth_params:
+            print(f"Warning: {missing_depth_params} training cameras have no depth alignment; depth loss will be disabled for them")
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
@@ -332,3 +336,4 @@ sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
     "Blender" : readNerfSyntheticInfo
 }
+
