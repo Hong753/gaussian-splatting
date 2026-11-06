@@ -127,6 +127,7 @@ class SurfaceExperimentTests(unittest.TestCase):
         m._exposure = torch.nn.Parameter(torch.zeros(1, 3, 4))
         m.spatial_lr_scale = 1
         args = types.SimpleNamespace(surface_mode='constrained', percent_dense=.01, absgs=True,
+            position_warmup_steps=0, position_ramp_steps=0,
             position_lr_init=.001, position_lr_final=.00001, position_lr_delay_mult=.01,
             position_lr_max_steps=100, feature_lr=.01, opacity_lr=.01, scaling_lr=.01,
             rotation_lr=.01, exposure_lr_init=.01, exposure_lr_final=.001,
@@ -145,6 +146,19 @@ class SurfaceExperimentTests(unittest.TestCase):
         args.surface_mode = 'tangent'
         with self.assertRaises(ValueError):
             restored.restore(state, args)
+
+    def test_position_scheduler_controls_actual_optimizer(self):
+        m = self.model()
+        m.pretrained_exposures = object()
+        m.position_warmup_steps = 7000
+        m.position_ramp_steps = 3000
+        m.xyz_scheduler_args = lambda step: .003 if step == 0 else .001
+        self.assertEqual(m.update_learning_rate(7000), 0.)
+        self.assertEqual(m.optimizer.param_groups[0]['lr'], 0.)
+        self.assertAlmostEqual(m.update_learning_rate(8500), .0015)
+        self.assertAlmostEqual(m.optimizer.param_groups[0]['lr'], .0015)
+        self.assertAlmostEqual(m.update_learning_rate(10000), .003)
+        self.assertAlmostEqual(m.update_learning_rate(10001), .001)
 
     def test_surface_loss_penalizes_normal_motion_and_not_tangent(self):
         m = self.model()

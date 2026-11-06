@@ -371,3 +371,27 @@ an inherited patch's support; there is no periodic reassociation. The final
 PLY remains a standard 3DGS model. `measure_lidar_distance.py` measures
 sampled Gaussian-center distance to the nearest input point, in scene units;
 this is not a point-to-surface distance and is sensitive to LiDAR density.
+
+### Sparse LiDAR depth and position warmup
+
+`scripts/preprocess_lidar_depth.py` projects the original registered input PLY
+into selected COLMAP cameras and stores sparse camera-z samples in each training
+image. A coarse cell z-buffer keeps frontmost projected samples, but is only an
+approximation to visibility and can miss a foreground surface. It uses the
+centered principal point and pixel convention of this repository's Graphdeco
+renderer, which does not use COLMAP principal-point offsets. The sparse depth
+resolution must match the launcher's `--resolution`.
+
+Pass native `--lidar_depth_dir PATH --lidar_depth_weight 0.02` to supervise
+sampled rendered inverse depth. The robust loss compares alpha-weighted rendered
+inverse depth to 1 / LiDAR camera-z, normalized per valid sample. The renderer's
+output is not normalized by accumulated opacity, so incomplete opacity also
+affects this loss. `--lidar_depth_start` delays the loss until the requested
+iteration; no depth is used if the weight is zero.
+
+`--position_warmup_steps N` freezes xyz and its Adam moments through N;
+`--position_ramp_steps M` linearly ramps the xyz learning rate after warmup.
+The usual exponential schedule starts after this ramp. Other Gaussian
+attributes still train during warmup. Set `--densification_phase_offset N` to
+shift the ordinary densification and opacity-reset schedule by N iterations;
+without these options the original training behavior is unchanged.

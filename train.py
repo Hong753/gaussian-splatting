@@ -53,6 +53,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             import diff_gaussian_rasterization_abs
         except ImportError as exc:
             raise ImportError("Install the separate AbsGS rasterizer; see scripts/README.md") from exc
+    if min(opt.position_warmup_steps, opt.position_ramp_steps, opt.densification_phase_offset, opt.lidar_depth_start) < 0:
+        raise ValueError("Warmup, ramp, phase offset and LiDAR start must be nonnegative")
+    if opt.lidar_depth_weight < 0 or (opt.lidar_depth_weight > 0 and not opt.lidar_depth_dir):
+        raise ValueError("LiDAR depth weight must be nonnegative and requires --lidar_depth_dir")
+    if opt.lidar_depth_weight > 0 and dataset.depths:
+        raise ValueError("Use either sparse LiDAR or monocular depth regularization, not both")
+    for name in ("position_warmup_steps", "position_ramp_steps", "position_lr_init", "position_lr_final",
+                 "position_lr_max_steps", "densification_phase_offset", "lidar_depth_dir", "lidar_depth_weight", "lidar_depth_start"):
+        setattr(dataset, name, getattr(opt, name))
     if opt.surface_mode not in ("off", "tangent", "constrained"):
         raise ValueError("surface_mode must be off, tangent, or constrained")
     if opt.surface_mode != "off":
@@ -76,6 +85,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if opt.surface_mode != "off":
         gaussians.initialize_surface(opt.surface_patches, opt.surface_mode, opt.surface_confidence, opt.surface_thickness)
     gaussians.training_setup(opt)
+    if opt.lidar_depth_weight > 0:
+        from utils.sparse_lidar import check_dataset, load_frame, lidar_loss
+        check_dataset(opt.lidar_depth_dir, dataset.source_path, scene.getTrainCameras(), dataset.resolution)
+        print(f"Sparse LiDAR supervision enabled from step {opt.lidar_depth_start} (weight {opt.lidar_depth_weight})")
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -93,6 +106,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+    ema_lidar_for_log = 0.0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -116,7 +130,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_start.record()
 
-        gaussians.update_learning_rate(iteration)
+        position_lr = gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -167,6 +181,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
+        lidar_weighted_log = 0.0
+        if opt.lidar_depth_weight > 0 and iteration >= opt.lidar_depth_start:
+            lidar_u, lidar_v, lidar_z = load_frame(opt.lidar_depth_dir, viewpoint_cam)
+            lidar_depth_loss = lidar_loss(render_pkg["depth"], lidar_u, lidar_v, lidar_z, viewpoint_cam.alpha_mask)
+            loss = loss + opt.lidar_depth_weight * lidar_depth_loss
+            lidar_weighted_log = opt.lidar_depth_weight * lidar_depth_loss.item()
+            if tb_writer and iteration % 100 == 0:
+                tb_writer.add_scalar('train_loss_patches/lidar_depth_loss', lidar_depth_loss.item(), iteration)
         if opt.surface_mode == "constrained":
             surface_loss = gaussians.surface_loss(visibility_filter, opt.surface_position_weight,
                 opt.surface_normal_weight, opt.surface_thickness_weight, opt.surface_loss_samples)
@@ -174,6 +196,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if tb_writer and iteration % 100 == 0:
                 tb_writer.add_scalar('train_loss_patches/surface_loss', surface_loss.item(), iteration)
         loss.backward()
+        if iteration <= opt.position_warmup_steps:
+            # Do not accumulate Adam moments while the positions are frozen.
+            gaussians._xyz.grad = None
 
         iter_end.record()
 
@@ -181,9 +206,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
+            ema_lidar_for_log = 0.4 * lidar_weighted_log + 0.6 * ema_lidar_for_log
+            if tb_writer and iteration % 100 == 0:
+                tb_writer.add_scalar("train/position_lr", position_lr, iteration)
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                progress = {"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"}
+                if opt.lidar_depth_weight > 0:
+                    progress["LiDAR"] = f"{ema_lidar_for_log:.{7}f}"
+                if opt.position_warmup_steps or opt.position_ramp_steps:
+                    progress["xyz lr"] = f"{position_lr:.2e}"
+                progress_bar.set_postfix(progress)
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -195,18 +228,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene.save(iteration)
 
             # Densification
-            if iteration < opt.densify_until_iter:
+            phase_iteration = iteration - opt.densification_phase_offset
+            if 0 < phase_iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                if phase_iteration > opt.densify_from_iter and phase_iteration % opt.densification_interval == 0:
+                    size_threshold = 20 if phase_iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent,
                                                 size_threshold, radii,
                                                 max_grad_abs=opt.absgs_split_threshold if opt.absgs else None)
                 
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                if phase_iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and phase_iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
             # Optimizer step

@@ -247,6 +247,8 @@ class GaussianModel:
     def training_setup(self, training_args):
         self.surface_mode = training_args.surface_mode
         self.percent_dense = training_args.percent_dense
+        self.position_warmup_steps = training_args.position_warmup_steps
+        self.position_ramp_steps = training_args.position_ramp_steps
         self.use_absgs = getattr(training_args, "absgs", False)
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 2 if self.use_absgs else 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -289,7 +291,9 @@ class GaussianModel:
 
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "xyz":
-                lr = self.xyz_scheduler_args(iteration)
+                from utils.warmup_schedule import position_lr_step
+                multiplier, schedule_step = position_lr_step(iteration, self.position_warmup_steps, self.position_ramp_steps)
+                lr = multiplier * self.xyz_scheduler_args(schedule_step)
                 param_group['lr'] = lr
                 return lr
 
