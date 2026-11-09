@@ -70,6 +70,125 @@ training. To train afterwards, run the same command without `--selection-only`
 and add `--allow-existing`; the existing matching manifest is reused. The
 option currently supports COLMAP scenes, not NeRF synthetic scenes.
 
+### LiDAR coverage keyframes and constrained pose refinement
+
+The separate CPU pipeline below selects reusable frames from the complete
+registered image set, then optionally refines just their poses. It does not
+require a COLMAP database or existing feature tracks. Dependencies are NumPy,
+SciPy, OpenCV (SIFT), and plyfile; the CUDA training stack is not imported.
+
+```bash
+python -m pip install scipy opencv-python plyfile
+
+SCENE=/data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full
+KF=/data/3dgs_outputs/orange_4F/1_full/keyframes_coverage600
+REFINED=/data/3dgs_outputs/orange_4F/1_full/keyframes_coverage600_refined
+
+python scripts/select_keyframes.py --source "$SCENE" --output "$KF" \
+  --target-frames 600 --eval
+
+python scripts/refine_keyframe_poses.py --source "$SCENE" \
+  --keyframes "$KF/keyframes.json" --output "$REFINED"
+```
+
+`--eval` excludes the original lexicographic 1-in-8 test images **before**
+selection. Omit it to use all registered frames as candidates. Keep this choice
+identical for comparisons; use launcher `--eval` when the selection used it.
+`--exclude-list names.txt` additionally reserves arbitrary filenames. All names
+are relative to the image directory and include extensions/subdirectories.
+
+Selection writes:
+
+| File | Contents |
+| --- | --- |
+| `keyframes.json` | Selected filenames, selection settings, scores, coverage counts and excluded filenames; accepted by the training launcher |
+| `image_list.txt` | Selected filenames only, one per line |
+| `coverage_cache/` | Per-image scores and approximate LiDAR visibility for resumable selection |
+
+The selector compares sharpness against nearby frames, discounts clipped pixels
+and distant observations, and greedily adds coverage of LiDAR surface patches
+and viewing directions. Repeated views of an already well-observed patch have
+diminishing value. It also seeds each block of 30 candidate images, plus stream
+ends, to retain trajectory coverage. This is a block safeguard, not a strict
+30-frame bound between consecutive selections or a guarantee of visual overlap.
+Natural filename order **within each parent directory** defines each camera
+stream; interleaved cameras should be placed in separate directories. The
+default budget is 600, capped by available eligible frames; selection can stop
+earlier if additional frames add no coverage or observation quality. If trajectory
+seeds exceed the budget, increase `--max-gap` or the budget. No images are copied.
+
+Refinement is a SciPy sparse bundle adjustment that reads/writes COLMAP models,
+with extra LiDAR constraints. It is not ordinary unconstrained COLMAP BA:
+
+1. Extract RootSIFT features on selected images, match temporal/spatial neighbor
+   pairs, and reject matches inconsistent with the existing poses and LiDAR.
+2. Associate features with ray intersections on locally planar LiDAR patches.
+   A point z-buffer filters occlusions, but sparse clouds cannot guarantee full
+   visibility. Nonplanar neighborhoods and grazing rays are excluded.
+3. Construct tracks with at least three images and optimize camera poses plus
+   their 3D landmarks. Intrinsics and LiDAR points stay fixed. Point-to-plane
+   residuals tie landmarks to the map; finite patch support and pose priors
+   prevent large drift. Defaults assume metres: 3 cm translation-prior std,
+   0.2 degree rotation-prior std, 1.5 cm surface residual std. Hard pose/landmark
+   bounds further restrict updates. Scale these flags if the map uses other units.
+4. Withhold one observation per track from both landmark initialization and BA.
+   Compare against a baseline that fits landmarks while fixing the original
+   poses. Reject the entire export if held-out median error does not improve,
+   the p90 degrades beyond a small tolerance, or a sufficiently supported image
+   degrades substantially.
+   Cameras with fewer than `--min-observations` training observations stay fixed.
+
+Both steps require undistorted `PINHOLE`/`SIMPLE_PINHOLE` images at their COLMAP
+dimensions and a LiDAR PLY already in the **same world frame** as the camera
+poses. They use `sparse/0/points3D.ply` (or flat `sparse/points3D.ply`) by default;
+pass `--point-cloud /path/to/lidar.ply` to both commands when the real map is
+elsewhere. Selection and refinement use voxel representatives for efficiency;
+the exported training initialization uses the original full PLY. It must have
+the RGB and normal fields expected by this repository's training loader.
+
+An accepted refinement creates `REFINED/dataset/` with standard COLMAP binary
+cameras, images and newly constructed feature tracks, a symlink to the original
+LiDAR PLY, a symlink to all source images, and its own `keyframes.json`. All
+original camera entries are retained, including unselected/test poses, so frame
+ordering and evaluation splits stay unchanged. Only supported selected poses
+are refined. Original images, poses, and LiDAR files are never modified.
+
+`matching_report.json` reports usable pairs/tracks and feature counts;
+`refinement_report.json` reports before/after withheld reprojection error,
+per-image pose changes and acceptance. Pixel errors are at the feature working
+resolution (maximum side 1600 by default). Rejection exits nonzero and produces
+no training dataset. Do not loosen thresholds just to force an export: inspect
+coverage, feature support, map alignment and image quality first. Pure planes
+and repetitive/textureless images may not constrain every pose direction.
+This check establishes improved image consistency, not ground-truth accuracy.
+It does not estimate rolling shutter, rig calibration, exposure, or LiDAR drift.
+
+Caches can be reused by repeating an identical command. Changed settings or
+input file stamps require a different output directory. Keep the source dataset
+available because exports use symlinks. An interrupted final export leaves a
+`dataset.tmp` directory to inspect/remove before retrying.
+
+Train the same selected images with original and refined poses to isolate the
+effect of pose refinement (both commands use the existing launcher):
+
+```bash
+python scripts/train.py --data-root "$SCENE" --scenes . \
+  --output-root /data/3dgs_outputs/keyframe_ablation --name coverage600_original \
+  --keyframe-manifest "$KF/keyframes.json" --eval \
+  --no-exposure-compensation --antialiasing --gpu 0
+
+python scripts/train.py --data-root "$REFINED/dataset" --scenes . \
+  --output-root /data/3dgs_outputs/keyframe_ablation --name coverage600_refined \
+  --keyframe-manifest "$REFINED/dataset/keyframes.json" --eval \
+  --no-exposure-compensation --antialiasing --gpu 1
+```
+
+Compare both on the **same reserved filenames**, including floor crops. A
+separate all-training-frame baseline using the same `--eval` split tests frame
+selection itself. For sparse LiDAR depth supervision, regenerate depth samples
+using the refined dataset: old per-pixel depth files were projected with old
+poses. This pipeline deliberately does not copy those cached depth priors.
+
 
 ### PSNR on all registered COLMAP frames
 

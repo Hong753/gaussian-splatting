@@ -6,3 +6,4 @@ trimesh
 scikit-image
 pycolmap==3.10.0
 hatchling
+scipy
