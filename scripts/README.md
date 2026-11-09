@@ -123,6 +123,11 @@ at `~/Proxy-GS`; both locations can be overridden. Training runs in the foregrou
 and refuses to overwrite existing training outputs. `--dry-run` prints commands.
 Use `prepare` with the same arguments to build just the proxy/depth cache.
 
+Setup includes the missing `<cfloat>` header in upstream `simple-knn`, fixing
+`identifier "FLT_MAX" is undefined` on newer CUDA toolchains. If an earlier setup
+failed at that error, pull the update and rerun `setup`; it reuses the checkout
+and environment and applies the fix before rebuilding the extension.
+
 The default proxy uses 5 cm LiDAR voxel sampling, estimated normals, and ball
 pivoting, discarding long triangle edges. This deliberately leaves unsupported
 regions open; gaps in the mesh can still allow occlusion leakage. A registered

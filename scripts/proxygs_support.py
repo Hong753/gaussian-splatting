@@ -41,6 +41,14 @@ def patch_reader(text):
     return text.replace(old, old + '        if not frames:\n            return []\n')
 
 
+def patch_simple_knn(text):
+    """Define FLT_MAX explicitly instead of relying on CUDA's transitive headers."""
+    marker = '#include "simple_knn.h"\n'
+    if text.count(marker) != 1 or "FLT_MAX" not in text:
+        raise ValueError("Unexpected upstream simple-knn source")
+    return text.replace(marker, marker + "#include <cfloat>\n")
+
+
 def install(repo, environment):
     if sys.version_info < (3, 11):
         raise RuntimeError("The pinned requirements need Python >=3.11. Run setup from the existing Python 3.12 3dgs environment.")
@@ -57,7 +65,8 @@ def install(repo, environment):
     if actual != REVISION:
         raise ValueError(f"{repo} is at {actual}; use a separate checkout pinned to {REVISION}")
     patched = ""
-    for filename, patch in (("train.py", patch_training), ("scene/dataset_readers.py", patch_reader)):
+    for filename, patch in (("train.py", patch_training), ("scene/dataset_readers.py", patch_reader),
+                            ("submodules/simple-knn/simple_knn.cu", patch_simple_knn)):
         original = subprocess.check_output(["git", "show", REVISION + ":" + filename], cwd=repo, text=True)
         transformed = patch(original)
         target = repo / filename
