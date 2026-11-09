@@ -37,6 +37,7 @@ DEPTHS = ""  # Optional depth-prior directory; empty means RGB-only.
 SELECT_KEYFRAMES = False
 KEYFRAME_GROUP_SIZE = 3
 EVAL_ALL_FRAMES = True
+RENDER_COMPARISONS = True
 EXTRA_ARGS = []  # e.g. ["--save_iterations", "7000", "15000", "30000"]
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -90,6 +91,8 @@ def main(argv=None):
     parser.add_argument("--selection-only", action="store_true", help="Select keyframes without launching training")
     parser.add_argument("--eval-all-frames", action=argparse.BooleanOptionalAction, default=EVAL_ALL_FRAMES,
                         help="Evaluate every COLMAP frame after training (default: enabled)")
+    parser.add_argument("--render-comparisons", action=argparse.BooleanOptionalAction, default=RENDER_COMPARISONS,
+                        help="Save actual-image/render train and eval galleries after training (default: enabled)")
     parser.add_argument("--evaluate-only", action="store_true",
                         help="Evaluate an existing saved model without starting training")
     parser.add_argument("--eval-iteration", type=int, default=-1,
@@ -269,6 +272,18 @@ def main(argv=None):
                     return exc.returncode or 1
         if args.eval_all_frames and not has_colmap:
             print(f"[{scene}] Skipping all-frame PSNR: only COLMAP scenes are supported.", flush=True)
+        if args.render_comparisons and has_colmap:
+            iteration = args.eval_iteration if args.evaluate_only else args.iterations
+            render_cmd = [sys.executable, str(REPO_ROOT / "scripts/render.py"), "--split", "both",
+                          "--model", str(output), "--iteration", str(iteration), "--gpu", args.gpu,
+                          "--antialiasing" if args.antialiasing else "--no-antialiasing"]
+            print(f"\n[{scene}] {shlex.join(render_cmd)}", flush=True)
+            if not args.dry_run:
+                try:
+                    subprocess.run(render_cmd, cwd=REPO_ROOT, env=env, check=True)
+                except subprocess.CalledProcessError as exc:
+                    print(f"View comparison rendering failed for {scene} (exit {exc.returncode}).", file=sys.stderr)
+                    return exc.returncode or 1
         if args.eval_all_frames and has_colmap:
             iteration = args.eval_iteration if args.evaluate_only else args.iterations
             eval_cmd = [sys.executable, str(REPO_ROOT / "scripts/eval_all_frames.py"),

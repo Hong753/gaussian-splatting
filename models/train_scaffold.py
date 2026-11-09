@@ -53,6 +53,7 @@ def evaluate_training_views(scene, gaussians, pipe, background, iteration, use_e
 
 
 def train(dataset, opt, pipe, save_iterations, test_iterations):
+    dataset.antialiasing = pipe.antialiasing
     os.makedirs(dataset.model_path, exist_ok=True)
     with open(os.path.join(dataset.model_path, "cfg_args"), "w") as stream:
         stream.write(str(Namespace(**vars(dataset))))

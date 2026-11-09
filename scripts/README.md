@@ -50,6 +50,102 @@ The launcher refuses to use a nonempty output directory unless
 `--allow-existing` is specified; that option does not resume training by
 itself. Native `--start_checkpoint` is required to resume a checkpoint.
 
+## Actual images versus rendered train/eval views
+
+COLMAP training and `--evaluate-only` now produce image comparisons by default,
+before the existing all-frame PSNR evaluation. `--no-render-comparisons` explicitly
+opts out. Future configs save the anti-aliasing setting as well.
+
+```bash
+python scripts/render.py train --model /path/to/run --gpu 2
+python scripts/render.py --split both --models /path/to/run_a /path/to/run_b --gpu 2
+python scripts/render.py --eval --model /path/to/run --iteration 7000 --gpu 2
+```
+
+`train` contains the images actually selected for training. `eval` contains the
+original lexical 1-in-8 held-out split when enabled; unused training candidates
+are not relabeled as eval images. `all` includes all registered images (for
+Proxy-GS, all staged train/eval images). `both` is the default. Comparing runs uses
+their shared image names and latest common saved iteration, or `--iteration N`.
+Each run uses its own saved source calibration, which preserves the intended
+original-versus-refined-pose comparison. Different ground-truth pixels or image
+sizes are rejected rather than shown against a misleading shared target.
+
+For the current two keyframe runs, locate their nested output directories by name:
+
+```bash
+python scripts/render.py \
+  --model-root /data/3dgs_outputs/orange_4F/1_full/keyframe_ablation \
+  --runs kf600_original kf600_refined --train --gpu 2 --antialiasing \
+  --output /data/3dgs_outputs/orange_4F/1_full/keyframe_ablation/train_comparison
+```
+
+Open `OUTPUT/index.html`. Each split contains an image browser with
+`actual | run A | run B`, full-resolution PNGs, absolute-error maps (displayed at
+4×), labeled comparison JPEGs, `per_frame.csv`, and `summary.json`. The browser
+can sort by lowest PSNR. Metrics use mean per-channel PSNR, matching
+`scripts/eval_all_frames.py`, and base appearance without per-image exposure.
+Rendering streams one camera and one model at a time. `--max-views N` optionally
+samples uniformly from the shared split; zero (default) renders every view.
+
+The default output is `RUN/view_comparisons/iteration_N` for a single model and
+a directory under the common parent for multiple models. `--dry-run` checks
+selection/checkpoints without loading CUDA or creating outputs. Older configs
+without an AA field default to AA for 3DGS/Scaffold; override explicitly with
+`--no-antialiasing` when appropriate. Proxy-GS uses its own rasterizer without AA.
+
+## Proxy-GS trial with a LiDAR surface proxy
+
+`scripts/run_proxygs.py` integrates the [official Proxy-GS implementation](https://github.com/Visionary-Laboratory/Proxy-GS)
+at commit `eac937e8f34ab46690d73cf4e4d0217ae32d645e`. It preserves the selected
+training images, held-out split, original camera poses, and input LiDAR cloud.
+The official anchor/MLP representation is initialized from the LiDAR geometry;
+this is a method comparison, not a visibility-only ablation of vanilla 3DGS.
+Its optimizer defaults remain upstream defaults, with a 30k iteration limit and
+saved/validated checkpoints at 7k and the final iteration.
+
+Set up once from the CUDA-enabled `3dgs` environment (Python >=3.11, a matching
+CUDA toolkit/compiler, and Git are required):
+
+```bash
+conda activate 3dgs
+python scripts/run_proxygs.py setup
+python scripts/run_proxygs.py run \
+  --source /data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full \
+  --keyframes /data/3dgs_outputs/orange_4F/1_full/keyframes_coverage600/keyframes.json \
+  --model /data/3dgs_outputs/orange_4F/1_full/keyframe_ablation/proxygs_kf600_original \
+  --iterations 30000 --gpu 4
+```
+
+The isolated environment at `~/.venvs/proxygs` reuses the active environment's
+PyTorch but installs Proxy-GS's extensions separately. The pinned checkout is
+at `~/Proxy-GS`; both locations can be overridden. Training runs in the foreground
+and refuses to overwrite existing training outputs. `--dry-run` prints commands.
+Use `prepare` with the same arguments to build just the proxy/depth cache.
+
+The default proxy uses 5 cm LiDAR voxel sampling, estimated normals, and ball
+pivoting, discarding long triangle edges. This deliberately leaves unsupported
+regions open; gaps in the mesh can still allow occlusion leakage. A registered
+triangle mesh can instead be supplied with `--mesh PATH`. `--voxel-size` is in
+the input map's units (assumed metres), and affects proxy construction, not the
+official model's anchor resolution.
+
+Preparation stages symlinks and NeRF-format camera transforms under
+`RUN/proxygs_data`, leaving the source dataset untouched. It caches frontmost
+camera-z proxy depths using nvdiffrast's CUDA rasterizer, including on A100 GPUs.
+It follows the same centered projection as the baseline. Inspect
+`proxygs_data/depth/*_rgb_depth.jpg` and `depth/metadata.json` for registration and
+per-frame coverage; black pixels in the depth preview have no mesh support.
+Preparation fails if every training view has zero proxy coverage.
+
+The adapter avoids upstream COLMAP-loader incompatibilities and applies small
+checked integration fixes: honor the requested GPU, load test-view depth caches,
+accept empty test splits, fail clearly on empty Gaussian renders, and use our
+streaming final comparison report. Core Proxy-GS culling and optimization are
+unchanged. After training, `scripts/render.py --split both` runs automatically
+in the Proxy-GS environment and keeps proxy culling enabled during rendering.
+The same entry point can also compare the Proxy-GS output with native runs.
+
 ## Keyframe selection
 
 Add `--select-keyframes` to score registered COLMAP training images in natural

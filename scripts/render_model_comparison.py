@@ -17,8 +17,8 @@ from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from eval_all_frames import read_config, choose_iteration
-from keyframes import natural_key
+from scripts.eval_all_frames import read_config, choose_iteration
+from scripts.keyframes import natural_key
 
 
 def model_spec(path, expected_type, iteration, source):

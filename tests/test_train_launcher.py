@@ -76,6 +76,22 @@ class TrainLauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(str(self.output / "1_full/test/keyframes.json"), result.stdout)
 
+    def test_view_comparisons_default_on_with_explicit_opt_out(self):
+        enabled = self.run_launcher(self.scene, ".")
+        self.assertEqual(enabled.returncode, 0, enabled.stderr)
+        self.assertIn("scripts/render.py --split both", enabled.stdout)
+        disabled = self.run_launcher(self.scene, ".", extra=("--no-render-comparisons",))
+        self.assertEqual(disabled.returncode, 0, disabled.stderr)
+        self.assertNotIn("scripts/render.py", disabled.stdout)
+
+    def test_evaluate_only_still_generates_comparison_report(self):
+        (self.output / "1_full/test").mkdir(parents=True)
+        result = self.run_launcher(self.scene, ".", extra=("--evaluate-only", "--eval-iteration", "7000"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("scripts/render.py --split both", result.stdout)
+        self.assertIn("--iteration 7000", result.stdout)
+        self.assertNotIn("Would select", result.stdout)
+
     def test_reject_escape_and_duplicate_normalized_paths(self):
         for scenes in (("../other",), (str(self.scene),),
                        ("orange_4F/1_full", "orange_4F//1_full")):
