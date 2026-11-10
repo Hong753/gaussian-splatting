@@ -9,3 +9,8 @@ and a shared saved iteration, and state whether their camera poses differ.
 Do not report training or rendering as completed without observing the outputs.
 If the dataset, checkpoints, or CUDA host are unavailable, finish and validate
 the runnable workflow and clearly identify what still requires server execution.
+
+For Proxy-GS, run preparation, training, and automatic rendering without Python
+supervisor subprocesses. Use process replacement for environment/runtime changes
+so training errors remain the direct traceback. Retain proxy/depth caches when
+restarting a failed attempt.

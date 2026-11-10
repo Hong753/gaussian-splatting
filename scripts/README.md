@@ -119,14 +119,44 @@ python scripts/run_proxygs.py run \
 
 The isolated environment at `~/.venvs/proxygs` reuses the active environment's
 PyTorch but installs Proxy-GS's extensions separately. The pinned checkout is
-at `~/Proxy-GS`; both locations can be overridden. Training runs in the foreground
-and refuses to overwrite existing training outputs. `--dry-run` prints commands.
-Use `prepare` with the same arguments to build just the proxy/depth cache.
+at `~/Proxy-GS`; both locations can be overridden. The launcher replaces its own
+process when switching environments and starting the official trainer; there is
+no Python supervisor and training exceptions appear directly. On success, the
+trainer replaces itself with the train/eval reporter, which uses `--in-process`
+rendering. Each replacement releases the preceding stage's CPU/CUDA allocations.
+`--dry-run` prints commands. Use `prepare` with the same arguments to build just
+the proxy/depth cache.
 
 Setup includes the missing `<cfloat>` header in upstream `simple-knn`, fixing
 `identifier "FLT_MAX" is undefined` on newer CUDA toolchains. If an earlier setup
 failed at that error, pull the update and rerun `setup`; it reuses the checkout
 and environment and applies the fix before rebuilding the extension.
+
+For an already-installed version, apply the Python memory/runtime fixes without
+reinstalling packages or rebuilding extensions:
+
+```bash
+python scripts/run_proxygs.py patch
+```
+
+Anchor growth pools candidate features in chunks instead of repeating every
+anchor feature for all offsets. It computes only selected offset positions and
+uses integer-row membership instead of pairwise voxel comparisons. Candidate
+selection and feature maxima are preserved. The default feature-gather chunk is
+65,536 candidates (8 MiB for 32 float32 features); output features, model state,
+and optimizer state still need memory proportional to the anchor count.
+
+`--voxel-size` controls **only the proxy mesh**. Anchor spacing is controlled by
+upstream `base_layer` and `levels`, exposed as `--base-layer` and `--levels`.
+The defaults remain 10 and adaptive, respectively. Reducing `--base-layer` from
+10 to 9 doubles the base anchor spacing for the same scene bounds; it can reduce
+anchor count at the cost of spatial detail. Do not change this to work around
+the unnecessary feature-replication allocation before applying the memory fix.
+
+After a failure before the first saved checkpoint, repeat the `run` command with
+`--restart`. This restarts training at step 0, reuses the proxy mesh/depth cache,
+and moves previous logs/configs into `RUN/failed_attempts/`. Saved checkpoints
+are protected: a run containing them requires a new output directory.
 
 The default proxy uses 5 cm LiDAR voxel sampling, estimated normals, and ball
 pivoting, discarding long triangle edges. This deliberately leaves unsupported
@@ -146,8 +176,8 @@ Preparation fails if every training view has zero proxy coverage.
 The adapter avoids upstream COLMAP-loader incompatibilities and applies small
 checked integration fixes: honor the requested GPU, load test-view depth caches,
 accept empty test splits, fail clearly on empty Gaussian renders, and use our
-streaming final comparison report. Core Proxy-GS culling and optimization are
-unchanged. After training, `scripts/render.py --split both` runs automatically
+streaming final comparison report. The memory changes preserve anchor selection,
+feature pooling, and proxy culling. After training, `scripts/render.py --split both` runs automatically
 in the Proxy-GS environment and keeps proxy culling enabled during rendering.
 The same entry point can also compare the Proxy-GS output with native runs.
 

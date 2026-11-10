@@ -2,6 +2,7 @@
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,7 +11,7 @@ from unittest.mock import patch
 import numpy as np
 from PIL import Image
 
-from scripts.proxygs_support import REVISION, prepare_dataset, resolution
+from scripts.proxygs_support import REVISION, PATCH_VERSION, prepare_dataset, resolution
 from scripts.run_proxygs import main
 from test_view_comparisons import dataset
 
@@ -95,17 +96,63 @@ class ProxyGSAdapterTests(unittest.TestCase):
         self.assertEqual(resolution(1921, 1081, 2), (960, 540))
         self.assertEqual(resolution(1920, 1080, 1000), (1000, 562))
 
-    def test_prepare_dispatches_to_isolated_environment(self):
+    def installed(self):
         environment, repo = self.root / "venv", self.root / "upstream"
         environment.mkdir()
-        (environment / "proxygs_install.json").write_text(json.dumps(dict(revision=REVISION, upstream=str(repo))))
-        with patch("scripts.run_proxygs.subprocess.run") as worker:
+        repo.mkdir()
+        (environment / "proxygs_install.json").write_text(json.dumps(dict(revision=REVISION, upstream=str(repo), patch_version=PATCH_VERSION)))
+        return environment, repo
+
+    def test_prepare_replaces_process_with_isolated_interpreter(self):
+        environment, repo = self.installed()
+        with patch("scripts.run_proxygs.os.execv") as execute:
             self.assertEqual(main(["prepare", "--source", str(self.source), "--keyframes", str(self.manifest),
                                    "--model", str(self.model), "--environment", str(environment), "--repo", str(repo)]), 0)
-        command = worker.call_args.args[0]
+        command = execute.call_args.args[1]
         self.assertEqual(command[0], str(environment / "bin/python"))
         self.assertIn("prepare", command)
         self.assertFalse(self.model.exists())
+
+    def test_restart_keeps_preparation_and_executes_trainer_with_report_hook(self):
+        environment, repo = self.installed()
+        prep = prepare_dataset(self.source, self.manifest, self.model)
+        (prep.parent / "proxy.ply").write_bytes(b"mesh cache")
+        (prep.parent / "depth").mkdir()
+        (prep.parent / "depth/000000.npy").write_bytes(b"depth cache")
+        (self.model / "cfg_args").write_text("previous config")
+        (self.model / "outputs.log").write_text("previous failure")
+        before = {p: p.read_bytes() for p in prep.parent.rglob("*") if p.is_file()}
+        old_cwd = Path.cwd()
+        self.addCleanup(os.chdir, old_cwd)
+        with patch("scripts.run_proxygs.sys.prefix", str(environment)), \
+                patch("scripts.run_proxygs.cache_depths") as depths, \
+                patch("scripts.run_proxygs.os.execv") as execute, patch.dict(os.environ), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["run", "--source", str(self.source), "--keyframes", str(self.manifest),
+                                   "--model", str(self.model), "--environment", str(environment), "--repo", str(repo),
+                                   "--restart", "--base-layer", "9", "--levels", "4"]), 0)
+            command = execute.call_args.args[1]
+            self.assertEqual(command[:3], [str(environment / "bin/python"), "-u", str(repo / "train.py")])
+            self.assertIn("--base_layer", command)
+            self.assertIn("--levels", command)
+            self.assertIn("--in-process", json.loads(os.environ["PROXYGS_REPORT_ARGS"]))
+        depths.assert_called_once()
+        self.assertEqual(before, {p: p.read_bytes() for p in prep.parent.rglob("*") if p.is_file()})
+        archived = list((self.model / "failed_attempts").glob("*/outputs.log"))
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(archived[0].read_text(), "previous failure")
+
+    def test_restart_refuses_existing_checkpoint(self):
+        environment, repo = self.installed()
+        saved = self.model / "point_cloud/iteration_7000/point_cloud.ply"
+        saved.parent.mkdir(parents=True)
+        saved.write_text("saved model")
+        with patch("scripts.run_proxygs.os.execv") as execute, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                main(["run", "--source", str(self.source), "--keyframes", str(self.manifest),
+                      "--model", str(self.model), "--environment", str(environment), "--repo", str(repo), "--restart"])
+        execute.assert_not_called()
+        self.assertEqual(saved.read_text(), "saved model")
 
 
 if __name__ == "__main__":

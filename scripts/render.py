@@ -49,6 +49,7 @@ def main(argv=None):
     parser.add_argument("--max-views", type=int, default=0, help="0: all views; otherwise evenly spaced")
     parser.add_argument("--antialiasing", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--in-process", action="store_true", help="Render one model directly, without a Python worker process")
     args = parser.parse_args(argv)
     if args.max_views < 0 or args.iteration == 0 or args.iteration < -1:
         parser.error("max-views must be nonnegative; iteration must be positive or -1")
@@ -57,7 +58,14 @@ def main(argv=None):
     mode = args.split or args.mode or "both"
     try:
         paths = resolve_models(args.models, args.model_root, args.runs)
+        if args.in_process and len(paths) != 1:
+            raise ValueError("--in-process requires exactly one model")
         specs = [model_info(p) for p in paths]
+        if args.in_process:
+            os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+            meta = specs[0].get("metadata", {})
+            if meta.get("python") and Path(meta["python"]).parent.parent.resolve() != Path(sys.prefix).resolve():
+                raise ValueError(f"--in-process requires the model's environment: {meta['python']}")
         iteration = shared_iteration(specs, args.iteration)
         if args.output:
             output = args.output.expanduser().resolve()
@@ -96,8 +104,12 @@ def main(argv=None):
                        "--selection", str(folder / "selection.json"), "--output", str(destination)]
                 if args.antialiasing is not None:
                     cmd.append("--antialiasing" if args.antialiasing else "--no-antialiasing")
-                print(shlex.join(cmd), flush=True)
-                subprocess.run(cmd, cwd=ROOT, env=env, check=True)
+                if args.in_process:
+                    from scripts.render_views_worker import render_views
+                    render_views(spec, names, iteration, destination, args.antialiasing)
+                else:
+                    print(shlex.join(cmd), flush=True)
+                    subprocess.run(cmd, cwd=ROOT, env=env, check=True)
                 model_rows.append(json.loads((destination / "frames.json").read_text()))
             # Verify the actual targets agree before showing a single shared GT column.
             for name in names:

@@ -136,6 +136,20 @@ class ViewComparisonsTests(unittest.TestCase):
         worker.assert_not_called()
         self.assertFalse(output.exists())
 
+    def test_in_process_report_renders_both_splits_without_worker_processes(self):
+        model, output = self.model("inline"), self.root / "inline_report"
+        def render_inline(spec, names, iteration, destination, antialiasing):
+            self.assertEqual(spec["path"], model)
+            self.assertEqual(iteration, 7000)
+            self.fake_worker()(["--output", str(destination), "--selection", str(destination.parent / "selection.json")])
+        with patch("scripts.render_views_worker.render_views", side_effect=render_inline) as inline, \
+                patch.object(render.subprocess, "run") as worker, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(render.main(["--model", str(model), "--split", "both", "--in-process", "--output", str(output)]), 0)
+        self.assertEqual(inline.call_count, 2)
+        worker.assert_not_called()
+        self.assertTrue((output / "train/index.html").is_file())
+        self.assertTrue((output / "eval/index.html").is_file())
+
     def test_gallery_escapes_embedded_filenames(self):
         rows = [dict(name="</script><script>alert(1)</script>.png", gt="gt.png", renders=[])]
         write_gallery(self.root / "html", "A < B", rows, [], {})

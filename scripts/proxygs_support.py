@@ -10,11 +10,12 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 UPSTREAM = "https://github.com/Visionary-Laboratory/Proxy-GS.git"
 REVISION = "eac937e8f34ab46690d73cf4e4d0217ae32d645e"
+PATCH_VERSION = 2
 from scripts.view_comparisons import atomic_json, read_colmap_records, split_names
 from utils.colmap_paths import colmap_model_dir
 
 
-def patch_training(text):
+def patch_training(text, direct_report=True):
     """Only integration fixes, checked against the pinned release."""
     start = text.index("import subprocess\n")
     end = text.index("import torch", start)
@@ -30,7 +31,13 @@ def patch_training(text):
     marker = '    # rendering\n    logger.info(f'
     if text.count(marker) != 1:
         raise ValueError("Unexpected upstream final-report entry point")
-    text = text.replace(marker, '    if os.environ.get("PROXYGS_EXTERNAL_REPORT") == "1":\n        raise SystemExit(0)\n\n' + marker)
+    report = '    if os.environ.get("PROXYGS_EXTERNAL_REPORT") == "1":\n'
+    if direct_report:
+        report += ('        report_script = os.environ.get("PROXYGS_REPORT_SCRIPT")\n'
+                   '        if report_script:\n'
+                   '            report_args = json.loads(os.environ["PROXYGS_REPORT_ARGS"])\n'
+                   '            os.execv(sys.executable, [sys.executable, "-u", report_script, *report_args])\n')
+    text = text.replace(marker, report + '        raise SystemExit(0)\n\n' + marker)
     return text
 
 
@@ -49,6 +56,63 @@ def patch_simple_knn(text):
     return text.replace(marker, marker + "#include <cfloat>\n")
 
 
+def patch_gaussian_model(text):
+    replacements = {
+        "from torch_scatter import scatter_max\n":
+            "from torch_scatter import scatter_max\nfrom proxygs_memory import selected_offset_positions, pooled_candidate_features, occupied_voxel_mask\n",
+        "            all_xyz = self.get_anchor.unsqueeze(dim=1) + self._offset * self.get_scaling[:,:3].unsqueeze(dim=1)\n": "",
+        "            selected_xyz = all_xyz.view([-1, 3])[candidate_mask]\n":
+            "            selected_xyz = selected_offset_positions(self.get_anchor, self._offset, self.get_scaling, candidate_mask)\n",
+        "                selected_xyz_ds = all_xyz.view([-1, 3])[candidate_ds_mask]\n":
+            "                selected_xyz_ds = selected_offset_positions(self.get_anchor, self._offset, self.get_scaling, candidate_ds_mask)\n",
+        "                new_feat = self._anchor_feat.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, self.feat_dim])[candidate_mask]\n"
+        "                new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0][remove_duplicates]\n":
+            "                new_feat = pooled_candidate_features(self._anchor_feat, self.n_offsets, candidate_mask, inverse_indices, remove_duplicates)\n",
+    }
+    for old, new in replacements.items():
+        if text.count(old) != 1:
+            raise ValueError("Unexpected upstream anchor-growth code")
+        text = text.replace(old, new)
+    start = text.index("    def get_remove_duplicates(")
+    end = text.index("    def anchor_growing(", start)
+    text = text[:start] + (
+        "    def get_remove_duplicates(self, grid_coords, selected_grid_coords_unique, use_chunk=True):\n"
+        "        return occupied_voxel_mask(grid_coords, selected_grid_coords_unique)\n\n"
+    ) + text[end:]
+    return text
+
+
+def apply_upstream_patches(repo, previous_hashes=None):
+    """Validate all managed sources before applying/reapplying Python fixes."""
+    repo = Path(repo).resolve()
+    actual = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    if actual != REVISION:
+        raise ValueError(f"{repo} is at {actual}; use a separate checkout pinned to {REVISION}")
+    changes = {}
+    for filename, patch in (("train.py", patch_training), ("scene/dataset_readers.py", patch_reader),
+                            ("submodules/simple-knn/simple_knn.cu", patch_simple_knn),
+                            ("scene/gaussian_model.py", patch_gaussian_model)):
+        original = subprocess.check_output(["git", "show", REVISION + ":" + filename], cwd=repo, text=True)
+        transformed = patch(original)
+        accepted = [original, transformed]
+        if filename == "train.py":
+            accepted.append(patch_training(original, direct_report=False))
+        if (repo / filename).read_text() not in accepted:
+            raise ValueError(f"Proxy-GS {filename} has unrelated changes; refusing to overwrite them")
+        changes[filename] = transformed
+    helper = "proxygs_memory.py"
+    changes[helper] = (ROOT / "scripts" / helper).read_text()
+    if (repo / helper).exists():
+        old = (repo / helper).read_text()
+        if old != changes[helper] and hashlib.sha256(old.encode()).hexdigest() != (previous_hashes or {}).get(helper):
+            raise ValueError(f"Unrecognized existing {repo / helper}; refusing to overwrite it")
+    hashes = {}
+    for filename, content in changes.items():
+        (repo / filename).write_text(content)
+        hashes[filename] = hashlib.sha256(content.encode()).hexdigest()
+    return hashes
+
+
 def install(repo, environment):
     if sys.version_info < (3, 11):
         raise RuntimeError("The pinned requirements need Python >=3.11. Run setup from the existing Python 3.12 3dgs environment.")
@@ -61,20 +125,9 @@ def install(repo, environment):
         subprocess.run(["git", "sparse-checkout", "set", "arguments", "scene", "utils",
                         "gaussian_renderer", "Mesh2DepthHelper", "lpipsPyTorch", "submodules"], cwd=repo, check=True)
         subprocess.run(["git", "checkout", "--detach", REVISION], cwd=repo, check=True)
-    actual = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
-    if actual != REVISION:
-        raise ValueError(f"{repo} is at {actual}; use a separate checkout pinned to {REVISION}")
-    patched = ""
-    for filename, patch in (("train.py", patch_training), ("scene/dataset_readers.py", patch_reader),
-                            ("submodules/simple-knn/simple_knn.cu", patch_simple_knn)):
-        original = subprocess.check_output(["git", "show", REVISION + ":" + filename], cwd=repo, text=True)
-        transformed = patch(original)
-        target = repo / filename
-        if target.read_text() not in (original, transformed):
-            raise ValueError(f"Proxy-GS {filename} has unrelated changes; refusing to overwrite them")
-        target.write_text(transformed)
-        if filename == "train.py":
-            patched = transformed
+    marker = environment / "proxygs_install.json"
+    previous = json.loads(marker.read_text()) if marker.exists() else {}
+    hashes = apply_upstream_patches(repo, previous.get("source_patch_sha256"))
     if not (environment / "bin/python").is_file():
         subprocess.run([sys.executable, "-m", "venv", "--system-site-packages", str(environment)], check=True)
     python = str(environment / "bin/python")
@@ -101,7 +154,8 @@ def install(repo, environment):
         "from simple_knn._C import distCUDA2; print('Proxy-GS imports OK')"], cwd=repo, check=True)
     atomic_json(environment / "proxygs_install.json",
                 dict(upstream=str(repo), revision=REVISION, python=python,
-                     training_patch_sha256=hashlib.sha256(patched.encode()).hexdigest()))
+                     patch_version=PATCH_VERSION, source_patch_sha256=hashes,
+                     training_patch_sha256=hashes["train.py"]))
     return python
 
 
