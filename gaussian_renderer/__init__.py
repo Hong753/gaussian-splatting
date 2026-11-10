@@ -66,6 +66,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means3D = pc.get_xyz
     means2D = screenspace_points
     opacity = pc.get_opacity
+    occlusion_keep = None
+    if getattr(pipe, "occlusion_mode", "off") == "proxy":
+        from utils.occlusion_culling import visibility_mask
+        occlusion_keep = visibility_mask(viewpoint_camera, pc, pipe, scaling_modifier)
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -82,6 +86,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
     shs = None
+    dc = None
     colors_precomp = None
     if override_color is None:
         if pipe.convert_SHs_python:
@@ -98,8 +103,25 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         colors_precomp = override_color
 
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    if separate_sh:
+    # Subsetting before the unchanged AA rasterizer removes both contributions
+    # and gradients. Indexing scatters surviving gradients to the original rows.
+    if occlusion_keep is not None:
+        def selected(value):
+            return value[occlusion_keep] if value is not None else None
+        means3D, means2D, opacity = map(selected, (means3D, means2D, opacity))
+        scales, rotations, cov3D_precomp = map(selected, (scales, rotations, cov3D_precomp))
+        shs, colors_precomp = map(selected, (shs, colors_precomp))
+        if separate_sh:
+            dc = selected(dc)
+
+    # Handle a fully culled view without passing an empty batch to CUDA. The
+    # zero link preserves backward and zero screen gradients for densification.
+    if occlusion_keep is not None and len(means3D) == 0:
+        zero = means3D.sum()*0 + means2D.sum()*0 + opacity.sum()*0
+        rendered_image = bg_color[:, None, None].expand(3, int(viewpoint_camera.image_height), int(viewpoint_camera.image_width)) + zero
+        depth_image = rendered_image[:1]*0
+        radii = torch.zeros(0, dtype=torch.int32, device=pc.get_xyz.device)
+    elif separate_sh:
         rendered_image, radii, depth_image = rasterizer(
             means3D = means3D,
             means2D = means2D,
@@ -110,6 +132,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             scales = scales,
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
+
     else:
         rendered_image, radii, depth_image = rasterizer(
             means3D = means3D,
@@ -120,6 +143,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             scales = scales,
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
+
+    if occlusion_keep is not None:
+        full_radii = torch.zeros(pc.get_xyz.shape[0], dtype=radii.dtype, device=radii.device)
+        full_radii[occlusion_keep] = radii
+        radii = full_radii
         
     # Apply exposure to rendered image (training only)
     if use_trained_exp:
@@ -136,6 +164,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         "radii": radii,
         "depth" : depth_image
         }
+    if occlusion_keep is not None:
+        out["occlusion_keep"] = occlusion_keep
     
     return out
 

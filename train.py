@@ -42,6 +42,11 @@ except:
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     dataset.antialiasing = pipe.antialiasing
+    dataset.optimization_settings = vars(opt).copy()
+    from scripts.occlusion_options import configure_pipeline
+    configure_pipeline(pipe, dataset)
+    if pipe.occlusion_mode != "off" and opt.optimizer_type != "default":
+        raise ValueError("Occlusion culling currently requires the default Adam optimizer")
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -217,6 +222,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     progress["LiDAR"] = f"{ema_lidar_for_log:.{7}f}"
                 if opt.position_warmup_steps or opt.position_ramp_steps:
                     progress["xyz lr"] = f"{position_lr:.2e}"
+                if "occlusion_keep" in render_pkg:
+                    progress["culled"] = f"{100*(1-render_pkg['occlusion_keep'].float().mean().item()):.1f}%"
                 progress_bar.set_postfix(progress)
                 progress_bar.update(10)
             if iteration == opt.iterations:
@@ -253,7 +260,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer.step(visible, radii.shape[0])
                     gaussians.optimizer.zero_grad(set_to_none = True)
                 else:
-                    gaussians.optimizer.step()
+                    if "occlusion_keep" in render_pkg:
+                        from utils.occlusion_culling import masked_adam_step
+                        masked_adam_step(gaussians.optimizer, render_pkg["occlusion_keep"], pipe.occlusion_chunk_size)
+                    else:
+                        gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):

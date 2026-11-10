@@ -142,6 +142,20 @@ class AblationVideosTests(unittest.TestCase):
         np.testing.assert_array_equal(calls[1][0][9], [4,5,6])
         self.assertTrue(calls[0][1]["linear_depth"])
 
+    def test_same_checkpoint_video_can_compare_culling_off_and_on(self):
+        native = self.model("native")
+        mesh = self.root / "mesh.ply"
+        mesh.touch()
+        args = self.args([native, native])
+        args.labels = ["Baseline", "Culled"]
+        args.occlusion = ["off", "on"]
+        args.occlusion_mesh = mesh
+        plan = video.build_plan(args)
+        self.assertEqual([m["cfg"]["occlusion_mode"] for m in plan["models"]], ["off", "proxy"])
+        self.assertEqual(plan["models"][0]["trajectory_sha256"], plan["models"][1]["trajectory_sha256"])
+        self.assertEqual(plan["models"][0]["ply"], plan["models"][1]["ply"])
+        self.assertTrue(all(m["antialiasing"] for m in plan["models"]))
+
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg required")
     def test_real_gt_and_multiple_panel_video_encoding(self):
         models = [self.model("baseline"), self.model("refined", self.refined())]

@@ -61,6 +61,13 @@ class ModelParams(ParamGroup):
         self.train_test_exp = False
         self.data_device = "cuda"
         self.eval = False
+        self.occlusion_mode = "off"
+        self.occlusion_mesh = ""
+        self.occlusion_cache = ""
+        self.occlusion_margin = 0.05
+        self.occlusion_sigma = 3.0
+        self.occlusion_edge_pixels = 1
+        self.occlusion_chunk_size = 131072
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

@@ -13,9 +13,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts.view_comparisons import (atomic_json, image_id, model_info,
                                       shared_iteration, write_all_frame_metrics, write_gallery)
+from scripts.occlusion_options import add_arguments, apply_overrides, worker_arguments, settings
 
 
-def resolve_models(models, model_root, runs):
+def resolve_models(models, model_root, runs, allow_duplicates=False):
     if models:
         paths = [Path(p).expanduser().resolve() for p in models]
     elif model_root and runs:
@@ -28,7 +29,7 @@ def resolve_models(models, model_root, runs):
             paths.extend(matches)
     else:
         raise ValueError("Specify --models RUN [RUN ...] or --model-root ROOT --runs NAME [NAME ...]")
-    if len(paths) != len(set(paths)):
+    if not allow_duplicates and len(paths) != len(set(paths)):
         raise ValueError("The same model was supplied more than once")
     return paths
 
@@ -54,6 +55,7 @@ def main(argv=None):
     parser.add_argument("--antialiasing", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--in-process", action="store_true", help="Render one model directly, without a Python worker process")
+    add_arguments(parser)
     args = parser.parse_args(argv)
     if args.max_views < 0 or args.iteration == 0 or args.iteration < -1:
         parser.error("max-views must be nonnegative; iteration must be positive or -1")
@@ -64,7 +66,7 @@ def main(argv=None):
         paths = resolve_models(args.models, args.model_root, args.runs)
         if args.in_process and len(paths) != 1:
             raise ValueError("--in-process requires exactly one model")
-        specs = [model_info(p) for p in paths]
+        specs = [apply_overrides(model_info(p), args) for p in paths]
         if args.in_process:
             os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
             meta = specs[0].get("metadata", {})
@@ -76,6 +78,9 @@ def main(argv=None):
         else:
             parent = paths[0] if len(paths) == 1 else Path(os.path.commonpath(paths))
             tag = "" if len(paths) == 1 else image_id("|".join(map(str, paths))) + "_"
+            variants = [s.get("render_variant", "") for s in specs]
+            if any(variants):
+                tag += (variants[0] if len(specs) == 1 else image_id("|".join(variants))) + "_"
             output = parent / "view_comparisons" / f"{tag}iteration_{iteration}"
         labels = [p.name for p in paths]
         if len(labels) != len(set(labels)):
@@ -108,6 +113,7 @@ def main(argv=None):
                        "--selection", str(folder / "selection.json"), "--output", str(destination)]
                 if args.antialiasing is not None:
                     cmd.append("--antialiasing" if args.antialiasing else "--no-antialiasing")
+                cmd.extend(worker_arguments(args))
                 if args.in_process:
                     from scripts.render_views_worker import render_views
                     render_views(spec, names, iteration, destination, args.antialiasing)
@@ -132,6 +138,9 @@ def main(argv=None):
             for model, records in zip(models, model_rows):
                 mean = sum(float(records[n]["psnr_db"]) for n in names) / len(names)
                 model["mean_psnr_db"] = round(mean, 5) if math.isfinite(mean) else "inf"
+            for model, spec in zip(models, specs):
+                model["occlusion"] = settings(spec["cfg"])
+                model["render_variant"] = spec.get("render_variant", "")
             if split_name == "all":
                 for spec, records in zip(specs, model_rows):
                     summary = write_all_frame_metrics(spec, records, iteration, args.antialiasing)

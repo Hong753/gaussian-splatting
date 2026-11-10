@@ -543,6 +543,109 @@ an error if any fail. `--dry-run` validates and prints commands without renderin
 Override `SCENE`, `MODEL_ROOT`, `OUTPUT_ROOT`, `ITERATION` (default 30000),
 `NATIVE_PYTHON`, or `PROXY_PYTHON` through environment variables when needed.
 
+### Occlusion-only ablation on native 3DGS + AA
+
+The native renderer supports `--occlusion_mode proxy` with a registered LiDAR
+triangle mesh. Standard SH Gaussians, AA, losses, initialization, position LR,
+densification schedule, and opacity resets retain their baseline behavior.
+Whole splats are culled only when their nearest 3-sigma depth lies behind the
+proxy throughout their entire rasterizer tile footprint, including the AA
+covariance filter. Unknown/hole pixels remain unoccluded; a one-pixel maximum
+depth filter relaxes boundaries. Large or partially occluded splats are kept.
+This is conservative whole-Gaussian culling, not per-pixel clipping.
+
+Surviving tensors enter the existing AA CUDA rasterizer. Culled rows have zero
+rendering gradients and zero radii, and do not contribute to per-view
+densification statistics. Default Adam's parameter and moment updates skip
+culled rows while retaining its global clock/LR schedule. The default Adam
+optimizer is required. Global pruning/opacity resets keep the original schedule.
+
+Proxy depths use a separate nvdiffrast CUDA pass. Only conservative 16x16 tile
+maxima are cached (not thousands of full-resolution depth arrays). Cache keys
+include mesh SHA-256, pose, FoV, resolution, clipping planes and edge padding.
+Novel poses/resolutions are rendered on demand. At most four tile maps stay in
+GPU cache; Gaussian processing is chunked. The existing GS rasterizer needs no
+rebuild. Install the same pinned nvdiffrast revision used by Proxy-GS into the
+native environment, then run the actual CUDA smoke test:
+
+```bash
+PY=/opt/anaconda3/envs/3dgs/bin/python
+"$PY" -m pip install --no-deps --no-build-isolation \
+  'git+https://github.com/NVlabs/nvdiffrast.git@abb07ca0358f3a21c3942b50c54aa1eacd329af9'
+"$PY" scripts/smoke_occlusion.py --gpu 2
+
+ROOT=/data/3dgs_outputs/orange_4F/1_full
+SCENE=/data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full
+BASE=$("$PY" -c 'from scripts.render import resolve_models; import sys; print(resolve_models(None, sys.argv[1], ["sharp_keyframes_stride3_aa"])[0])' "$ROOT")
+MESH="$ROOT/keyframe_ablation/proxygs_stride3_original/proxygs_data/proxy.ply"
+CACHE="$ROOT/occlusion_depth_cache"
+NEW="$ROOT/3dgs_stride3_aa_occlusion"
+
+# Optional but recommended: all original cameras, reusable by training/evaluation.
+"$PY" scripts/precompute_occlusion.py --source "$SCENE" --mesh "$MESH" \
+  --cache "$CACHE" --resolution -1 --gpu 2
+
+# Existing weights, culling ON: full-frame PSNR plus matched image previews.
+CUDA_VISIBLE_DEVICES=2 "$PY" scripts/eval_all_frames.py --source "$SCENE" \
+  --model "$BASE" --iteration 30000 --antialiasing --occlusion on \
+  --occlusion-mesh "$MESH" --occlusion-cache "$CACHE" --occlusion-margin 0.05
+"$PY" scripts/render.py --model "$BASE" --split both --max-views 64 \
+  --iteration 30000 --gpu 2 --in-process --antialiasing --occlusion on \
+  --occlusion-mesh "$MESH" --occlusion-cache "$CACHE" --occlusion-margin 0.05
+
+# Fresh training from the same LiDAR initialization and saved stride-3 keyframes.
+"$PY" scripts/train.py --data-root /data/gh_workspace/data/COLMAP_BA_export \
+  --scenes orange_4F/1_full --output-root /data/3dgs_outputs \
+  --name 3dgs_stride3_aa_occlusion --keyframe-manifest "$BASE/keyframes.json" \
+  --iterations 30000 --resolution -1 --gpu 3 --data-device cpu \
+  --antialiasing --no-exposure-compensation --disable-viewer -- \
+  --occlusion_mode proxy --occlusion_mesh "$MESH" --occlusion_cache "$CACHE" \
+  --occlusion_margin 0.05
+
+# After training: evaluate the same new weights with culling OFF.
+# Training automatically produces the culling-ON train/eval images and full PSNR.
+CUDA_VISIBLE_DEVICES=4 "$PY" scripts/eval_all_frames.py --source "$SCENE" \
+  --model "$NEW" --iteration 30000 --antialiasing --occlusion off
+"$PY" scripts/render.py --model "$NEW" --split both --max-views 64 \
+  --iteration 30000 --gpu 4 --in-process --antialiasing --occlusion off
+"$PY" scripts/collect_ablation_results.py --root "$ROOT" \
+  --runs sharp_keyframes_stride3_aa 3dgs_stride3_aa_occlusion --iteration 30000
+```
+
+`0.05` is a starting margin in **scene units**, not an estimated sensor noise.
+Inspect floor/wall boundary crops and the reported culling fraction; compare
+larger margins if valid splats disappear. Precomputing can also use the existing
+Proxy-GS Python environment; fully cached fixed-view evaluation/training does
+not import nvdiffrast at runtime. Novel-view rendering needs it for cache misses.
+
+Saved settings are applied automatically by native rendering/evaluation.
+`--occlusion on|off|saved` overrides them in `scripts/render.py` and
+`scripts/eval_all_frames.py`. Overrides save metrics under
+`MODEL/psnr_all_frames/iteration_N/occlusion_on_HASH/` or `occlusion_off/`, and
+image galleries under separate variant names. Default evaluations stay in
+`iteration_N/`. They never overwrite the baseline protocol. Full-frame PSNR is
+computed before encoding and includes selected/unselected splits; the explicit
+64-view previews above only limit image saving. New training configs also record
+the complete optimizer settings for reproducibility; the commands above retain
+the original stride-3 baseline's standard training defaults.
+
+Videos accept **one culling setting per model**, including the same checkpoint
+twice when distinct labels are provided. For example, an immediate before/after
+rendering comparison with identical weights is:
+
+```bash
+"$PY" scripts/render.py --video random --source "$SCENE" \
+  --models "$BASE" "$BASE" --labels "3DGS + AA" "3DGS + AA + culling" \
+  --aa on on --occlusion off on --occlusion-mesh "$MESH" --occlusion-cache "$CACHE" \
+  --iteration 30000 --gpu 2 --duration 40 --seed 42 --width 1280 --fps 30 \
+  --output "$ROOT/comparisons/occlusion_existing_random"
+"$PY" scripts/render.py --video actual --source "$SCENE" \
+  --models "$BASE" "$NEW" --labels "3DGS + AA" "Trained with culling" \
+  --aa on on --occlusion off on --occlusion-mesh "$MESH" --occlusion-cache "$CACHE" \
+  --iteration 30000 --gpu 5 --width 1280 --fps 30 \
+  --output "$ROOT/comparisons/occlusion_trained_actual"
+```
+
 ### AbsGS densification
 
 `--absgs` enables the AbsGS homodirectional gradient for splitting large

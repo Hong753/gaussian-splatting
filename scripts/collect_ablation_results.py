@@ -55,7 +55,7 @@ def main(argv=None):
             parser.error(f"Run names not found: {sorted(missing)}")
     if not paths:
         parser.error("No cfg_args files found under the supplied root")
-    rows, view_rows = [], []
+    rows, view_rows, occlusion_rows = [], [], []
     for path in paths:
         cfg = read_config(path / "cfg_args")
         proxy = (path / "proxygs_run.json").is_file()
@@ -82,6 +82,18 @@ def main(argv=None):
             "Y" if cfg.get("train_test_exp", False) else "N", counts.get("selected", count or "—"),
             number(score.get("all")), number(score.get("selected")), number(score.get("unselected")),
             counts.get("all", "—"), latest])
+        variants = sorted((path / "psnr_all_frames").glob("iteration_*/occlusion_*/summary.json"))
+        if variants or cfg.get("occlusion_mode") == "proxy":
+            summaries = ([result] if result else []) + [json.loads(p.read_text()) for p in variants]
+            for entry in summaries:
+                if args.iteration != -1 and entry["iteration"] != args.iteration:
+                    continue
+                scores = entry.get("mean_psnr_db", {})
+                occlusion_rows.append([path.name, entry["iteration"],
+                    "on" if cfg.get("occlusion_mode") == "proxy" else "off",
+                    "on" if entry.get("occlusion", {}).get("occlusion_mode") == "proxy" else "off",
+                    entry.get("render_variant") or "saved", number(scores.get("all")),
+                    number(scores.get("selected")), number(scores.get("unselected")), entry.get("counts", {}).get("all", "—")])
         # Show train/eval gallery scores separately; their 'all' need not mean all registered frames.
         for file in sorted((path / "view_comparisons").glob("iteration_*/*/summary.json")):
             data = json.loads(file.read_text())
@@ -97,6 +109,9 @@ def main(argv=None):
     else:
         print("All registered-frame PSNR (base appearance; valid = unselected frames):")
         print_table(["Run", "Metric steps", "AA", "EC", "Keyframes", "PSNR all", "PSNR train", "PSNR valid", "Evaluated frames", "Latest checkpoint"], rows)
+        if occlusion_rows:
+            print("\nOcclusion ablation (separate render protocols):")
+            print_table(["Run", "Steps", "Train culling", "Render culling", "Variant", "PSNR all", "PSNR train", "PSNR valid", "Frames"], occlusion_rows)
         if view_rows:
             print("\nSaved image-report scores (separate protocol; not necessarily all registered frames):")
             print_table(["Run", "Steps", "Split", "Rendered views", "Available shared views", "PSNR"], view_rows)

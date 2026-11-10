@@ -19,6 +19,7 @@ from scripts.render import resolve_models
 from scripts.view_comparisons import atomic_json, model_info, read_colmap_records, shared_iteration
 from scripts.eval_all_frames import choose_iteration
 from utils.colmap_paths import colmap_model_dir
+from scripts.occlusion_options import add_arguments, apply_overrides
 
 
 def camera(record):
@@ -73,6 +74,7 @@ def parser():
     p.add_argument("--max-frames", type=int)
     p.add_argument("--crf", type=int, default=18)
     p.add_argument("--dry-run", action="store_true")
+    add_arguments(p, per_model=True)
     return p
 
 
@@ -82,10 +84,14 @@ def build_plan(args):
         raise ValueError("fps/duration must be positive; CRF must be 0..51")
     if output.exists() and any(output.iterdir()) and not args.dry_run:
         raise ValueError(f"Use an empty output directory: {output}")
-    paths = resolve_models(args.models, args.model_root, args.runs)
+    paths = resolve_models(args.models, args.model_root, args.runs, allow_duplicates=True)
     if len(paths) < 2:
         raise ValueError("Supply at least two models for a comparison")
     specs = [model_info(path) for path in paths]
+    modes = args.occlusion or ["saved"] * len(specs)
+    if len(modes) != len(specs):
+        raise ValueError("Provide one --occlusion setting per model")
+    specs = [apply_overrides(spec, args, mode) for spec, mode in zip(specs, modes)]
     labels = args.labels or [path.name for path in paths]
     aa = args.aa or ["auto"] * len(specs)
     if len(labels) != len(specs) or len(set(labels)) != len(labels) or len(aa) != len(specs):
@@ -199,6 +205,8 @@ def execute_model(plan_path, index):
     frames = core.rendered_frames(spec, [camera(c) for c in model["cameras"]],
                                   plan["width"], plan["height"], model["antialiasing"])
     label = f"{model['label']} | {model['iteration']} steps | AA {'on' if model['antialiasing'] else 'off'}"
+    if model["type"] == "3dgs":
+        label += " | culling " + ("on" if model["cfg"].get("occlusion_mode") == "proxy" else "off")
     output = Path(plan["output"])
     core.write_video(output / model["video"], labeled_frames(frames, label, plan["width"], plan["height"]),
                      plan["width"], plan["height"] + plan["label_height"], plan["fps"], plan["crf"])

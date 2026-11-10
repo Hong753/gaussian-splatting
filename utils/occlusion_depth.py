@@ -1,0 +1,157 @@
+"""Fixed proxy depth, cached as conservative 16-pixel tile maxima.
+
+The proxy is an opaque geometry prior. Unknown pixels stay +inf. No hole filling,
+learned opacity, or gradients through the depth test are used.
+"""
+from collections import OrderedDict
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import uuid
+
+import numpy as np
+
+TILE = 16
+CACHE_VERSION = 1
+
+
+def file_digest(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def camera_signature(camera, edge_pixels):
+    view = camera.world_view_transform.detach().cpu().numpy().astype(np.float32)
+    payload = dict(version=CACHE_VERSION, tile=TILE, edge_pixels=edge_pixels,
+        width=int(camera.image_width), height=int(camera.image_height),
+        fovx=float(camera.FoVx), fovy=float(camera.FoVy),
+        near=float(camera.znear), far=float(camera.zfar), view=view.tolist())
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def mesh_clip_vertices(vertices, camera):
+    """Graphdeco camera coordinates (+z forward, +y down) to GL clip coordinates."""
+    import torch
+    view = camera.world_view_transform.to(device=vertices.device, dtype=vertices.dtype)
+    camera_xyz = vertices @ view[:3, :3] + view[3, :3]
+    x, y, z = camera_xyz.unbind(-1)
+    n, f = camera.znear, camera.zfar
+    # Flip camera y into GL y-up; flip the raster image back after rasterization.
+    return torch.stack((x / math.tan(camera.FoVx / 2), -y / math.tan(camera.FoVy / 2),
+                        (f+n)/(f-n)*z - 2*f*n/(f-n), z), dim=-1)
+
+
+class MeshDepthRenderer:
+    def __init__(self, mesh, device):
+        import torch
+        from plyfile import PlyData
+        try:
+            import nvdiffrast.torch as dr
+        except ImportError as exc:
+            raise ImportError("A proxy depth cache is missing. Precompute it with scripts/precompute_occlusion.py "
+                              "in the Proxy-GS environment, or install nvdiffrast in this environment.") from exc
+        data = PlyData.read(str(mesh))
+        if "face" not in data or not len(data["face"]):
+            raise ValueError("Occlusion proxy must contain triangle faces, not just points")
+        vertices = np.stack([data["vertex"][axis] for axis in ("x", "y", "z")], axis=1).astype(np.float32)
+        faces = np.asarray(list(data["face"]["vertex_indices"]), dtype=np.int32)
+        if faces.ndim != 2 or faces.shape[1] != 3 or not np.isfinite(vertices).all():
+            raise ValueError("Proxy requires finite vertices and triangular faces")
+        if faces.min() < 0 or faces.max() >= len(vertices):
+            raise ValueError("Proxy face indices are out of bounds")
+        self.dr, self.ctx = dr, dr.RasterizeCudaContext(device=device)
+        self.vertices = torch.as_tensor(vertices, device=device)
+        self.faces = torch.as_tensor(faces, device=device)
+
+    def __call__(self, camera):
+        import torch
+        with torch.no_grad():
+            clip = mesh_clip_vertices(self.vertices, camera)[None].contiguous()
+            h, w = camera.image_height, camera.image_width
+            depth = torch.full((h, w), float("inf"), device=self.vertices.device)
+            # Bound rasterizer scratch allocations for large LiDAR meshes.
+            for start in range(0, len(self.faces), 1_000_000):
+                rast, _ = self.dr.rasterize(self.ctx, clip, self.faces[start:start+1_000_000].contiguous(),
+                                           resolution=(h, w), grad_db=False)
+                hit = rast[0, :, :, 3] > 0
+                ndc = rast[0, :, :, 2].clamp(-1, 1)
+                n, f = camera.znear, camera.zfar
+                linear = 2*n*f / (f+n - ndc*(f-n))
+                depth = torch.minimum(depth, torch.where(hit, linear, torch.full_like(linear, float("inf"))))
+            return depth.flip(0).contiguous()
+
+
+def tile_maxima(depth, edge_pixels=1):
+    import torch
+    import torch.nn.functional as F
+    depth = torch.where(torch.isfinite(depth) & (depth > 0), depth, torch.full_like(depth, float("inf")))
+    depth = depth[None, None]
+    if edge_pixels:
+        depth = F.max_pool2d(F.pad(depth, (edge_pixels,)*4, value=float("inf")), 2*edge_pixels+1, stride=1)
+    return F.max_pool2d(depth, TILE, stride=TILE, ceil_mode=True)[0, 0]
+
+
+class ProxyDepthCache:
+    def __init__(self, mesh, directory="", edge_pixels=1, memory_views=4):
+        self.mesh = Path(mesh).expanduser().resolve()
+        self.mesh_sha256 = file_digest(self.mesh)
+        self.directory = (Path(directory).expanduser().resolve() if directory else
+                          self.mesh.parent / "occlusion_depth_cache") / self.mesh_sha256
+        self.edge_pixels, self.memory_views = edge_pixels, memory_views
+        self.memory, self.renderer = OrderedDict(), None
+
+    def tiles(self, camera, device):
+        import torch
+        # Camera objects are immutable in the training/view pipelines.
+        signature = camera_signature(camera, self.edge_pixels)
+        key = (signature, str(device))
+        if key in self.memory:
+            self.memory.move_to_end(key)
+            return self.memory[key]
+        path = self.directory / (signature + ".npy")
+        shape = ((camera.image_height + TILE-1)//TILE, (camera.image_width + TILE-1)//TILE)
+        if path.is_file():
+            array = np.load(path, allow_pickle=False)
+            if array.shape != shape or np.isnan(array).any() or np.any(array <= 0):
+                raise ValueError(f"Invalid proxy depth cache: {path}")
+            tiles = torch.as_tensor(array, dtype=torch.float32, device=device)
+        else:
+            if self.renderer is None:
+                self.renderer = MeshDepthRenderer(self.mesh, device)
+            tiles = tile_maxima(self.renderer(camera), self.edge_pixels)
+            self.directory.mkdir(parents=True, exist_ok=True)
+            temp = path.with_name(path.stem + f".{os.getpid()}.{uuid.uuid4().hex}.tmp.npy")
+            try:
+                np.save(temp, tiles.cpu().numpy())
+                os.replace(temp, path)
+            finally:
+                temp.unlink(missing_ok=True)
+        self.memory[key] = tiles
+        while len(self.memory) > self.memory_views:
+            self.memory.popitem(last=False)
+        return tiles
+
+
+def record_camera(record, resolution=-1, device="cuda"):
+    """Construct the exact centered camera used by loadCam without RGB allocation."""
+    import torch
+    from PIL import Image
+    from types import SimpleNamespace
+    from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+    with Image.open(record["image_path"]) as image:
+        ow, oh = image.size
+    if resolution in (1, 2, 4, 8):
+        w, h = round(ow / resolution), round(oh / resolution)
+    else:
+        factor = max(1., ow / 1600) if resolution == -1 else ow / resolution
+        w, h = int(ow / factor), int(oh / factor)
+    view = torch.tensor(getWorld2View2(np.array(record["R"]), np.array(record["T"])), device=device).T
+    projection = getProjectionMatrix(.01, 100., record["fov_x"], record["fov_y"]).to(device).T
+    return SimpleNamespace(image_width=w, image_height=h, image_name=record["name"],
+        FoVx=record["fov_x"], FoVy=record["fov_y"], znear=.01, zfar=100.,
+        world_view_transform=view, full_proj_transform=view @ projection)

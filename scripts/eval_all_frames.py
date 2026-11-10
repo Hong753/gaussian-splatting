@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from scripts.occlusion_options import add_arguments, apply_overrides, configure_pipeline, metric_directory, settings
 
 
 def read_config(path):
@@ -47,10 +48,13 @@ def main():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--iteration", type=int, default=-1, help="Saved iteration, or -1 for latest")
     parser.add_argument("--antialiasing", action=argparse.BooleanOptionalAction, default=True)
+    add_arguments(parser)
     args = parser.parse_args()
     model, source = args.model.resolve(), args.source.resolve()
     cfg = read_config(model / "cfg_args")
     model_type = cfg.get("model_type", "3dgs")
+    spec = apply_overrides(dict(path=model, cfg=cfg, type=model_type), args)
+    cfg = spec["cfg"]
     iteration, ply = choose_iteration(model, args.iteration, model_type)
     manifest_path = model / "keyframes.json"
     manifest_name = cfg.get("keyframe_manifest", "")
@@ -115,17 +119,20 @@ def main():
         raise ValueError(f"Unsupported saved model type: {model_type}")
     pipeline = SimpleNamespace(convert_SHs_python=False, compute_cov3D_python=False,
                                debug=False, antialiasing=args.antialiasing)
+    configure_pipeline(pipeline, cfg)
     camera_args = SimpleNamespace(resolution=cfg.get("resolution", -1), data_device="cpu", train_test_exp=False)
     color = [1, 1, 1] if cfg.get("white_background", False) else [0, 0, 0]
     background = torch.tensor(color, dtype=torch.float32, device="cuda")
-    output = model / "psnr_all_frames" / f"iteration_{iteration}"
+    output = metric_directory(model, iteration, spec.get("render_variant", ""))
     output.mkdir(parents=True, exist_ok=True)
     csv_tmp, json_tmp = output / "per_frame.csv.tmp", output / "summary.json.tmp"
     sums, counts = {k: 0.0 for k in ("all", "selected", "unselected")}, {k: 0 for k in ("all", "selected", "unselected")}
+    culled_sum, culled_views = 0., 0
     with torch.no_grad(), csv_tmp.open("w", newline="") as stream:
         writer = csv.writer(stream)
-        writer.writerow(["image_name", "selected_for_training", "psnr_db"])
+        writer.writerow(["image_name", "selected_for_training", "psnr_db", "occlusion_culled_fraction"])
         for idx, info in enumerate(tqdm(cameras, desc="Evaluating all frames", unit="frame")):
+            culled_fraction = None
             camera = loadCam(camera_args, idx, info, 1.0, False, False)
             if model_type == "scaffold":
                 visible = prefilter_voxel(camera, gaussians, pipeline, background)
@@ -133,12 +140,17 @@ def main():
             elif model_type == "textured":
                 pred = gaussians.render(camera, background)[0].clamp(0, 1)
             else:
-                pred = render(camera, gaussians, pipeline, background, separate_sh=separate_sh,
-                              use_trained_exp=False)["render"].clamp(0, 1)
+                rendered = render(camera, gaussians, pipeline, background, separate_sh=separate_sh,
+                                  use_trained_exp=False)
+                pred = rendered["render"].clamp(0, 1)
+                if "occlusion_keep" in rendered:
+                    culled_fraction = 1-rendered["occlusion_keep"].float().mean().item()
+                    culled_sum += culled_fraction
+                    culled_views += 1
             target = camera.original_image.to("cuda").clamp(0, 1)
             value = psnr(pred, target).mean().item()
             is_selected = (info.image_name in selected) if selected is not None else None
-            writer.writerow([info.image_name, "" if is_selected is None else int(is_selected), value])
+            writer.writerow([info.image_name, "" if is_selected is None else int(is_selected), value, culled_fraction])
             sums["all"] += value
             counts["all"] += 1
             if is_selected is not None:
@@ -152,6 +164,8 @@ def main():
                "exposure_protocol": "base appearance; no per-image exposure applied",
                "antialiasing": args.antialiasing, "resolution_setting": camera_args.resolution,
                "selection_manifest": str(manifest_path) if manifest_name else None,
+               "occlusion": settings(cfg), "render_variant": spec.get("render_variant", ""),
+               "mean_occlusion_culled_fraction": culled_sum/culled_views if culled_views else None,
                "counts": counts, "mean_psnr_db": means}
     json_tmp.write_text(json.dumps(summary, indent=2, allow_nan=False) + "\n")
     os.replace(csv_tmp, output / "per_frame.csv")

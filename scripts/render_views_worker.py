@@ -11,6 +11,7 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts.view_comparisons import atomic_json, image_id, model_info, save_panel
+from scripts.occlusion_options import add_arguments, apply_overrides
 
 
 def render_views(spec, names, iteration, output, antialiasing=None):
@@ -79,8 +80,9 @@ def main():
     parser.add_argument("--selection", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--antialiasing", action=argparse.BooleanOptionalAction, default=None)
+    add_arguments(parser)
     args = parser.parse_args()
-    render_views(model_info(args.model), json.loads(args.selection.read_text())["names"],
+    render_views(apply_overrides(model_info(args.model), args), json.loads(args.selection.read_text())["names"],
                  args.iteration, args.output, args.antialiasing)
 
 

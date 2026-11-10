@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts.eval_all_frames import read_config, choose_iteration
 from utils.colmap_paths import colmap_model_dir
+from scripts.occlusion_options import metric_directory, settings
 
 
 def atomic_json(path, value):
@@ -137,8 +138,9 @@ def write_all_frame_metrics(spec, rows, iteration, antialiasing=None):
         selection_manifest=meta.get("preparation") if spec["type"] == "proxygs" else (
             str(spec["path"] / "keyframes.json") if cfg.get("keyframe_manifest") else None),
         coverage="all original registered COLMAP frames",
+        occlusion=settings(cfg), render_variant=spec.get("render_variant", ""),
         counts={group: len(names) for group, names in groups.items()}, mean_psnr_db=means)
-    output = spec["path"] / "psnr_all_frames" / f"iteration_{iteration}"
+    output = metric_directory(spec["path"], iteration, spec.get("render_variant", ""))
     output.mkdir(parents=True, exist_ok=True)
     temporary = output / "per_frame.csv.tmp"
     with temporary.open("w", newline="") as stream:
