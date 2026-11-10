@@ -13,18 +13,23 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
-def parser():
+def parser(*, depth_maps=False):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--source', type=Path, required=True)
     p.add_argument('--model', type=Path, required=True)
-    p.add_argument('--keyframes', type=Path, help='Reuse this manifest; otherwise select sharp stride-3 keyframes')
-    p.add_argument('--baseline', type=Path, help='Optional native 3DGS+AA checkpoint for four-way scores and both comparison videos')
+    p.add_argument('--keyframes', type=Path, help=('Exact training manifest used for depth preparation; defaults to baseline manifest'
+                   if depth_maps else 'Reuse this manifest; otherwise select sharp stride-3 keyframes'))
+    p.add_argument('--baseline', type=Path, help=('Optional native 3DGS+AA checkpoint for scores and both comparison videos'
+                   if depth_maps else 'Optional native 3DGS+AA checkpoint for four-way scores and both comparison videos'))
     p.add_argument('--video-output', type=Path, help='Comparison video root; defaults to MODEL/comparisons')
     p.add_argument('--gpu', default='2')
     p.add_argument('--iterations', type=int, default=30000)
     p.add_argument('--resolution', type=int, default=-1)
-    p.add_argument('--voxel-size', type=float, default=.05)
-    p.add_argument('--max-radius', type=float, default=.1)
+    if depth_maps:
+        p.set_defaults(voxel_size=.05, max_radius=.1)
+    else:
+        p.add_argument('--voxel-size', type=float, default=.05)
+        p.add_argument('--max-radius', type=float, default=.1)
     p.add_argument('--margin', type=float, default=.05)
     p.add_argument('--position-warmup-steps', type=int, default=0,
                    help='Freeze xyz and its Adam state for this many initial steps')

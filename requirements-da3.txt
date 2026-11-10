@@ -1,0 +1,4 @@
+# Install only in the separate da3-depth conda environment.
+depth-anything-3 @ git+https://github.com/ByteDance-Seed/Depth-Anything-3.git@3d835ec1a5802d64a8b8b15f817a1ab54809bfe4
+scipy
+tqdm

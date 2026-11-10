@@ -62,6 +62,7 @@ class ModelParams(ParamGroup):
         self.data_device = "cuda"
         self.eval = False
         self.occlusion_mode = "off"
+        self.train_depth_occlusion_dir = ""
         self.occlusion_geometry = ""
         self.occlusion_points = ""
         self.occlusion_voxel_size = 0.05

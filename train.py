@@ -44,8 +44,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     dataset.antialiasing = pipe.antialiasing
     dataset.optimization_settings = vars(opt).copy()
     from scripts.occlusion_options import configure_pipeline, prepare_training_geometry
-    if dataset.occlusion_mode != "off" and opt.optimizer_type != "default":
+    depth_directory = getattr(dataset, "train_depth_occlusion_dir", "")
+    if (dataset.occlusion_mode != "off" or depth_directory) and opt.optimizer_type != "default":
         raise ValueError("Occlusion culling currently requires the default Adam optimizer")
+    if depth_directory and dataset.occlusion_mode != "off":
+        raise ValueError("Choose either training depth maps or LiDAR surfel culling")
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -89,6 +92,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene = Scene(dataset, gaussians)
     prepare_training_geometry(dataset)
     configure_pipeline(pipe, dataset)
+    training_occluders = None
+    if depth_directory:
+        from utils.da3_occlusion import TrainingDepthCache
+        training_occluders = TrainingDepthCache(depth_directory, dataset.source_path,
+            scene.getTrainCameras(), dataset.resolution, dataset.occlusion_edge_pixels,
+            point_cloud=os.path.join(dataset.model_path, 'input.ply'))
+        print("Aligned DA3 culling enabled for optimization only; evaluation renders without depth culling")
     if opt.surface_mode != "off":
         gaussians.initialize_surface(opt.surface_patches, opt.surface_mode, opt.surface_confidence, opt.surface_thickness)
     gaussians.training_setup(opt)
@@ -157,7 +167,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        training_tiles = training_occluders.tiles(viewpoint_cam, gaussians.get_xyz.device) if training_occluders else None
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp,
+                            separate_sh=SPARSE_ADAM_AVAILABLE, occlusion_tiles=training_tiles)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if viewpoint_cam.alpha_mask is not None:
@@ -225,6 +237,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     progress["xyz lr"] = f"{position_lr:.2e}"
                 if "occlusion_keep" in render_pkg:
                     progress["culled"] = f"{100*(1-render_pkg['occlusion_keep'].float().mean().item()):.1f}%"
+                if training_tiles is not None:
+                    progress["depth coverage"] = f"{100*torch.isfinite(training_tiles).float().mean().item():.1f}%"
                 progress_bar.set_postfix(progress)
                 progress_bar.update(10)
             if iteration == opt.iterations:

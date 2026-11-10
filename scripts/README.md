@@ -1,5 +1,10 @@
 # Training
 
+For the independent LiDAR-calibrated Depth Anything 3 occlusion experiment,
+see [DA3_OCCLUSION.md](DA3_OCCLUSION.md). It includes conda setup, preprocessing,
+the warmup/reduced-LR training command, calibration previews, and automatic
+all-frame evaluation and comparison videos.
+
 Edit the defaults at the top of `scripts/train.py` (especially `DATA_ROOT` and
 `SCENES`), then run `python scripts/train.py`. Or provide settings as arguments:
 

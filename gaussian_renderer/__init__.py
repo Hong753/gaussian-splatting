@@ -15,7 +15,7 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, occlusion_tiles=None):
     """
     Render the scene. 
     
@@ -67,7 +67,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means2D = screenspace_points
     opacity = pc.get_opacity
     occlusion_keep = None
-    if getattr(pipe, "occlusion_mode", "off") == "lidar":
+    if occlusion_tiles is not None:
+        if getattr(pipe, "occlusion_mode", "off") != "off":
+            raise ValueError("Choose either training depth maps or LiDAR surfel culling")
+        from utils.occlusion_culling import conservative_keep
+        occlusion_keep = conservative_keep(viewpoint_camera, pc.get_xyz.detach(), pc.get_scaling.detach(),
+            pc.get_rotation.detach(), occlusion_tiles, pipe.occlusion_margin, pipe.occlusion_sigma,
+            pipe.occlusion_chunk_size, scaling_modifier)
+    elif getattr(pipe, "occlusion_mode", "off") == "lidar":
         from utils.occlusion_culling import visibility_mask
         occlusion_keep = visibility_mask(viewpoint_camera, pc, pipe, scaling_modifier)
 
