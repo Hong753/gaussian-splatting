@@ -585,10 +585,11 @@ the existing GS extension needs no rebuild. All model computation remains native
 3DGS. Install it once in the native environment:
 
 ```bash
+source /opt/anaconda3/etc/profile.d/conda.sh
+conda activate 3dgs
 cd /home/sequor_vfm/gaussian-splatting
-PY=/opt/anaconda3/envs/3dgs/bin/python
-"$PY" -m pip install --no-deps --no-build-isolation -r requirements-occlusion.txt
-"$PY" scripts/smoke_occlusion.py --gpu 2
+python -m pip install --no-deps --no-build-isolation -r requirements-occlusion.txt
+python scripts/smoke_occlusion.py --gpu 2
 ```
 
 The smoke test checks surface depth, image orientation, an unseen camera pose,
@@ -602,7 +603,7 @@ and held-out views. It also evaluates the new weights with culling disabled.
 There are no Python supervisor subprocesses or environment switches:
 
 ```bash
-"$PY" scripts/run_occlusion.py \
+python scripts/run_occlusion.py \
   --source /data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full \
   --model /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_occlusion \
   --gpu 2
@@ -616,8 +617,8 @@ four train/render culling combinations plus **random-trajectory** and
 
 ```bash
 ROOT=/data/3dgs_outputs/orange_4F/1_full
-BASE=$("$PY" -c 'from scripts.render import resolve_models; import sys; print(resolve_models(None, sys.argv[1], ["sharp_keyframes_stride3_aa"])[0])' "$ROOT")
-"$PY" scripts/run_occlusion.py \
+BASE=$(python -c 'from scripts.render import resolve_models; import sys; print(resolve_models(None, sys.argv[1], ["sharp_keyframes_stride3_aa"])[0])' "$ROOT")
+python scripts/run_occlusion.py \
   --source /data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full \
   --model "$ROOT/3dgs_stride3_aa_lidar_occlusion" \
   --baseline "$BASE" --gpu 2
@@ -632,6 +633,44 @@ the selected/unselected PSNR split using the saved keyframe manifest.
 CUDA. `--evaluate-only` retries post-training work and skips recorded completed
 stages with identical commands. Incomplete videos retain their output; choose a
 fresh `--video-output DIRECTORY` or inspect it before retrying that stage.
+
+For a separate combined large-scene experiment on GPU 1, add the fixed-position
+warmup and reduced xyz LR. This keeps 30k total steps and the same keyframes:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh
+conda activate 3dgs
+cd /home/sequor_vfm/gaussian-splatting
+git pull --ff-only origin experiment/my-3dgs-changes
+ROOT=/data/3dgs_outputs/orange_4F/1_full
+BASE=$(python -c 'from scripts.render import resolve_models; import sys; print(resolve_models(None, sys.argv[1], ["sharp_keyframes_stride3_aa"])[0])' "$ROOT")
+python -u scripts/run_occlusion.py \
+  --source /data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full \
+  --model "$ROOT/3dgs_stride3_aa_lidar_occlusion_warm7k_lr50" \
+  --baseline "$BASE" --iterations 30000 --resolution -1 --gpu 1 \
+  --position-warmup-steps 7000 --position-ramp-steps 2000 \
+  --position-lr-scale 0.02
+```
+
+Positions and their Adam state stay fixed through step 7,000; appearance,
+opacity, scale, and rotation still train. The xyz LR then ramps linearly from
+zero to `3.2e-6` at step 9,000 and decays exponentially to `3.2e-8` at step
+30,000. Both endpoints are still multiplied by scene extent. The launcher
+sets the decay duration to `iterations - warmup - ramp` (21,000 here), unless
+`--position-lr-max-steps` explicitly overrides it.
+
+Densification and opacity resets automatically shift by the warmup duration.
+This preserves 144 densification events, at steps 7,600 through 21,900, and
+moves opacity resets to 10k/13k/16k/19k. `--densification-phase-offset` can delay
+them further, but cannot place them inside the fixed-position warmup. Neither
+xyz warmup nor lower LR enables a depth regularization loss. Culling remains
+active throughout training and rendering. This is a combined ablation; compare
+against the occlusion-only run to measure the schedule's additional effect.
+
+The resolved schedule is printed at launch, recorded in `occlusion_workflow.json`
+and `cfg_args`, and identified in comparison-video labels. Default occlusion-only
+settings remain unchanged. Concurrent runs use separate temporary report files
+when evaluating their shared baseline.
 
 Outputs under the model directory:
 
@@ -660,7 +699,7 @@ exact run names before sending SIGTERM through PID-safe handles. It leaves jobs
 on other GPUs and unrelated processes alone. Without `--stop`, it only lists.
 
 ```bash
-"$PY" scripts/stop_render_jobs.py --gpus 0 1 --stop
+python scripts/stop_render_jobs.py --gpus 0 1 --stop
 ```
 
 ### AbsGS densification

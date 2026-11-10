@@ -45,6 +45,25 @@ def checkpoint(path, iteration):
 
 
 class ViewComparisonsTests(unittest.TestCase):
+    def test_concurrent_reports_use_independent_atomic_temporary_files(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+        barrier = Barrier(2)
+        original_replace = Path.replace
+        def synchronized_replace(path, target):
+            barrier.wait(timeout=5)
+            return original_replace(path, target)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(Path, 'replace', synchronized_replace):
+            target = Path(tmp)/'summary.json'
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(atomic_json, target, dict(worker=i, values=list(range(100)))) for i in range(2)]
+                for future in futures:
+                    future.result()
+            saved = json.loads(target.read_text())
+            self.assertIn(saved['worker'], [0, 1])
+            self.assertEqual(saved['values'], list(range(100)))
+            self.assertEqual(list(Path(tmp).glob('*.tmp')), [])
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)

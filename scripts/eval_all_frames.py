@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import uuid
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -125,7 +126,9 @@ def main():
     background = torch.tensor(color, dtype=torch.float32, device="cuda")
     output = metric_directory(model, iteration, spec.get("render_variant", ""))
     output.mkdir(parents=True, exist_ok=True)
-    csv_tmp, json_tmp = output / "per_frame.csv.tmp", output / "summary.json.tmp"
+    # Concurrent ablations can evaluate the same baseline on different GPUs.
+    token = uuid.uuid4().hex
+    csv_tmp, json_tmp = output / f"per_frame.csv.{token}.tmp", output / f"summary.json.{token}.tmp"
     sums, counts = {k: 0.0 for k in ("all", "selected", "unselected")}, {k: 0 for k in ("all", "selected", "unselected")}
     culled_sum, culled_views = 0., 0
     with torch.no_grad(), csv_tmp.open("w", newline="") as stream:

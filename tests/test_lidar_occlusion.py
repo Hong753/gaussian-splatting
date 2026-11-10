@@ -144,6 +144,62 @@ class LidarOcclusionTests(unittest.TestCase):
             self.assertIn('--in-process', plan['stages'][2]['argv'])
             self.assertFalse((root/'model').exists())
 
+    def test_combined_warmup_schedule_endpoints_and_densification_window(self):
+        from utils.warmup_schedule import position_lr_step
+        from utils.general_utils import get_expon_lr_func
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root/'source/sparse').mkdir(parents=True)
+            for name in ['images.txt', 'cameras.txt']:
+                (root/'source/sparse'/name).touch()
+            args = run_occlusion.parser().parse_args(['--source', str(root/'source'), '--model', str(root/'model'),
+                '--gpu', '1', '--position-warmup-steps', '7000', '--position-ramp-steps', '2000', '--position-lr-scale', '0.02'])
+            plan = run_occlusion.build_plan(args)
+            schedule, command = plan['training_schedule'], plan['stages'][0]['argv']
+            for key, value in schedule.items():
+                self.assertEqual(command[command.index('--'+key)+1], str(value))
+            self.assertEqual(schedule['position_lr_max_steps'], 21000)
+            self.assertEqual(schedule['densification_phase_offset'], 7000)
+            self.assertAlmostEqual(schedule['position_lr_init'], 3.2e-6)
+            self.assertAlmostEqual(schedule['position_lr_final'], 3.2e-8)
+            self.assertEqual(plan['gpu'], '1')
+            self.assertIn('lidar', command)
+            self.assertIn('--antialiasing', command)
+            self.assertNotIn('--lidar_depth_weight', command)
+            decay = get_expon_lr_func(schedule['position_lr_init'], schedule['position_lr_final'], max_steps=21000)
+            def lr(step):
+                multiplier, clock = position_lr_step(step, 7000, 2000)
+                return multiplier*decay(clock)
+            self.assertEqual(lr(1), 0)
+            self.assertEqual(lr(7000), 0)
+            self.assertAlmostEqual(lr(8000), 1.6e-6)
+            self.assertAlmostEqual(lr(9000), 3.2e-6)
+            self.assertAlmostEqual(lr(30000), 3.2e-8)
+            densify = [i for i in range(1, 30001) if 500 < i-7000 < 15000 and (i-7000)%100 == 0]
+            resets = [i for i in range(1, 30001) if 0 < i-7000 < 15000 and (i-7000)%3000 == 0]
+            self.assertEqual((densify[0], densify[-1], len(densify)), (7600, 21900, 144))
+            self.assertEqual(resets, [10000, 13000, 16000, 19000])
+
+    def test_schedule_validation_and_evaluation_use_saved_training_settings(self):
+        args = run_occlusion.parser().parse_args(['--source', '/unused', '--model', '/unused'])
+        default = run_occlusion.training_schedule(args)
+        self.assertEqual((default['position_warmup_steps'], default['position_ramp_steps'], default['densification_phase_offset']), (0, 0, 0))
+        self.assertEqual(default['position_lr_max_steps'], 30000)
+        self.assertEqual(default['position_lr_init'], .00016)
+        for changes in [dict(position_lr_scale=0), dict(position_lr_scale=float('nan')),
+                        dict(position_warmup_steps=-1), dict(position_warmup_steps=30000),
+                        dict(position_warmup_steps=7000, densification_phase_offset=0)]:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                run_occlusion.training_schedule(SimpleNamespace(**{**vars(args), **changes}))
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = dict(default, position_warmup_steps=7000, position_ramp_steps=2000,
+                position_lr_init=3.2e-6, position_lr_final=3.2e-8, position_lr_max_steps=21000,
+                densification_phase_offset=7000)
+            (Path(tmp)/'cfg_args').write_text('Namespace(optimization_settings='+repr(saved)+')')
+            args.model, args.evaluate_only, args.iterations = Path(tmp), True, 7000
+            self.assertEqual(run_occlusion.training_schedule(args), saved)
+            self.assertIn('xyz warmup 7000', run_occlusion.schedule_label(saved))
+
     def test_workflow_invocation_stays_in_process_and_preserves_errors(self):
         argv, stdout = sys.argv, sys.stdout
         with patch('runpy.run_path', side_effect=SystemExit(0)) as run:

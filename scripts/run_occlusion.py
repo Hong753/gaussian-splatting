@@ -26,10 +26,56 @@ def parser():
     p.add_argument('--voxel-size', type=float, default=.05)
     p.add_argument('--max-radius', type=float, default=.1)
     p.add_argument('--margin', type=float, default=.05)
+    p.add_argument('--position-warmup-steps', type=int, default=0,
+                   help='Freeze xyz and its Adam state for this many initial steps')
+    p.add_argument('--position-ramp-steps', type=int, default=0,
+                   help='Linearly ramp xyz LR after the fixed-position warmup')
+    p.add_argument('--position-lr-scale', type=float, default=1.,
+                   help='Multiply both baseline xyz LR endpoints; 0.02 is 50x smaller')
+    p.add_argument('--position-lr-max-steps', type=int,
+                   help='Exponential decay duration; default: iterations minus warmup and ramp')
+    p.add_argument('--densification-phase-offset', type=int,
+                   help='Shift densification and opacity resets; default: position warmup steps')
     p.add_argument('--report-max-views', type=int, default=64)
     p.add_argument('--evaluate-only', action='store_true', help='Retry post-training evaluation without retraining')
     p.add_argument('--dry-run', action='store_true')
     return p
+
+
+def training_schedule(args):
+    import math
+    from arguments import OptimizationParams
+    defaults = OptimizationParams(argparse.ArgumentParser(add_help=False))
+    if args.evaluate_only:
+        # Report the schedule that produced these weights, not new CLI defaults.
+        from scripts.eval_all_frames import read_config
+        cfg = read_config(args.model.expanduser().resolve()/'cfg_args')
+        saved = cfg.get('optimization_settings', {})
+        keys = ('position_warmup_steps', 'position_ramp_steps', 'position_lr_init', 'position_lr_final',
+                'position_lr_max_steps', 'densification_phase_offset')
+        return {key: cfg.get(key, saved.get(key, getattr(defaults, key))) for key in keys}
+    warmup, ramp = args.position_warmup_steps, args.position_ramp_steps
+    offset = warmup if args.densification_phase_offset is None else args.densification_phase_offset
+    decay = args.iterations-warmup-ramp if args.position_lr_max_steps is None else args.position_lr_max_steps
+    if (not math.isfinite(args.position_lr_scale) or args.position_lr_scale <= 0 or
+            min(warmup, ramp, offset) < 0 or warmup+ramp >= args.iterations or decay < 1):
+        raise ValueError('Require positive finite xyz LR scale, nonnegative warmup/ramp/offset, and a positive decay phase')
+    if offset < warmup:
+        raise ValueError('Densification phase offset must cover the entire fixed-position warmup')
+    result = dict(position_warmup_steps=warmup, position_ramp_steps=ramp,
+                  position_lr_init=defaults.position_lr_init*args.position_lr_scale,
+                  position_lr_final=defaults.position_lr_final*args.position_lr_scale,
+                  position_lr_max_steps=decay, densification_phase_offset=offset)
+    return result
+
+
+def schedule_label(schedule):
+    additions = []
+    if schedule['position_warmup_steps']:
+        additions.append(f"xyz warmup {schedule['position_warmup_steps']}")
+    if schedule['position_lr_init'] < 0.00016:
+        additions.append('reduced xyz LR')
+    return '3DGS + AA + LiDAR culling' + ((' + ' + ' + '.join(additions)) if additions else '')
 
 
 def build_plan(args):
@@ -48,6 +94,7 @@ def build_plan(args):
         raise ValueError('Model already has checkpoints; choose a fresh model or use --evaluate-only')
     if args.evaluate_only and not (model/f'point_cloud/iteration_{args.iterations}/point_cloud.ply').is_file():
         raise FileNotFoundError('Requested saved iteration is missing')
+    schedule = training_schedule(args)
     steps = sorted(set(i for i in (7000, args.iterations) if i <= args.iterations))
     train = ['train.py', '-s', str(source), '-m', str(model), '--iterations', str(args.iterations),
              '--resolution', str(args.resolution), '--data_device', 'cpu', '--disable_viewer', '--antialiasing',
@@ -55,6 +102,8 @@ def build_plan(args):
              '--occlusion_voxel_size', str(args.voxel_size), '--occlusion_max_radius', str(args.max_radius),
              '--occlusion_margin', str(args.margin), '--test_iterations', *map(str, steps),
              '--save_iterations', *map(str, steps)]
+    for key, value in schedule.items():
+        train += ['--'+key, str(value)]
     stages = [] if args.evaluate_only else [dict(name='train', argv=train)]
     geometry, cache = str(model/'occlusion_geometry.npz'), str(model/'occlusion_depth_cache')
     def evaluation(path, mode, name):
@@ -80,7 +129,7 @@ def build_plan(args):
         video_root = args.video_output.expanduser().resolve() if args.video_output else model/'comparisons'
         for video in ('random', 'actual'):
             command = ['scripts/render.py', '--video', video, '--source', str(source), '--models', str(baseline), str(model),
-                '--labels', '3DGS + AA', '3DGS + AA + LiDAR culling', '--aa', 'on', 'on', '--occlusion', 'off', 'saved',
+                '--labels', '3DGS + AA', schedule_label(schedule), '--aa', 'on', 'on', '--occlusion', 'off', 'saved',
                 '--iteration', str(args.iterations), '--gpu', args.gpu, '--in-process', '--width', '1280', '--fps', '30',
                 '--output', str(video_root/video)]
             if video == 'random':
@@ -88,7 +137,7 @@ def build_plan(args):
             else:
                 command += ['--actual-poses', 'source']
             stages.append(dict(name=video+'_video', argv=command))
-    return dict(source=str(source), model=str(model), gpu=args.gpu, stages=stages)
+    return dict(source=str(source), model=str(model), gpu=args.gpu, training_schedule=schedule, stages=stages)
 
 
 def invoke(command):
@@ -117,6 +166,8 @@ def main(argv=None):
     if args.dry_run:
         print(json.dumps(plan, indent=2))
         return 0
+    print('Position/densification schedule (LR endpoints before scene-extent scaling):\n' +
+          json.dumps(plan['training_schedule'], indent=2), flush=True)
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     import torch
     if not torch.cuda.is_available():

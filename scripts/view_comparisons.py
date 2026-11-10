@@ -11,6 +11,7 @@ import json
 import math
 from pathlib import Path
 import sys
+import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -22,9 +23,12 @@ from scripts.occlusion_options import metric_directory, settings
 def atomic_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
-    temp.replace(path)
+    temp = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
+    try:
+        temp.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def image_id(name):
@@ -142,7 +146,7 @@ def write_all_frame_metrics(spec, rows, iteration, antialiasing=None):
         counts={group: len(names) for group, names in groups.items()}, mean_psnr_db=means)
     output = metric_directory(spec["path"], iteration, spec.get("render_variant", ""))
     output.mkdir(parents=True, exist_ok=True)
-    temporary = output / "per_frame.csv.tmp"
+    temporary = output / f"per_frame.csv.{uuid.uuid4().hex}.tmp"
     with temporary.open("w", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow(["image_name", "selected_for_training", "psnr_db"])
