@@ -522,6 +522,27 @@ they are never presented as all-registered-frame PSNR. `--runs NAME ...` filters
 the tables, and `--iteration -1` selects each run's latest available metric
 while retaining its actual step count.
 
+To run both current Proxy-GS comparisons concurrently on GPUs **0–5**:
+
+```bash
+bash scripts/render_proxygs_reports.sh
+```
+
+GPUs 0/1 render all original frames and compute PSNR for `proxygs_kf600_original`
+and `proxygs_stride3_original`. GPUs 2/3 render their random videos; GPUs 4/5
+render their captured-trajectory videos with GT. Each Proxy-GS run is compared
+with its matched 3DGS+AA control (`kf600_original` or
+`sharp_keyframes_stride3_aa`). Every job gets one GPU. Rendering models within
+a video still uses process replacement, without a Python supervisor.
+
+All six jobs are validated before launching. Per-job logs and four videos are
+written beneath `MODEL_ROOT/comparisons/proxygs_ITERATION_TIMESTAMP/`; each
+video subdirectory contains `side_by_side.mp4`. All-frame galleries/PSNR stay
+under their model directories. The launcher waits for all jobs and exits with
+an error if any fail. `--dry-run` validates and prints commands without rendering.
+Override `SCENE`, `MODEL_ROOT`, `OUTPUT_ROOT`, `ITERATION` (default 30000),
+`NATIVE_PYTHON`, or `PROXY_PYTHON` through environment variables when needed.
+
 ### AbsGS densification
 
 `--absgs` enables the AbsGS homodirectional gradient for splitting large
