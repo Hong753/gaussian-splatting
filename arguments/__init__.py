@@ -62,7 +62,12 @@ class ModelParams(ParamGroup):
         self.data_device = "cuda"
         self.eval = False
         self.occlusion_mode = "off"
-        self.occlusion_mesh = ""
+        self.occlusion_geometry = ""
+        self.occlusion_points = ""
+        self.occlusion_voxel_size = 0.05
+        self.occlusion_max_radius = 0.1
+        self.occlusion_neighbors = 24
+        self.occlusion_confidence = 0.6
         self.occlusion_cache = ""
         self.occlusion_margin = 0.05
         self.occlusion_sigma = 3.0

@@ -16,7 +16,7 @@ import torch
 
 from scripts.occlusion_options import apply_overrides, metric_directory
 from utils.occlusion_culling import conservative_keep, depth_pyramid, rectangle_maximum, masked_adam_step
-from utils.occlusion_depth import ProxyDepthCache, camera_signature, mesh_clip_vertices, tile_maxima
+from utils.occlusion_depth import LidarDepthCache, camera_signature, clip_vertices, tile_maxima
 from utils.graphics_utils import getProjectionMatrix
 
 
@@ -80,7 +80,7 @@ class OcclusionTests(unittest.TestCase):
     def test_mesh_projection_orientation_and_depth(self):
         cam = camera()
         vertices = torch.tensor([[0., -.5, 2.], [0., .5, 2.], [0., 0., .01], [0., 0., 100.]])
-        clip = mesh_clip_vertices(vertices, cam)
+        clip = clip_vertices(vertices, cam)
         ndc = clip[:, :3]/clip[:, 3:]
         self.assertGreater(float(ndc[0, 1]), 0) # Image top -> GL top before output flip.
         self.assertLess(float(ndc[1, 1]), 0)
@@ -113,19 +113,19 @@ class OcclusionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             mesh = Path(tmp)/"mesh.ply"
             mesh.write_text("fixture")
-            cache = ProxyDepthCache(mesh, Path(tmp)/"cache", edge_pixels=0, memory_views=0)
+            cache = LidarDepthCache(mesh, Path(tmp)/"cache", edge_pixels=0, memory_views=0)
             cam = camera(32)
-            with patch("utils.occlusion_depth.MeshDepthRenderer", return_value=lambda c: torch.ones(c.image_height, c.image_width)*2) as renderer:
+            with patch("utils.occlusion_depth.LidarDepthRenderer", return_value=lambda c: torch.ones(c.image_height, c.image_width)*2) as renderer:
                 cache.tiles(cam, torch.device("cpu"))
                 self.assertEqual(renderer.call_count, 1)
-            other = ProxyDepthCache(mesh, Path(tmp)/"cache", edge_pixels=0, memory_views=0)
-            with patch("utils.occlusion_depth.MeshDepthRenderer", side_effect=AssertionError("Must load cache")):
+            other = LidarDepthCache(mesh, Path(tmp)/"cache", edge_pixels=0, memory_views=0)
+            with patch("utils.occlusion_depth.LidarDepthRenderer", side_effect=AssertionError("Must load cache")):
                 self.assertTrue(torch.equal(other.tiles(cam, torch.device("cpu")), torch.ones(2, 2)*2))
             moved = camera(32, translation=(1, 0, 0))
             self.assertNotEqual(camera_signature(cam, 0), camera_signature(moved, 0))
             self.assertNotEqual(camera_signature(cam, 0), camera_signature(camera(64), 0))
             np.save(other.directory/(camera_signature(cam, 0)+".npy"), np.zeros((2, 2)))
-            with self.assertRaisesRegex(ValueError, "Invalid proxy depth"):
+            with self.assertRaisesRegex(ValueError, "Invalid LiDAR depth"):
                 other.tiles(cam, torch.device("cpu"))
 
     def test_render_overrides_keep_baseline_metrics_separate(self):
@@ -133,8 +133,8 @@ class OcclusionTests(unittest.TestCase):
             mesh = Path(tmp)/"mesh.ply"
             mesh.touch()
             spec = dict(path=Path(tmp), type="3dgs", cfg={})
-            apply_overrides(spec, SimpleNamespace(occlusion="on", occlusion_mesh=mesh))
-            self.assertEqual(spec["cfg"]["occlusion_mode"], "proxy")
+            apply_overrides(spec, SimpleNamespace(occlusion="on", occlusion_geometry=mesh))
+            self.assertEqual(spec["cfg"]["occlusion_mode"], "lidar")
             target = metric_directory(tmp, 30000, spec["render_variant"])
             self.assertNotEqual(target, metric_directory(tmp, 30000))
             cfg = dict(spec["cfg"])
@@ -148,7 +148,7 @@ class OcclusionTests(unittest.TestCase):
             model = Path(tmp)/"baseline"
             model.mkdir()
             (model/"cfg_args").write_text("Namespace(model_type='3dgs', antialiasing=True)")
-            for variant, value, mode in (("", 20., "off"), ("occlusion_on_test", 23., "proxy")):
+            for variant, value, mode in (("", 20., "off"), ("occlusion_on_test", 23., "lidar")):
                 folder = metric_directory(model, 30000, variant)
                 folder.mkdir(parents=True)
                 (folder/"summary.json").write_text(json.dumps(dict(iteration=30000, antialiasing=True,
@@ -190,7 +190,7 @@ class OcclusionTests(unittest.TestCase):
                         get_features=leaf(2,1,3), get_features_dc=leaf(2,1,3), get_features_rest=leaf(2,1,3), active_sh_degree=0)
                     cam = camera(8)
                     cam.camera_center = torch.zeros(3)
-                    pipe = SimpleNamespace(occlusion_mode="proxy", antialiasing=True, debug=False, compute_cov3D_python=False, convert_SHs_python=False)
+                    pipe = SimpleNamespace(occlusion_mode="lidar", antialiasing=True, debug=False, compute_cov3D_python=False, convert_SHs_python=False)
                     before = len(calls)
                     with patch.object(module.torch, "zeros_like", side_effect=cpu_zeros), patch("utils.occlusion_culling.visibility_mask", return_value=keep):
                         result = module.render(cam, pc, pipe, torch.zeros(3), separate_sh=separate)

@@ -67,7 +67,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means2D = screenspace_points
     opacity = pc.get_opacity
     occlusion_keep = None
-    if getattr(pipe, "occlusion_mode", "off") == "proxy":
+    if getattr(pipe, "occlusion_mode", "off") == "lidar":
         from utils.occlusion_culling import visibility_mask
         occlusion_keep = visibility_mask(viewpoint_camera, pc, pipe, scaling_modifier)
 

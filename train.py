@@ -43,9 +43,8 @@ except:
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     dataset.antialiasing = pipe.antialiasing
     dataset.optimization_settings = vars(opt).copy()
-    from scripts.occlusion_options import configure_pipeline
-    configure_pipeline(pipe, dataset)
-    if pipe.occlusion_mode != "off" and opt.optimizer_type != "default":
+    from scripts.occlusion_options import configure_pipeline, prepare_training_geometry
+    if dataset.occlusion_mode != "off" and opt.optimizer_type != "default":
         raise ValueError("Occlusion culling currently requires the default Adam optimizer")
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -88,6 +87,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
+    prepare_training_geometry(dataset)
+    configure_pipeline(pipe, dataset)
     if opt.surface_mode != "off":
         gaussians.initialize_surface(opt.surface_patches, opt.surface_mode, opt.surface_confidence, opt.surface_thickness)
     gaussians.training_setup(opt)
@@ -279,6 +280,8 @@ def prepare_output_and_logger(args):
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", unique_str[0:10])
         
+    from scripts.occlusion_options import training_paths
+    training_paths(args)
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)

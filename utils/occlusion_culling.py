@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from utils.occlusion_depth import TILE, ProxyDepthCache
+from utils.occlusion_depth import TILE, LidarDepthCache
 
 
 def depth_pyramid(tiles):
@@ -84,16 +84,16 @@ def conservative_keep(camera, xyz, scales, rotations, tiles, margin=.05, sigma=3
         intersects = (hi_pixel[:, 0] >= 0) & (hi_pixel[:, 1] >= 0) & (lo_pixel[:, 0] < w) & (lo_pixel[:, 1] < h)
         lo = torch.floor(lo_pixel/TILE).nan_to_num().long().clamp_min(0).minimum(tile_bounds)
         hi = torch.floor(hi_pixel/TILE).nan_to_num().long().clamp_min(0).minimum(tile_bounds)
-        farthest_proxy = rectangle_maximum(atlas, metadata, lo, hi)
+        farthest_surface = rectangle_maximum(atlas, metadata, lo, hi)
         nearest = z - sigma*torch.sqrt(cov[:, 2, 2].clamp_min(0))
         reliable = intersects & (nearest > .2) & torch.isfinite(radius) & torch.isfinite(center).all(dim=1)
-        keep[start:end] = ~(reliable & torch.isfinite(farthest_proxy) & (nearest > farthest_proxy + margin))
+        keep[start:end] = ~(reliable & torch.isfinite(farthest_surface) & (nearest > farthest_surface + margin))
     return keep
 
 
 def visibility_mask(camera, pc, pipe, scaling_modifier=1.):
     if not hasattr(pipe, "_occlusion_provider"):
-        pipe._occlusion_provider = ProxyDepthCache(pipe.occlusion_mesh, pipe.occlusion_cache, pipe.occlusion_edge_pixels)
+        pipe._occlusion_provider = LidarDepthCache(pipe.occlusion_geometry, pipe.occlusion_cache, pipe.occlusion_edge_pixels)
     tiles = pipe._occlusion_provider.tiles(camera, pc.get_xyz.device)
     return conservative_keep(camera, pc.get_xyz.detach(), pc.get_scaling.detach(), pc.get_rotation.detach(), tiles,
         pipe.occlusion_margin, pipe.occlusion_sigma, pipe.occlusion_chunk_size, scaling_modifier)

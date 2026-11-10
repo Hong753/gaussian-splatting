@@ -149,12 +149,34 @@ class AblationVideosTests(unittest.TestCase):
         args = self.args([native, native])
         args.labels = ["Baseline", "Culled"]
         args.occlusion = ["off", "on"]
-        args.occlusion_mesh = mesh
+        args.occlusion_geometry = mesh
         plan = video.build_plan(args)
-        self.assertEqual([m["cfg"]["occlusion_mode"] for m in plan["models"]], ["off", "proxy"])
+        self.assertEqual([m["cfg"]["occlusion_mode"] for m in plan["models"]], ["off", "lidar"])
         self.assertEqual(plan["models"][0]["trajectory_sha256"], plan["models"][1]["trajectory_sha256"])
         self.assertEqual(plan["models"][0]["ply"], plan["models"][1]["ply"])
         self.assertTrue(all(m["antialiasing"] for m in plan["models"]))
+
+    def test_native_in_process_video_finishes_both_models_without_exec(self):
+        models = [self.model('base'), self.model('culled')]
+        argv = ['--video', 'random', '--source', str(self.source), '--models', *map(str, models),
+                '--output', str(self.root/'in_process'), '--width', '64', '--duration', '1', '--fps', '2',
+                '--source-window', '12', '--in-process']
+        def frames(spec, cameras, width, height, aa):
+            for _ in cameras:
+                yield np.zeros((height, width, 3), dtype=np.uint8)
+        def write(path, images, *unused):
+            list(images)
+        with patch.object(video.core, 'rendered_frames', side_effect=frames) as render, \
+                patch.object(video.core, 'write_video', side_effect=write), \
+                patch.object(video, 'stack_videos') as stack, \
+                patch.object(video, 'replace_with_model', side_effect=AssertionError('Must stay in-process')), \
+                patch.object(video.shutil, 'which', return_value='/usr/bin/ffmpeg'):
+            self.assertEqual(video.main(argv), 0)
+        plan = json.loads((self.root/'in_process/trajectory.json').read_text())
+        self.assertTrue(plan['complete'])
+        self.assertEqual(plan['completed_models'], [0, 1])
+        self.assertEqual(render.call_count, 2)
+        stack.assert_called_once()
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg required")
     def test_real_gt_and_multiple_panel_video_encoding(self):

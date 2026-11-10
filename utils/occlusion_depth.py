@@ -1,6 +1,6 @@
-"""Fixed proxy depth, cached as conservative 16-pixel tile maxima.
+"""Fixed LiDAR surfel depth, cached as conservative 16-pixel tile maxima.
 
-The proxy is an opaque geometry prior. Unknown pixels stay +inf. No hole filling,
+The cloud supplies opaque local surfaces. Unknown pixels stay +inf. No hole filling,
 learned opacity, or gradients through the depth test are used.
 """
 from collections import OrderedDict
@@ -12,17 +12,10 @@ from pathlib import Path
 import uuid
 
 import numpy as np
+from utils.lidar_occlusion import file_digest, load_geometry, surfel_triangles
 
 TILE = 16
-CACHE_VERSION = 1
-
-
-def file_digest(path):
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+CACHE_VERSION = 2
 
 
 def camera_signature(camera, edge_pixels):
@@ -34,7 +27,7 @@ def camera_signature(camera, edge_pixels):
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
-def mesh_clip_vertices(vertices, camera):
+def clip_vertices(vertices, camera):
     """Graphdeco camera coordinates (+z forward, +y down) to GL clip coordinates."""
     import torch
     view = camera.world_view_transform.to(device=vertices.device, dtype=vertices.dtype)
@@ -46,38 +39,29 @@ def mesh_clip_vertices(vertices, camera):
                         (f+n)/(f-n)*z - 2*f*n/(f-n), z), dim=-1)
 
 
-class MeshDepthRenderer:
-    def __init__(self, mesh, device):
+class LidarDepthRenderer:
+    def __init__(self, geometry, device):
         import torch
-        from plyfile import PlyData
         try:
             import nvdiffrast.torch as dr
         except ImportError as exc:
-            raise ImportError("A proxy depth cache is missing. Precompute it with scripts/precompute_occlusion.py "
-                              "in the Proxy-GS environment, or install nvdiffrast in this environment.") from exc
-        data = PlyData.read(str(mesh))
-        if "face" not in data or not len(data["face"]):
-            raise ValueError("Occlusion proxy must contain triangle faces, not just points")
-        vertices = np.stack([data["vertex"][axis] for axis in ("x", "y", "z")], axis=1).astype(np.float32)
-        faces = np.asarray(list(data["face"]["vertex_indices"]), dtype=np.int32)
-        if faces.ndim != 2 or faces.shape[1] != 3 or not np.isfinite(vertices).all():
-            raise ValueError("Proxy requires finite vertices and triangular faces")
-        if faces.min() < 0 or faces.max() >= len(vertices):
-            raise ValueError("Proxy face indices are out of bounds")
+            raise ImportError("Install the standalone depth rasterizer in the native environment: "
+                              "python -m pip install --no-build-isolation -r requirements-occlusion.txt") from exc
+        arrays, _ = load_geometry(geometry)
         self.dr, self.ctx = dr, dr.RasterizeCudaContext(device=device)
-        self.vertices = torch.as_tensor(vertices, device=device)
-        self.faces = torch.as_tensor(faces, device=device)
+        self.centers, self.normals, self.radii = [torch.as_tensor(arrays[k], device=device) for k in ('centers', 'normals', 'radii')]
 
     def __call__(self, camera):
         import torch
         with torch.no_grad():
-            clip = mesh_clip_vertices(self.vertices, camera)[None].contiguous()
             h, w = camera.image_height, camera.image_width
-            depth = torch.full((h, w), float("inf"), device=self.vertices.device)
-            # Bound rasterizer scratch allocations for large LiDAR meshes.
-            for start in range(0, len(self.faces), 1_000_000):
-                rast, _ = self.dr.rasterize(self.ctx, clip, self.faces[start:start+1_000_000].contiguous(),
-                                           resolution=(h, w), grad_db=False)
+            depth = torch.full((h, w), float("inf"), device=self.centers.device)
+            # Bounded scratch: never expand every surfel into triangles at once.
+            for start in range(0, len(self.centers), 100_000):
+                sl = slice(start, start+100_000)
+                vertices, faces = surfel_triangles(self.centers[sl], self.normals[sl], self.radii[sl])
+                clip = clip_vertices(vertices, camera)[None].contiguous()
+                rast, _ = self.dr.rasterize(self.ctx, clip, faces, resolution=(h, w), grad_db=False)
                 hit = rast[0, :, :, 3] > 0
                 ndc = rast[0, :, :, 2].clamp(-1, 1)
                 n, f = camera.znear, camera.zfar
@@ -96,12 +80,12 @@ def tile_maxima(depth, edge_pixels=1):
     return F.max_pool2d(depth, TILE, stride=TILE, ceil_mode=True)[0, 0]
 
 
-class ProxyDepthCache:
-    def __init__(self, mesh, directory="", edge_pixels=1, memory_views=4):
-        self.mesh = Path(mesh).expanduser().resolve()
-        self.mesh_sha256 = file_digest(self.mesh)
+class LidarDepthCache:
+    def __init__(self, geometry, directory="", edge_pixels=1, memory_views=4):
+        self.geometry = Path(geometry).expanduser().resolve()
+        self.geometry_sha256 = file_digest(self.geometry)
         self.directory = (Path(directory).expanduser().resolve() if directory else
-                          self.mesh.parent / "occlusion_depth_cache") / self.mesh_sha256
+                          self.geometry.parent / "occlusion_depth_cache") / self.geometry_sha256
         self.edge_pixels, self.memory_views = edge_pixels, memory_views
         self.memory, self.renderer = OrderedDict(), None
 
@@ -118,11 +102,11 @@ class ProxyDepthCache:
         if path.is_file():
             array = np.load(path, allow_pickle=False)
             if array.shape != shape or np.isnan(array).any() or np.any(array <= 0):
-                raise ValueError(f"Invalid proxy depth cache: {path}")
+                raise ValueError(f"Invalid LiDAR depth cache: {path}")
             tiles = torch.as_tensor(array, dtype=torch.float32, device=device)
         else:
             if self.renderer is None:
-                self.renderer = MeshDepthRenderer(self.mesh, device)
+                self.renderer = LidarDepthRenderer(self.geometry, device)
             tiles = tile_maxima(self.renderer(camera), self.edge_pixels)
             self.directory.mkdir(parents=True, exist_ok=True)
             temp = path.with_name(path.stem + f".{os.getpid()}.{uuid.uuid4().hex}.tmp.npy")

@@ -83,15 +83,15 @@ def main(argv=None):
             number(score.get("all")), number(score.get("selected")), number(score.get("unselected")),
             counts.get("all", "—"), latest])
         variants = sorted((path / "psnr_all_frames").glob("iteration_*/occlusion_*/summary.json"))
-        if variants or cfg.get("occlusion_mode") == "proxy":
+        if variants or cfg.get("occlusion_mode") == "lidar":
             summaries = ([result] if result else []) + [json.loads(p.read_text()) for p in variants]
             for entry in summaries:
                 if args.iteration != -1 and entry["iteration"] != args.iteration:
                     continue
                 scores = entry.get("mean_psnr_db", {})
                 occlusion_rows.append([path.name, entry["iteration"],
-                    "on" if cfg.get("occlusion_mode") == "proxy" else "off",
-                    "on" if entry.get("occlusion", {}).get("occlusion_mode") == "proxy" else "off",
+                    "on" if cfg.get("occlusion_mode") == "lidar" else "off",
+                    "on" if entry.get("occlusion", {}).get("occlusion_mode") == "lidar" else "off",
                     entry.get("render_variant") or "saved", number(scores.get("all")),
                     number(scores.get("selected")), number(scores.get("unselected")), entry.get("counts", {}).get("all", "—")])
         # Show train/eval gallery scores separately; their 'all' need not mean all registered frames.

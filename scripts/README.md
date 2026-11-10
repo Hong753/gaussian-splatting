@@ -543,107 +543,124 @@ an error if any fail. `--dry-run` validates and prints commands without renderin
 Override `SCENE`, `MODEL_ROOT`, `OUTPUT_ROOT`, `ITERATION` (default 30000),
 `NATIVE_PYTHON`, or `PROXY_PYTHON` through environment variables when needed.
 
-### Occlusion-only ablation on native 3DGS + AA
+### Standalone LiDAR occlusion: 3DGS + AA
 
-The native renderer supports `--occlusion_mode proxy` with a registered LiDAR
-triangle mesh. Standard SH Gaussians, AA, losses, initialization, position LR,
-densification schedule, and opacity resets retain their baseline behavior.
-Whole splats are culled only when their nearest 3-sigma depth lies behind the
-proxy throughout their entire rasterizer tile footprint, including the AA
-covariance filter. Unknown/hole pixels remain unoccluded; a one-pixel maximum
-depth filter relaxes boundaries. Large or partially occluded splats are kept.
-This is conservative whole-Gaussian culling, not per-pixel clipping.
+The occlusion framework builds its own fixed surface patches directly from the
+same `input.ply` used to initialize native 3DGS. It needs no Proxy-GS repository,
+environment, model, mesh, depth files, or training stage. `--occlusion_mode lidar`
+enables it in native `train.py`; native preparation is automatic.
 
-Surviving tensors enter the existing AA CUDA rasterizer. Culled rows have zero
-rendering gradients and zero radii, and do not contribute to per-view
-densification statistics. Default Adam's parameter and moment updates skip
-culled rows while retaining its global clock/LR schedule. The default Adam
-optimizer is required. Global pruning/opacity resets keep the original schedule.
+Preparation retains a measured point per voxel, fits local PCA normals, and
+rejects poorly planar or one-sided neighborhoods. Trusted patches have bounded
+radii and become opaque local surfels. No global mesh completion or learned
+opacity is used. Defaults are voxel size 0.05, maximum patch radius 0.1, and
+occlusion margin 0.05, all in **scene units**. These are starting values, not
+sensor-noise estimates. Missing/uncertain surface coverage remains unoccluded.
+Check the reported trusted-patch and culling fractions on the real scene.
 
-Proxy depths use a separate nvdiffrast CUDA pass. Only conservative 16x16 tile
-maxima are cached (not thousands of full-resolution depth arrays). Cache keys
-include mesh SHA-256, pose, FoV, resolution, clipping planes and edge padding.
-Novel poses/resolutions are rendered on demand. At most four tile maps stay in
-GPU cache; Gaussian processing is chunked. The existing GS rasterizer needs no
-rebuild. Install the same pinned nvdiffrast revision used by Proxy-GS into the
-native environment, then run the actual CUDA smoke test:
+At each camera pose, a depth-only CUDA pass finds the first fixed surface.
+A Gaussian is removed before the unchanged AA rasterizer only when its nearest
+3-sigma extent is behind that surface throughout its full rasterizer tile
+footprint. AA covariance support, boundary padding, and unknown pixels are
+accounted for. Partially occluded splats stay. Culled rows have zero rendering
+gradients and radii; their Adam parameter/moment updates and per-view
+densification statistics are skipped. The standard initialization, SH appearance,
+losses, position LR, densification schedule, and opacity resets stay unchanged.
+Default Adam is required.
+
+**Novel views use the same fixed 3D surfels from the new camera pose.** Exact-pose
+cached depths are reused when available; otherwise depth is computed on demand.
+No association with particular training frames is needed. Culling stays enabled
+at inference. Maximizing foreground opacity is not a substitute for this depth
+constraint: opacity saturation cannot guarantee spatial coverage. Rendering
+without culling is an ablation, not an equivalent deployment mode. A generic PLY
+viewer will not apply this mechanism; deployment needs the native renderer plus
+`occlusion_geometry.npz`, which is saved alongside the checkpoint.
+
+Only small 16x16 tile-depth maxima are cached, keyed by geometry content, pose,
+FoV, resolution, clipping planes, and boundary padding. At most four tile maps
+stay in GPU memory. Surface triangle expansion and Gaussian culling are chunked.
+The only added CUDA dependency is the general-purpose nvdiffrast rasterizer;
+the existing GS extension needs no rebuild. All model computation remains native
+3DGS. Install it once in the native environment:
 
 ```bash
+cd /home/sequor_vfm/gaussian-splatting
 PY=/opt/anaconda3/envs/3dgs/bin/python
-"$PY" -m pip install --no-deps --no-build-isolation \
-  'git+https://github.com/NVlabs/nvdiffrast.git@abb07ca0358f3a21c3942b50c54aa1eacd329af9'
+"$PY" -m pip install --no-deps --no-build-isolation -r requirements-occlusion.txt
 "$PY" scripts/smoke_occlusion.py --gpu 2
-
-ROOT=/data/3dgs_outputs/orange_4F/1_full
-SCENE=/data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full
-BASE=$("$PY" -c 'from scripts.render import resolve_models; import sys; print(resolve_models(None, sys.argv[1], ["sharp_keyframes_stride3_aa"])[0])' "$ROOT")
-MESH="$ROOT/keyframe_ablation/proxygs_stride3_original/proxygs_data/proxy.ply"
-CACHE="$ROOT/occlusion_depth_cache"
-NEW="$ROOT/3dgs_stride3_aa_occlusion"
-
-# Optional but recommended: all original cameras, reusable by training/evaluation.
-"$PY" scripts/precompute_occlusion.py --source "$SCENE" --mesh "$MESH" \
-  --cache "$CACHE" --resolution -1 --gpu 2
-
-# Existing weights, culling ON: full-frame PSNR plus matched image previews.
-CUDA_VISIBLE_DEVICES=2 "$PY" scripts/eval_all_frames.py --source "$SCENE" \
-  --model "$BASE" --iteration 30000 --antialiasing --occlusion on \
-  --occlusion-mesh "$MESH" --occlusion-cache "$CACHE" --occlusion-margin 0.05
-"$PY" scripts/render.py --model "$BASE" --split both --max-views 64 \
-  --iteration 30000 --gpu 2 --in-process --antialiasing --occlusion on \
-  --occlusion-mesh "$MESH" --occlusion-cache "$CACHE" --occlusion-margin 0.05
-
-# Fresh training from the same LiDAR initialization and saved stride-3 keyframes.
-"$PY" scripts/train.py --data-root /data/gh_workspace/data/COLMAP_BA_export \
-  --scenes orange_4F/1_full --output-root /data/3dgs_outputs \
-  --name 3dgs_stride3_aa_occlusion --keyframe-manifest "$BASE/keyframes.json" \
-  --iterations 30000 --resolution -1 --gpu 3 --data-device cpu \
-  --antialiasing --no-exposure-compensation --disable-viewer -- \
-  --occlusion_mode proxy --occlusion_mesh "$MESH" --occlusion_cache "$CACHE" \
-  --occlusion_margin 0.05
-
-# After training: evaluate the same new weights with culling OFF.
-# Training automatically produces the culling-ON train/eval images and full PSNR.
-CUDA_VISIBLE_DEVICES=4 "$PY" scripts/eval_all_frames.py --source "$SCENE" \
-  --model "$NEW" --iteration 30000 --antialiasing --occlusion off
-"$PY" scripts/render.py --model "$NEW" --split both --max-views 64 \
-  --iteration 30000 --gpu 4 --in-process --antialiasing --occlusion off
-"$PY" scripts/collect_ablation_results.py --root "$ROOT" \
-  --runs sharp_keyframes_stride3_aa 3dgs_stride3_aa_occlusion --iteration 30000
 ```
 
-`0.05` is a starting margin in **scene units**, not an estimated sensor noise.
-Inspect floor/wall boundary crops and the reported culling fraction; compare
-larger margins if valid splats disappear. Precomputing can also use the existing
-Proxy-GS Python environment; fully cached fixed-view evaluation/training does
-not import nvdiffrast at runtime. Novel-view rendering needs it for cache misses.
+The smoke test checks surface depth, image orientation, an unseen camera pose,
+AA rendering, and zero gradients for hidden splats on a real GPU. CPU tests also
+check opposite-side camera visibility, point-cloud patch fitting, open holes,
+cache identity, and frozen optimizer momentum. CPU tests do not validate CUDA.
 
-Saved settings are applied automatically by native rendering/evaluation.
-`--occlusion on|off|saved` overrides them in `scripts/render.py` and
-`scripts/eval_all_frames.py`. Overrides save metrics under
-`MODEL/psnr_all_frames/iteration_N/occlusion_on_HASH/` or `occlusion_off/`, and
-image galleries under separate variant names. Default evaluations stay in
-`iteration_N/`. They never overwrite the baseline protocol. Full-frame PSNR is
-computed before encoding and includes selected/unselected splits; the explicit
-64-view previews above only limit image saving. New training configs also record
-the complete optimizer settings for reproducibility; the commands above retain
-the original stride-3 baseline's standard training defaults.
-
-Videos accept **one culling setting per model**, including the same checkpoint
-twice when distinct labels are provided. For example, an immediate before/after
-rendering comparison with identical weights is:
+One command runs the CUDA smoke test, prepares geometry, trains for 30k steps, evaluates **all original
+registered frames first**, then saves GT/render/error galleries for both train
+and held-out views. It also evaluates the new weights with culling disabled.
+There are no Python supervisor subprocesses or environment switches:
 
 ```bash
-"$PY" scripts/render.py --video random --source "$SCENE" \
-  --models "$BASE" "$BASE" --labels "3DGS + AA" "3DGS + AA + culling" \
-  --aa on on --occlusion off on --occlusion-mesh "$MESH" --occlusion-cache "$CACHE" \
-  --iteration 30000 --gpu 2 --duration 40 --seed 42 --width 1280 --fps 30 \
-  --output "$ROOT/comparisons/occlusion_existing_random"
-"$PY" scripts/render.py --video actual --source "$SCENE" \
-  --models "$BASE" "$NEW" --labels "3DGS + AA" "Trained with culling" \
-  --aa on on --occlusion off on --occlusion-mesh "$MESH" --occlusion-cache "$CACHE" \
-  --iteration 30000 --gpu 5 --width 1280 --fps 30 \
-  --output "$ROOT/comparisons/occlusion_trained_actual"
+"$PY" scripts/run_occlusion.py \
+  --source /data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full \
+  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_occlusion \
+  --gpu 2
+```
+
+Without `--keyframes` or `--baseline`, the workflow selects the sharpest frame per
+consecutive stride-3 group. A supplied baseline's manifest is reused by default.
+To reuse the exact previous baseline selection and generate all
+four train/render culling combinations plus **random-trajectory** and
+**GT/captured-trajectory** comparison videos, supply the baseline:
+
+```bash
+ROOT=/data/3dgs_outputs/orange_4F/1_full
+BASE=$("$PY" -c 'from scripts.render import resolve_models; import sys; print(resolve_models(None, sys.argv[1], ["sharp_keyframes_stride3_aa"])[0])' "$ROOT")
+"$PY" scripts/run_occlusion.py \
+  --source /data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full \
+  --model "$ROOT/3dgs_stride3_aa_lidar_occlusion" \
+  --baseline "$BASE" --gpu 2
+```
+
+The default is AA enabled, exposure compensation disabled, and 30,000 steps.
+`--voxel-size`, `--max-radius`, and `--margin` control the geometric prior.
+`--report-max-views 64` limits only the saved image galleries; PSNR always uses
+all registered frames (5,009 for this scene). Each original image is assigned to
+the selected/unselected PSNR split using the saved keyframe manifest.
+`--dry-run` checks inputs and prints the stages without writing files or using
+CUDA. `--evaluate-only` retries post-training work and skips recorded completed
+stages with identical commands. Incomplete videos retain their output; choose a
+fresh `--video-output DIRECTORY` or inspect it before retrying that stage.
+
+Outputs under the model directory:
+
+- `occlusion_geometry.npz`: fixed centers, normals, radii, source SHA-256, and build settings.
+- `occlusion_depth_cache/`: reusable exact-camera depth tiles, including novel views.
+- `occlusion_workflow.json`: current stage and completed stages.
+- `psnr_all_frames/iteration_30000/summary.json`: saved culling-on all-frame scores.
+- `psnr_all_frames/iteration_30000/occlusion_off/`: the same trained weights without culling.
+- `view_comparisons/`: actual/render/error galleries for both rendering protocols.
+- `comparisons/random/side_by_side.mp4`: baseline versus trained model on one shared novel path.
+- `comparisons/actual/side_by_side.mp4`: GT plus both models on captured cameras.
+
+For individual renders, `scripts/render.py` and `scripts/eval_all_frames.py`
+automatically load saved settings; `--occlusion off` disables culling explicitly.
+Use `--occlusion on --occlusion-geometry MODEL/occlusion_geometry.npz` to apply
+the same geometry to a baseline checkpoint. Override metrics are saved separately
+under `occlusion_on_HASH/`, preserving existing baseline scores. Optional
+`scripts/prepare_occlusion.py --point-cloud INPUT.ply --output GEOMETRY.npz` and
+`scripts/precompute_occlusion.py --source SCENE --geometry GEOMETRY.npz --cache CACHE`
+expose preparation/caching independently; the normal workflow does not require
+these extra commands.
+
+To stop the two earlier all-frame rendering jobs on their server, the scoped
+helper below checks physical GPU indices, process ownership, script names, and
+exact run names before sending SIGTERM through PID-safe handles. It leaves jobs
+on other GPUs and unrelated processes alone. Without `--stop`, it only lists.
+
+```bash
+"$PY" scripts/stop_render_jobs.py --gpus 0 1 --stop
 ```
 
 ### AbsGS densification

@@ -74,6 +74,7 @@ def parser():
     p.add_argument("--max-frames", type=int)
     p.add_argument("--crf", type=int, default=18)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--in-process", action="store_true", help="Render native 3DGS comparisons without replacing the Python process")
     add_arguments(p, per_model=True)
     return p
 
@@ -88,6 +89,8 @@ def build_plan(args):
     if len(paths) < 2:
         raise ValueError("Supply at least two models for a comparison")
     specs = [model_info(path) for path in paths]
+    if args.in_process and any(spec['type'] != '3dgs' for spec in specs):
+        raise ValueError('--in-process videos require native 3DGS models')
     modes = args.occlusion or ["saved"] * len(specs)
     if len(modes) != len(specs):
         raise ValueError("Provide one --occlusion setting per model")
@@ -196,7 +199,7 @@ def stack_videos(paths, output, crf):
         temp.unlink(missing_ok=True)
 
 
-def execute_model(plan_path, index):
+def execute_model(plan_path, index, chain=True):
     plan = json.loads(Path(plan_path).read_text())
     os.environ["CUDA_VISIBLE_DEVICES"] = plan["gpu"]
     model = plan["models"][index]
@@ -206,15 +209,15 @@ def execute_model(plan_path, index):
                                   plan["width"], plan["height"], model["antialiasing"])
     label = f"{model['label']} | {model['iteration']} steps | AA {'on' if model['antialiasing'] else 'off'}"
     if model["type"] == "3dgs":
-        label += " | culling " + ("on" if model["cfg"].get("occlusion_mode") == "proxy" else "off")
+        label += " | culling " + ("on" if model["cfg"].get("occlusion_mode") == "lidar" else "off")
     output = Path(plan["output"])
     core.write_video(output / model["video"], labeled_frames(frames, label, plan["width"], plan["height"]),
                      plan["width"], plan["height"] + plan["label_height"], plan["fps"], plan["crf"])
     plan["completed_models"].append(index)
     atomic_json(plan_path, plan)
-    if index + 1 < len(plan["models"]):
+    if index + 1 < len(plan["models"]) and chain:
         replace_with_model(plan_path, plan, index + 1)
-    else:
+    elif index + 1 == len(plan["models"]):
         videos = ([output / "original.mp4"] if plan["mode"] == "actual" else [])
         videos += [output / m["video"] for m in plan["models"]]
         stack_videos(videos, output / "side_by_side.mp4", plan["crf"])
@@ -254,7 +257,11 @@ def main(argv=None):
                                           plan["width"], plan["height"])
             core.write_video(output / "original.mp4", labeled_frames(frames, "GT image", plan["width"], plan["height"]),
                              plan["width"], plan["height"] + plan["label_height"], plan["fps"], plan["crf"])
-        replace_with_model(plan_path, plan, 0)
+        if args.in_process:
+            for index in range(len(plan['models'])):
+                execute_model(plan_path, index, chain=False)
+        else:
+            replace_with_model(plan_path, plan, 0)
     except (ValueError, OSError, KeyError) as exc:
         p.exit(1, f"Video preparation failed: {exc}\n")
     return 0

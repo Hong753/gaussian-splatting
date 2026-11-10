@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GPU smoke test for proxy orientation, native AA rendering, and hidden gradients."""
+"""GPU smoke test for LiDAR depth, novel poses, native AA, and hidden gradients."""
 import argparse
 import math
 import os
@@ -24,23 +24,34 @@ def main():
     from scene.gaussian_model import GaussianModel
     from scripts.occlusion_options import configure_pipeline
     from utils.graphics_utils import getProjectionMatrix
-    from utils.occlusion_depth import MeshDepthRenderer
+    from utils.occlusion_depth import LidarDepthRenderer
+    from utils.lidar_occlusion import save_geometry
+    import numpy as np
     from utils.sh_utils import RGB2SH
 
     with tempfile.TemporaryDirectory(prefix="3dgs_occlusion_smoke_") as tmp:
-        mesh = Path(tmp)/"two_depths.ply"
-        mesh.write_text("ply\nformat ascii 1.0\nelement vertex 8\nproperty float x\nproperty float y\nproperty float z\n"
-                        "element face 4\nproperty list uchar int vertex_indices\nend_header\n"
-                        "-2 -2 2\n2 -2 2\n2 0 2\n-2 0 2\n-4 0 4\n4 0 4\n4 4 4\n-4 4 4\n"
-                        "3 0 1 2\n3 0 2 3\n3 4 5 6\n3 4 6 7\n")
+        geometry = Path(tmp)/"two_depths.npz"
+        centers, radii = [], []
+        for z, low, high, step in [(2, -2, 0, .125), (4, 0, 4, .25)]:
+            x, y = np.meshgrid(np.arange(-z, z+step/2, step), np.arange(low, high+step/2, step))
+            centers.extend(np.stack((x.ravel(), y.ravel(), np.full(x.size, z)), axis=1))
+            radii.extend([step*1.2]*x.size)
+        save_geometry(geometry, centers, np.tile([0, 0, 1], (len(centers), 1)), radii)
         view = torch.eye(4, device="cuda")
         projection = getProjectionMatrix(.01, 100., math.pi/2, math.pi/2).cuda().T
         cam = SimpleNamespace(image_width=128, image_height=128, FoVx=math.pi/2, FoVy=math.pi/2,
             znear=.01, zfar=100., world_view_transform=view, full_proj_transform=view@projection,
             camera_center=torch.zeros(3, device="cuda"))
-        depth = MeshDepthRenderer(mesh, torch.device("cuda:0"))(cam)
+        renderer = LidarDepthRenderer(geometry, torch.device("cuda:0"))
+        depth = renderer(cam)
         torch.testing.assert_close(depth[32, 64], torch.tensor(2., device="cuda"), atol=.002, rtol=0)
         torch.testing.assert_close(depth[96, 64], torch.tensor(4., device="cuda"), atol=.002, rtol=0)
+        moved_view = view.clone()
+        moved_view[3, 2] = -.25
+        novel = SimpleNamespace(**{**vars(cam), 'world_view_transform': moved_view, 'full_proj_transform': moved_view@projection})
+        novel_depth = renderer(novel)
+        torch.testing.assert_close(novel_depth[32, 64], torch.tensor(1.75, device="cuda"), atol=.002, rtol=0)
+        torch.testing.assert_close(novel_depth[96, 64], torch.tensor(3.75, device="cuda"), atol=.002, rtol=0)
 
         pc = GaussianModel(0)
         p = lambda x: torch.nn.Parameter(torch.tensor(x, dtype=torch.float32, device="cuda"))
@@ -53,7 +64,7 @@ def main():
         pipe = SimpleNamespace(convert_SHs_python=False, compute_cov3D_python=False, debug=False, antialiasing=True)
         bg = torch.zeros(3, device="cuda")
         plain = render(cam, pc, pipe, bg)["render"].detach()
-        configure_pipeline(pipe, dict(occlusion_mode="proxy", occlusion_mesh=str(mesh), occlusion_cache=tmp))
+        configure_pipeline(pipe, dict(occlusion_mode="lidar", occlusion_geometry=str(geometry), occlusion_cache=tmp))
         result = render(cam, pc, pipe, bg)
         assert result["occlusion_keep"].tolist() == [True, False, True]
         assert result["radii"][1].item() == 0
@@ -64,7 +75,7 @@ def main():
             assert gradient is not None and torch.count_nonzero(gradient[1]).item() == 0, attribute
         assert torch.count_nonzero(pc._features_dc.grad[[0,2]]).item() > 0
         assert torch.count_nonzero(result["viewspace_points"].grad[1]).item() == 0
-        print("CUDA smoke test passed: proxy depth/orientation, AA rendering, full-length visibility, and zero hidden gradients.")
+        print("CUDA smoke test passed: LiDAR depth/orientation, unseen camera pose, AA rendering, and zero hidden gradients.")
 
 
 if __name__ == "__main__":

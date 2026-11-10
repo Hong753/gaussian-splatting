@@ -1,0 +1,2 @@
+# Optional CUDA triangle rasterizer for fixed LiDAR surface depth only.
+nvdiffrast @ git+https://github.com/NVlabs/nvdiffrast.git@abb07ca0358f3a21c3942b50c54aa1eacd329af9
