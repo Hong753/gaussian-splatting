@@ -22,15 +22,22 @@ def require_cuda(torch, gpu):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--gpu', default='3')
+    p.add_argument('--imports-only', action='store_true',
+                   help='Validate the actual DA3 API import chain without requiring a GPU')
     args = p.parse_args(argv)
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     import torch
     print(f'Python: {sys.executable}; torch: {torch.__version__}; wheel CUDA: {torch.version.cuda}', flush=True)
-    require_cuda(torch, args.gpu)
+    if not args.imports_only:
+        require_cuda(torch, args.gpu)
     import torchvision
     import xformers
     from xformers.ops import memory_efficient_attention
     from depth_anything_3.api import DepthAnything3
+    if args.imports_only:
+        print(f'DA3 API imports passed; torchvision={torchvision.__version__}; '
+              f'xformers={xformers.__version__}', flush=True)
+        return 0
     with torch.inference_mode():
         # Exercise CUDA kernels and the matching xFormers extension, not only imports.
         q = torch.randn(1, 64, 4, 64, dtype=torch.float16, device='cuda')

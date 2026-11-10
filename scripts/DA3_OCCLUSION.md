@@ -59,6 +59,10 @@ If `da3-depth` already exists, skip `conda create`. The pinned install also
 repairs the previous unbounded installation that could select a newer CUDA-major
 wheel. `check_da3_environment.py` prints the interpreter and package/CUDA versions,
 then executes an actual xFormers CUDA attention operation and imports the DA3 API.
+The requirements also explicitly include `addict`, which DA3 imports but omits
+from its upstream dependency list. To validate the real API import chain on a
+CPU-only machine, run `python scripts/check_da3_environment.py --imports-only`;
+the ordinary GPU check remains mandatory in the experiment launcher.
 
 The DA3 source revision is pinned in `requirements-da3.txt`. The resolved
 Hugging Face weight revision, source cloud digest, exact camera signatures,
