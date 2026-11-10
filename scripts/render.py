@@ -12,7 +12,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts.view_comparisons import (atomic_json, image_id, model_info,
-                                      shared_iteration, write_gallery)
+                                      shared_iteration, write_all_frame_metrics, write_gallery)
 
 
 def resolve_models(models, model_root, runs):
@@ -34,6 +34,10 @@ def resolve_models(models, model_root, runs):
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--video" in argv:
+        from scripts.render_ablation_videos import main as video_main
+        return video_main(argv)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", nargs="?", choices=["train", "eval", "both", "all"])
     parser.add_argument("-m", "--model", "--models", nargs="+", dest="models")
@@ -128,6 +132,13 @@ def main(argv=None):
             for model, records in zip(models, model_rows):
                 mean = sum(float(records[n]["psnr_db"]) for n in names) / len(names)
                 model["mean_psnr_db"] = round(mean, 5) if math.isfinite(mean) else "inf"
+            if split_name == "all":
+                for spec, records in zip(specs, model_rows):
+                    summary = write_all_frame_metrics(spec, records, iteration, args.antialiasing)
+                    if summary is None:
+                        print(f"{spec['path'].name}: partial coverage; no all-frame PSNR summary exported.")
+                    else:
+                        print(f"{spec['path'].name}: {summary['counts']} frames; PSNR {summary['mean_psnr_db']}", flush=True)
             write_gallery(folder, f"{split_name.title()} views · iteration {iteration}", rows, models,
                           dict(split=split_name, total_shared_views=total, rendered_views=len(names),
                                excluded_nonshared_views=[len(s)-total for s in sets],

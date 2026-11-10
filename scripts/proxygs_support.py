@@ -339,7 +339,25 @@ def cache_depths(preparation, upstream, setting):
     return mesh_path, output
 
 
-def proxy_renderer(spec, iteration):
+def proxy_depth_renderer(mesh_path):
+    """Rasterize the registered proxy at each requested pose and pixel resolution."""
+    import numpy as np
+    from Mesh2DepthHelper import DepthRenderer, Load_ply_resource, Build_Ply_Render_Camera_Parameters_colmap_correct
+    renderer = DepthRenderer(device="cuda")
+    mesh = Load_ply_resource(str(mesh_path), "cuda")
+    def depth_at(camera):
+        w, h = camera.image_width, camera.image_height
+        parameters = Build_Ply_Render_Camera_Parameters_colmap_correct(
+            w / (2 * np.tan(camera.FoVx / 2)), h / (2 * np.tan(camera.FoVy / 2)),
+            w * .5, h * .5, w, h, camera.znear, camera.zfar,
+            np.asarray(camera.R).T, np.asarray(camera.T), "cuda")
+        depth, _ = renderer.render_depth_batched(mesh, parameters, flip_y=True,
+            max_tris_per_pass=1_000_000, linear_depth=True, verbose=False)
+        return depth
+    return depth_at
+
+
+def proxy_renderer(spec, iteration, dynamic_depth=False):
     """Load official saved anchors/MLPs and retain proxy culling for evaluation."""
     import numpy as np
     import torch
@@ -355,6 +373,8 @@ def proxy_renderer(spec, iteration):
     from gaussian_renderer import prefilter_voxel, render
     from utils.camera_utils import loadCam
     cfg = spec["cfg"]
+    if cfg.get("appearance_dim", 0):
+        raise ValueError("Proxy-GS base-appearance evaluation requires appearance_dim=0")
     model = GaussianModel(*(cfg[k] for k in (
         "feat_dim", "n_offsets", "fork", "use_feat_bank", "appearance_dim",
         "add_opacity_dist", "add_cov_dist", "add_color_dist", "add_level",
@@ -367,18 +387,24 @@ def proxy_renderer(spec, iteration):
     pipe = SimpleNamespace(compute_cov3D_python=False, debug=False)
     background = torch.tensor([1,1,1] if cfg.get("white_background", False) else [0,0,0],
                               dtype=torch.float32, device="cuda")
+    if dynamic_depth:
+        depth_for_camera = proxy_depth_renderer(meta["mesh"])
     args = SimpleNamespace(resolution=cfg.get("resolution", -1), data_device="cpu")
     def make_camera(record, index):
         with Image.open(record["image_path"]) as image:
             original = image.convert("RGB").copy()
         info = SimpleNamespace(uid=index, R=np.array(record["R"]), T=np.array(record["T"]),
                 FovX=record["fov_x"], FovY=record["fov_y"], image=original,
-                image_name=record["alias"], image_path=record["image_path"],
+                image_name=record.get("alias", record["name"]), image_path=record["image_path"],
                 width=record["width"], height=record["height"])
         return loadCam(args, index, info, 1.)
     def render_camera(camera):
         model.set_anchor_mask(camera.camera_center, iteration, camera.resolution_scale)
-        depth = np.load(Path(meta["depth_dir"]) / (camera.image_name + ".npy"))
+        if dynamic_depth:
+            # A novel pose or changed output resolution needs its own proxy depth.
+            depth = depth_for_camera(camera)
+        else:
+            depth = np.load(Path(meta["depth_dir"]) / (camera.image_name + ".npy"))
         visible, _ = prefilter_voxel(camera, model, pipe, background, depth_map=depth)
         if not visible.any():
             return background[:, None, None].expand(3, camera.image_height, camera.image_width)

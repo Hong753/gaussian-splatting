@@ -13,6 +13,7 @@ from PIL import Image
 
 from scripts.proxygs_support import REVISION, PATCH_VERSION, prepare_dataset, resolution
 from scripts.run_proxygs import main
+from scripts.view_comparisons import model_info
 from test_view_comparisons import dataset
 
 
@@ -78,6 +79,25 @@ class ProxyGSAdapterTests(unittest.TestCase):
         path = prepare_dataset(self.source, self.manifest, self.model)
         self.assertEqual(json.loads((path.parent / "transforms_test.json").read_text())["frames"], [])
         self.assertEqual(len(json.loads(path.read_text())["frames"]), len(self.selected))
+
+    def test_all_frame_selection_expands_beyond_staged_frames_and_preserves_splits(self):
+        for evaluation in (True, False):
+            with self.subTest(evaluation=evaluation):
+                manifest = json.loads(self.manifest.read_text())
+                manifest["eval"] = evaluation
+                self.manifest.write_text(json.dumps(manifest))
+                model = self.root / f"all_{evaluation}"
+                prep = prepare_dataset(self.source, self.manifest, model)
+                (model / "cfg_args").write_text(f"Namespace(source_path={str(prep.parent)!r})")
+                (model / "proxygs_run.json").write_text(json.dumps(dict(preparation=str(prep), source=str(self.source))))
+                info = model_info(model)
+                self.assertEqual(info["splits"]["all"], set(self.names))
+                self.assertEqual(info["splits"]["train"], set(self.selected))
+                self.assertEqual(info["splits"]["eval"], set(self.names[::8]) if evaluation else set())
+                self.assertGreater(len(info["records"]), len(json.loads(prep.read_text())["frames"]))
+                self.assertIn("alias", info["records"][self.selected[0]])
+                self.assertNotIn("alias", info["records"][self.names[3]])
+                self.assertEqual(info["records"][self.names[3]]["image_path"], str(self.source / "images" / self.names[3]))
 
     def test_run_dry_run_has_checkpoints_proxy_culling_and_final_reports(self):
         stdout = io.StringIO()

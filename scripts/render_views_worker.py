@@ -20,8 +20,12 @@ def render_views(spec, names, iteration, output, antialiasing=None):
     from tqdm import tqdm
     cfg = spec["cfg"]
     if spec["type"] == "proxygs":
+        if antialiasing:
+            raise ValueError("Proxy-GS does not support Graphdeco AA; use --no-antialiasing")
         from scripts.proxygs_support import proxy_renderer
-        render, make_camera = proxy_renderer(spec, iteration)
+        # Unselected original frames have no training depth cache. Rasterize the
+        # proxy at the exact requested pose/resolution for every evaluated view.
+        render, make_camera = proxy_renderer(spec, iteration, dynamic_depth=True)
     else:
         from scripts.render_model_comparison import load_renderer
         from utils.camera_utils import loadCam
@@ -62,7 +66,7 @@ def render_views(spec, names, iteration, output, antialiasing=None):
             save_panel(gt, rendered, output / "comparisons" / f"{key}.jpg", spec["path"].name, psnr)
             records[name] = dict(gt=f"gt/{key}.png", image=f"renders/{key}.png",
                                  error=f"errors/{key}.png", comparison=f"comparisons/{key}.jpg",
-                                 psnr_db=round(psnr, 5) if math.isfinite(psnr) else "inf",
+                                 psnr_db=psnr if math.isfinite(psnr) else "inf",
                                  target_sha256=hashlib.sha256(str(gt_array.shape).encode() + gt_array.tobytes()).hexdigest())
             del camera, pred, target
     atomic_json(output / "frames.json", records)

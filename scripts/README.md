@@ -64,8 +64,8 @@ python scripts/render.py --eval --model /path/to/run --iteration 7000 --gpu 2
 
 `train` contains the images actually selected for training. `eval` contains the
 original lexical 1-in-8 held-out split when enabled; unused training candidates
-are not relabeled as eval images. `all` includes all registered images (for
-Proxy-GS, all staged train/eval images). `both` is the default. Comparing runs uses
+are not relabeled as eval images. `all` includes every original registered COLMAP
+image, including unstaged/unselected frames for Proxy-GS. `both` is the default. Comparing runs uses
 their shared image names and latest common saved iteration, or `--iteration N`.
 Each run uses its own saved source calibration, which preserves the intended
 original-versus-refined-pose comparison. Different ground-truth pixels or image
@@ -93,6 +93,22 @@ a directory under the common parent for multiple models. `--dry-run` checks
 selection/checkpoints without loading CUDA or creating outputs. Older configs
 without an AA field default to AA for 3DGS/Scaffold; override explicitly with
 `--no-antialiasing` when appropriate. Proxy-GS uses its own rasterizer without AA.
+
+For Proxy-GS, render and evaluate **every original frame** directly in its environment:
+
+```bash
+~/.venvs/proxygs/bin/python scripts/render.py --model /path/to/proxygs_run \
+  --split all --iteration 30000 --gpu 6 --in-process
+```
+
+This produces GT/render/error images and a browser under
+`RUN/view_comparisons/iteration_30000/all/`, plus
+`RUN/psnr_all_frames/iteration_30000/{summary.json,per_frame.csv}`. The summary
+separates all, selected training, and unselected frames. It is written only when
+the complete original camera set was rendered; sampled or shared subsets never
+overwrite it. Metrics are computed before PNG/video encoding, at the model's saved
+image resolution, without per-image exposure. Proxy depth is rasterized at each
+requested camera; no new training or depth-cache preparation is needed.
 
 ## Proxy-GS trial with a LiDAR surface proxy
 
@@ -449,6 +465,62 @@ sequentially on the same GPU. Default `--iteration 30000` selects the same
 iteration for both; `-1` selects each model's latest, which may differ.
 
 
+
+### Ablation videos and saved result tables
+
+`scripts/render.py --video random` and `--video actual` accept any mixture of
+native 3DGS/AbsGS, Scaffold, Textured Gaussians and Proxy-GS. Supply at least two
+`--models` paths, or use `--model-root ROOT --runs NAME ...` to resolve nested
+run folders. `--labels` and `--aa` accept one value per model. Proxy-GS and
+Textured Gaussians require AA off; `auto` uses saved AA or assumes on for legacy
+native configurations that lack the field. Set AA explicitly for old runs.
+
+```bash
+python scripts/collect_ablation_results.py --root /data/3dgs_outputs/orange_4F/1_full --list
+python scripts/collect_ablation_results.py --root /data/3dgs_outputs/orange_4F/1_full --iteration 30000
+
+python scripts/render.py --video random --source /path/to/scene \
+  --model-root /path/to/results --runs baseline ablation \
+  --labels "3DGS + AA" "Ablation" --aa on on --iteration 30000 \
+  --duration 40 --seed 42 --deviation 3 --max-distance-fraction 0.10 \
+  --view-degrees 12 --width 1280 --fps 30 --gpu 6 --output /path/to/random_video
+
+python scripts/render.py --video actual --source /path/to/scene \
+  --model-root /path/to/results --runs baseline ablation \
+  --labels "3DGS + AA" "Ablation" --aa on on --iteration 30000 \
+  --actual-poses model --width 1280 --fps 30 --gpu 6 --output /path/to/actual_video
+```
+
+Random videos use one shared trajectory and no GT panel. Identical source,
+seed and path settings reproduce the same trajectory across ablations. These
+camera-derived paths are not checked for collisions with walls. Actual videos
+place GT first, then each model in the supplied order. They cover all registered
+frames unless `--start`, `--stride` or `--max-frames` restrict the selection.
+`--actual-poses source` (default) uses identical source calibration for every
+model; `model` uses each run's calibration for the same GT image names. Use the
+latter to inspect pose refinement, and disclose that poses differ. A refined
+source must share the original LiDAR PLY and original images through symlinks
+or hard links; unrelated coordinate systems/GT images are rejected.
+
+The default iteration is the latest *common* checkpoint. Explicit per-model
+`--iterations 30000 60000` allows a different-budget comparison; each panel
+displays its iteration. Missing checkpoints/MLPs fail before rendering.
+`--dry-run` validates the plan without CUDA or output writes. Outputs are
+`model_0.mp4`, `model_1.mp4`, etc., `original.mp4` for actual views,
+`side_by_side.mp4`, and `trajectory.json` with camera hashes, poses, settings,
+model paths and completion state. Use a new output directory for each run.
+
+Models render sequentially using process replacement, including environment
+switches for Proxy-GS; no Python supervisor holds CUDA state. Proxy-GS computes
+fresh mesh depth at every requested pose and output resolution, retaining proxy
+culling for novel views. Existing training depth caches are left intact.
+
+The CPU-only result collector reads saved all-frame PSNR summaries and reports
+missing values as dashes. `valid` means unselected frames in that protocol.
+Train/eval image-report scores appear in a separate table with frame counts;
+they are never presented as all-registered-frame PSNR. `--runs NAME ...` filters
+the tables, and `--iteration -1` selects each run's latest available metric
+while retaining its actual step count.
 
 ### AbsGS densification
 

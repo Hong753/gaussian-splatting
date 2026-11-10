@@ -129,6 +129,33 @@ class ViewComparisonsTests(unittest.TestCase):
         self.assertEqual(result.exception.code, 1)
         self.assertFalse((output / "train/index.html").exists())
 
+    def test_all_frame_metrics_preserve_train_membership_and_ignore_sampled_runs(self):
+        model = self.model("all_frames")
+        with patch.object(render.subprocess, "run", side_effect=self.fake_worker()), contextlib.redirect_stdout(io.StringIO()):
+            render.main(["--model", str(model), "--split", "all"])
+        summary_path = model / "psnr_all_frames/iteration_7000/summary.json"
+        before = summary_path.read_bytes()
+        summary = json.loads(before)
+        self.assertEqual(summary["counts"], dict(all=16, selected=6, unselected=10))
+        self.assertEqual(summary["mean_psnr_db"], dict(all=22.5, selected=22.5, unselected=22.5))
+        csv_path = summary_path.with_name("per_frame.csv")
+        self.assertEqual(len(csv_path.read_text().splitlines()), 17)
+        with patch.object(render.subprocess, "run", side_effect=self.fake_worker()), contextlib.redirect_stdout(io.StringIO()):
+            render.main(["--model", str(model), "--split", "all", "--max-views", "3"])
+        self.assertEqual(summary_path.read_bytes(), before)
+        self.assertEqual(len(csv_path.read_text().splitlines()), 17)
+
+    def test_shared_subset_does_not_claim_full_coverage_for_larger_model(self):
+        a, b = self.model("subset"), self.model("full")
+        specs = {p: model_info(p) for p in (a, b)}
+        specs[a]["splits"]["all"] = set(self.names[:4])
+        specs[a]["splits"]["train"] = set(self.selected) & set(self.names[:4])
+        with patch.object(render, "model_info", side_effect=lambda p: specs[p]), \
+                patch.object(render.subprocess, "run", side_effect=self.fake_worker()), contextlib.redirect_stdout(io.StringIO()):
+            render.main(["--models", str(a), str(b), "--split", "all", "--output", str(self.root / "subset_report")])
+        self.assertTrue((a / "psnr_all_frames/iteration_7000/summary.json").is_file())
+        self.assertFalse((b / "psnr_all_frames").exists())
+
     def test_dry_run_makes_no_output_and_no_gpu_call(self):
         a, output = self.model("a"), self.root / "dry"
         with patch.object(render.subprocess, "run") as worker, contextlib.redirect_stdout(io.StringIO()):

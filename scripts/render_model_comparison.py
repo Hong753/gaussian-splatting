@@ -162,6 +162,11 @@ def read_cameras(source):
 
 
 def load_renderer(spec, aa):
+    if spec["type"] == "proxygs":
+        if aa:
+            raise ValueError("Proxy-GS does not support Graphdeco anti-aliasing")
+        from scripts.proxygs_support import proxy_renderer
+        return proxy_renderer(spec, spec["iteration"], dynamic_depth=True)[0]
     import torch
     from scene.gaussian_model import GaussianModel
     from gaussian_renderer import render as render_3dgs
@@ -209,9 +214,9 @@ def load_renderer(spec, aa):
 def rendered_frames(spec, cameras, width, height, aa):
     import torch
     from tqdm import tqdm
+    render = load_renderer(spec, aa)
     from scene.cameras import MiniCam
     from utils.graphics_utils import getWorld2View2, getProjectionMatrix
-    render = load_renderer(spec, aa)
     try:
         with torch.no_grad():
             for info in tqdm(cameras, desc=f"Rendering {spec['type']}", unit="frame"):
@@ -224,6 +229,10 @@ def rendered_frames(spec, cameras, width, height, aa):
                 # The texture renderer needs the original COLMAP pose to form
                 # its world-to-camera matrix; MiniCam normally stores only GPU transforms.
                 cam.R, cam.T = info.R, info.T
+                cam.image_name, cam.uid, cam.resolution_scale = info.image_name, 0, 1.0
+                cam.Fx, cam.Fy = width / (2 * math.tan(info.FovX / 2)), height / (2 * math.tan(info.FovY / 2))
+                cam.Cx, cam.Cy = width * .5, height * .5
+                cam.projection_matrix = projection
                 image = render(cam).clamp(0, 1).permute(1, 2, 0).mul(255).byte().cpu().numpy()
                 yield image
     finally:

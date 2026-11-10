@@ -88,7 +88,15 @@ def model_info(path):
     if marker.is_file():
         metadata = json.loads(marker.read_text())
         prepared = json.loads(Path(metadata["preparation"]).read_text())
-        records = {r["name"]: r for r in prepared["frames"]}
+        manifest_path = Path(prepared["keyframes"])
+        manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
+        records = read_colmap_records(prepared["source"], manifest.get("image_directory", "images"))
+        staged = {r["name"]: r for r in prepared["frames"]}
+        if len(staged) != len(prepared["frames"]) or not set(staged) <= set(records):
+            raise ValueError("Staged Proxy-GS frames are duplicated or absent from the original COLMAP source")
+        # Preserve saved training calibration/aliases; unstaged cameras come from
+        # the complete original source, never the reduced proxygs_data directory.
+        records.update(staged)
         splits = {s: {r["name"] for r in prepared["frames"] if r["split"] == s}
                   for s in ("train", "eval")}
         splits["all"] = set(records)
@@ -104,6 +112,43 @@ def model_info(path):
         manifest = json.loads(manifest_path.read_text())
     return dict(path=path, cfg=cfg, type=cfg.get("model_type", "3dgs"),
                 records=records, splits=split_names(records, cfg, manifest))
+
+
+def write_all_frame_metrics(spec, rows, iteration, antialiasing=None):
+    """Export the common PSNR protocol only when every registered frame was rendered."""
+    available, selected = spec["splits"]["all"], spec["splits"]["train"]
+    if not available or set(rows) != set(available):
+        return None  # A sampled/shared subset must never masquerade as full coverage.
+    if not selected <= available:
+        raise ValueError("Training frames are absent from the registered camera set")
+    groups = dict(all=available, selected=selected, unselected=available - selected)
+    means = {}
+    for group, names in groups.items():
+        value = sum(float(rows[name]["psnr_db"]) for name in sorted(names)) / len(names) if names else None
+        means[group] = "inf" if value == float("inf") else value
+    cfg, meta = spec["cfg"], spec.get("metadata", {})
+    aa = False if spec["type"] == "proxygs" else (
+        antialiasing if antialiasing is not None else cfg.get("antialiasing", spec["type"] != "textured"))
+    summary = dict(iteration=iteration, source=meta.get("source", cfg.get("source_path")),
+        model=str(spec["path"]), model_type=spec["type"], antialiasing=aa,
+        resolution_setting=cfg.get("resolution", -1),
+        exposure_protocol="base appearance; no per-image exposure applied",
+        metric="mean per-channel PSNR, then arithmetic mean over images",
+        selection_manifest=meta.get("preparation") if spec["type"] == "proxygs" else (
+            str(spec["path"] / "keyframes.json") if cfg.get("keyframe_manifest") else None),
+        coverage="all original registered COLMAP frames",
+        counts={group: len(names) for group, names in groups.items()}, mean_psnr_db=means)
+    output = spec["path"] / "psnr_all_frames" / f"iteration_{iteration}"
+    output.mkdir(parents=True, exist_ok=True)
+    temporary = output / "per_frame.csv.tmp"
+    with temporary.open("w", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["image_name", "selected_for_training", "psnr_db"])
+        for name in sorted(available):
+            writer.writerow([name, int(name in selected), rows[name]["psnr_db"]])
+    temporary.replace(output / "per_frame.csv")
+    atomic_json(output / "summary.json", summary)
+    return summary
 
 
 def shared_iteration(specs, requested):
@@ -175,7 +220,7 @@ function display(){
  const row=rows[index];el('name').textContent=row.name;
  el('count').textContent=(index+1)+' / '+rows.length;
  const entries=[{title:'Actual image',path:row.gt},...row.renders.map((r,i)=>({
- title:data.models[i].label+' · '+r.psnr_db+' dB',path:el('errors').checked?r.error:r.image}))];
+ title:data.models[i].label+' · '+(typeof r.psnr_db==='number'?r.psnr_db.toFixed(2):r.psnr_db)+' dB',path:el('errors').checked?r.error:r.image}))];
  el('panels').style.gridTemplateColumns='repeat('+entries.length+',minmax(0,1fr))';
  for(const item of entries){
  const box=document.createElement('figure'),caption=document.createElement('figcaption');
