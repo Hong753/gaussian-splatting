@@ -39,6 +39,11 @@ conservative; partially occluded splats are retained.
 
 DA3 has different PyTorch dependencies; install it in a separate conda environment.
 The native 3DGS environment is used unchanged for training and rendering.
+`requirements-da3.txt` pins PyTorch 2.6.0 + CUDA 12.4, torchvision 0.21.0,
+and xFormers 0.0.29.post3 from the CUDA-12.4 wheel repository. The explicit
+xFormers wheel URLs select the matching binary for Linux x86_64 Python 3.11/3.12;
+using the same version from a different CUDA index can select a different build.
+This supports the current host's CUDA-12.4 driver API without upgrading its driver.
 
 ```bash
 source /opt/anaconda3/etc/profile.d/conda.sh
@@ -47,7 +52,13 @@ git pull --ff-only origin experiment/my-3dgs-changes
 conda create -n da3-depth python=3.11 -y
 conda activate da3-depth
 python -m pip install -r requirements-da3.txt
+python scripts/check_da3_environment.py --gpu 3
 ```
+
+If `da3-depth` already exists, skip `conda create`. The pinned install also
+repairs the previous unbounded installation that could select a newer CUDA-major
+wheel. `check_da3_environment.py` prints the interpreter and package/CUDA versions,
+then executes an actual xFormers CUDA attention operation and imports the DA3 API.
 
 The DA3 source revision is pinned in `requirements-da3.txt`. The resolved
 Hugging Face weight revision, source cloud digest, exact camera signatures,
@@ -61,23 +72,23 @@ frames. Change the output directory when changing inputs/settings.
 source /opt/anaconda3/etc/profile.d/conda.sh
 conda activate 3dgs
 cd /home/sequor_vfm/gaussian-splatting
-ROOT=/data/3dgs_outputs/orange_4F/1_full
-SOURCE=/data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full
-BASE=$(python -c 'from scripts.render import resolve_models; import sys; print(resolve_models(None, sys.argv[1], ["sharp_keyframes_stride3_aa"])[0])' "$ROOT")
-DEPTH="$ROOT/da3_lidar_depth_stride3"
-MODEL="$ROOT/3dgs_stride3_aa_da3_occlusion_warm7k_lr50"
-
-conda activate da3-depth
-python -u scripts/prepare_da3_occlusion.py \
-  --source "$SOURCE" --keyframes "$BASE/keyframes.json" \
-  --point-cloud "$BASE/input.ply" --output "$DEPTH" \
-  --process-res 756 --resolution -1 --gpu 3
-
-conda activate 3dgs
-python -u scripts/run_da3_occlusion.py \
-  --source "$SOURCE" --model "$MODEL" --baseline "$BASE" \
-  --depth-dir "$DEPTH" --gpu 3
+git pull --ff-only origin experiment/my-3dgs-changes
+bash scripts/run_da3_ablation.sh 3
 ```
+
+This shell launcher activates each conda environment explicitly, installs/repairs
+the pinned DA3 dependencies, checks CUDA, prepares depths, and starts native
+training only when every preceding command succeeds. It uses direct sequential
+Python invocations and exits on the first failure. Existing valid depth caches
+are retained. It does not stop other runs or change the system driver.
+
+Defaults are the source `/data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full`,
+output root `/data/3dgs_outputs/orange_4F/1_full`, baseline
+`sharp_keyframes_stride3_aa` resolved below that root, depth cache
+`da3_lidar_depth_stride3`, and model `3dgs_stride3_aa_da3_occlusion_warm7k_lr50`.
+Override these with `DA3_SCENE_ROOT`, `DA3_OUTPUT_ROOT`, `DA3_BASELINE`,
+`DA3_DEPTH_DIR`, `DA3_MODEL_DIR`, or `DA3_CONDA_SH`. Arguments after the GPU index
+are forwarded to training, for example `bash scripts/run_da3_ablation.sh 3 --evaluate-only`.
 
 `prepare_da3_occlusion.py` writes `index.html` with RGB / calibrated depth /
 trusted-coverage overlays, `calibration.json` with per-frame quality and coverage,

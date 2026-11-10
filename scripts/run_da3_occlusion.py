@@ -24,6 +24,10 @@ def build_plan(args):
     if args.baseline and not args.keyframes:
         args.keyframes = args.baseline/'keyframes.json'
     report_path = args.depth_dir.expanduser().resolve()/'metadata.json'
+    if not report_path.is_file():
+        raise RuntimeError(f'DA3 preprocessing has not completed: missing {report_path}. '
+                           'Fix the preprocessing error and rerun scripts/prepare_da3_occlusion.py '
+                           'before starting training (or use scripts/run_da3_ablation.sh).')
     report = json.loads(report_path.read_text())
     if (not report.get('complete') or Path(report['source']).resolve() != args.source.resolve() or
             report['resolution'] != args.resolution or report['edge_pixels'] != 1):

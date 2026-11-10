@@ -141,8 +141,8 @@ def main(argv=None):
             raise ValueError('Completed DA3 cache is missing frames')
         print(f'Reusing complete aligned DA3 cache: {output}', flush=True)
         return 0
-    if not torch.cuda.is_available():
-        raise RuntimeError('DA3 preprocessing requires a CUDA-enabled environment')
+    from scripts.check_da3_environment import require_cuda
+    require_cuda(torch, args.gpu)
     from huggingface_hub import model_info
     revision = existing.get('resolved_model_revision') or model_info(args.model_id, revision=args.model_revision).sha
     metadata = dict(config, resolved_model_revision=revision, complete=False,
