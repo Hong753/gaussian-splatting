@@ -127,6 +127,13 @@ class OptimizationParams(ParamGroup):
         self.surface_normal_weight = 0.01
         self.surface_thickness_weight = 0.01
         self.surface_loss_samples = 100000
+        self.view_tangent_radius_pixels = 3
+        self.view_tangent_max_radius = 0.1
+        self.view_tangent_depth_abs = 0.03
+        self.view_tangent_depth_relative = 0.01
+        self.view_tangent_min_observations = 2
+        self.view_tangent_max_parents = 50000
+        self.view_tangent_max_points = 12000000
         self.depth_l1_weight_init = 1.0
         self.depth_l1_weight_final = 0.01
         self.random_background = False

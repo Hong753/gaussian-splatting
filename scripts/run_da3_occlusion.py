@@ -71,6 +71,8 @@ def main(argv=None):
     model.mkdir(parents=True, exist_ok=True)
     if not args.evaluate_only:
         run_occlusion.invoke(['scripts/smoke_da3_occlusion.py', '--gpu', args.gpu])
+        if args.view_tangent:
+            run_occlusion.invoke(['scripts/smoke_view_tangent.py', '--gpu', args.gpu])
         if args.keyframes.resolve() != model/'keyframes.json':
             shutil.copyfile(args.keyframes, model/'keyframes.json')
     status = dict(plan, completed=[], active=None, complete=False)

@@ -145,6 +145,7 @@ class TrainingDepthCache:
         self.signatures = report['camera_signatures']
         self.edge_pixels, self.memory_views = edge_pixels, memory_views
         self.memory = OrderedDict()
+        self.surface_memory = OrderedDict()
         for camera in cameras:
             if not (self.root/'frames'/frame_filename(camera.image_name)).is_file():
                 raise FileNotFoundError(f'Missing DA3 frame: {camera.image_name}')
@@ -169,3 +170,22 @@ class TrainingDepthCache:
                 self.memory.popitem(last=False)
         self.memory.move_to_end(key)
         return self.memory[key]
+
+    def surface(self, camera, device, radius_pixels=3, max_radius=.1):
+        """Use calibrated raw z and trusted mask, never inflated culling tiles."""
+        import torch
+        from utils.view_tangent import surface_frame
+        self.tiles(camera, device)  # Enforce the same camera/cache identity check.
+        key = (camera.image_name, str(device), radius_pixels, max_radius)
+        if key not in self.surface_memory:
+            with np.load(self.root/'frames'/frame_filename(camera.image_name), allow_pickle=False) as data:
+                if str(data['image']) != camera.image_name:
+                    raise ValueError('DA3 surface image identity mismatch')
+                depth = torch.as_tensor(data['depth'].astype(np.float32), device=device)
+                valid = torch.as_tensor(data['valid'].astype(bool), device=device)
+                intrinsic = torch.as_tensor(data['intrinsics'].astype(np.float32), device=device)
+            self.surface_memory[key] = surface_frame(depth, valid, intrinsic, radius_pixels, max_radius)
+            while len(self.surface_memory) > self.memory_views:
+                self.surface_memory.popitem(last=False)
+        self.surface_memory.move_to_end(key)
+        return self.surface_memory[key]

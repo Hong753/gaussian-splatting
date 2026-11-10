@@ -70,9 +70,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     for name in ("position_warmup_steps", "position_ramp_steps", "position_lr_init", "position_lr_final",
                  "position_lr_max_steps", "densification_phase_offset", "lidar_depth_dir", "lidar_depth_weight", "lidar_depth_start"):
         setattr(dataset, name, getattr(opt, name))
-    if opt.surface_mode not in ("off", "tangent", "constrained"):
-        raise ValueError("surface_mode must be off, tangent, or constrained")
-    if opt.surface_mode != "off":
+    if opt.surface_mode not in ("off", "tangent", "constrained", "view_tangent"):
+        raise ValueError("surface_mode must be off, tangent, constrained, or view_tangent")
+    if opt.surface_mode == 'view_tangent':
+        from utils.view_tangent import options
+        if (not depth_directory and dataset.occlusion_mode != 'lidar') or opt.optimizer_type != 'default':
+            raise ValueError('View-tangent densification requires LiDAR/DA3 culling and the default optimizer')
+        if opt.absgs or opt.surface_patches:
+            raise ValueError('Use view-tangent with native gradient statistics and without static surface patches')
+        for name, value in options(opt).items():
+            setattr(dataset, name, value)
+    elif opt.surface_mode != "off":
         if not opt.surface_patches or opt.optimizer_type != "default":
             raise ValueError("Surface mode requires patch data and the default optimizer")
         if not (0 <= opt.surface_confidence <= 1 and 0 < opt.surface_thickness <= 1):
@@ -99,7 +107,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             scene.getTrainCameras(), dataset.resolution, dataset.occlusion_edge_pixels,
             point_cloud=os.path.join(dataset.model_path, 'input.ply'))
         print("Aligned DA3 culling enabled for optimization only; evaluation renders without depth culling")
-    if opt.surface_mode != "off":
+    if opt.surface_mode == 'view_tangent':
+        gaussians.initialize_view_surface()
+        print('View-tangent densification: trusted visible depth neighborhoods only; '
+              'native covariance/opacity optimization; no depth or normal loss')
+    elif opt.surface_mode != "off":
         gaussians.initialize_surface(opt.surface_patches, opt.surface_mode, opt.surface_confidence, opt.surface_thickness)
     gaussians.training_setup(opt)
     if opt.lidar_depth_weight > 0:
@@ -124,6 +136,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
     ema_lidar_for_log = 0.0
+    surface_match_fraction = None
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -239,6 +252,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     progress["culled"] = f"{100*(1-render_pkg['occlusion_keep'].float().mean().item()):.1f}%"
                 if training_tiles is not None:
                     progress["depth coverage"] = f"{100*torch.isfinite(training_tiles).float().mean().item():.1f}%"
+                if surface_match_fraction is not None:
+                    progress['surface match'] = f'{100*surface_match_fraction:.1f}%'
                 progress_bar.set_postfix(progress)
                 progress_bar.update(10)
             if iteration == opt.iterations:
@@ -255,13 +270,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if 0 < phase_iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                growth_filter = visibility_filter
+                if opt.surface_mode == 'view_tangent':
+                    provider = training_occluders or pipe._occlusion_provider
+                    frame = provider.surface(viewpoint_cam, gaussians.get_xyz.device,
+                        opt.view_tangent_radius_pixels, opt.view_tangent_max_radius)
+                    growth_filter = gaussians.observe_view_surface(viewpoint_cam, visibility_filter,
+                        frame, pipe.occlusion_chunk_size)
+                    surface_match_fraction = len(growth_filter)/max(1, visibility_filter.numel())
+                    if tb_writer and iteration % 100 == 0:
+                        tb_writer.add_scalar('view_tangent/matched_visible_fraction', surface_match_fraction, iteration)
+                gaussians.add_densification_stats(viewspace_point_tensor, growth_filter)
 
                 if phase_iteration > opt.densify_from_iter and phase_iteration % opt.densification_interval == 0:
                     size_threshold = 20 if phase_iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent,
                                                 size_threshold, radii,
                                                 max_grad_abs=opt.absgs_split_threshold if opt.absgs else None)
+                    if opt.surface_mode == 'view_tangent':
+                        import json
+                        stats = dict(iteration=iteration, **gaussians.last_view_tangent_stats)
+                        with open(os.path.join(scene.model_path, 'view_tangent_densification.jsonl'), 'a') as stream:
+                            stream.write(json.dumps(stats) + '\n')
+                        if tb_writer:
+                            for name, value in stats.items():
+                                if name != 'iteration':
+                                    tb_writer.add_scalar('view_tangent/'+name, value, iteration)
                 
                 if phase_iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and phase_iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()

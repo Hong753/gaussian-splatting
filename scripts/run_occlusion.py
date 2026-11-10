@@ -42,6 +42,14 @@ def parser(*, depth_maps=False):
     p.add_argument('--densification-phase-offset', type=int,
                    help='Shift densification and opacity resets; default: position warmup steps')
     p.add_argument('--report-max-views', type=int, default=64)
+    p.add_argument('--view-tangent', action='store_true', help='Grow only inside trusted visible surface neighborhoods')
+    # Keep this launcher importable without PyTorch, for CPU plan inspection.
+    from arguments import OptimizationParams
+    defaults = OptimizationParams(argparse.ArgumentParser(add_help=False))
+    for name in ('radius_pixels', 'max_radius', 'depth_abs', 'depth_relative',
+                 'min_observations', 'max_parents', 'max_points'):
+        value = getattr(defaults, 'view_tangent_'+name)
+        p.add_argument('--view-tangent-'+name.replace('_', '-'), type=type(value), default=value)
     p.add_argument('--evaluate-only', action='store_true', help='Retry post-training evaluation without retraining')
     p.add_argument('--dry-run', action='store_true')
     return p
@@ -109,6 +117,18 @@ def build_plan(args):
              '--save_iterations', *map(str, steps)]
     for key, value in schedule.items():
         train += ['--'+key, str(value)]
+    tangent_options = {}
+    if args.view_tangent:
+        tangent_options = {key: value for key, value in vars(args).items() if key.startswith('view_tangent_')}
+        if (any(not math.isfinite(float(v)) for v in tangent_options.values()) or
+                args.view_tangent_radius_pixels < 2 or args.view_tangent_max_radius <= 0 or
+                min(args.view_tangent_depth_abs, args.view_tangent_depth_relative) < 0 or
+                args.view_tangent_depth_abs + args.view_tangent_depth_relative <= 0 or
+                min(args.view_tangent_min_observations, args.view_tangent_max_parents, args.view_tangent_max_points) < 1):
+            raise ValueError('Invalid view-tangent settings')
+        train += ['--surface_mode', 'view_tangent']
+        for key, value in tangent_options.items():
+            train += ['--'+key, str(value)]
     stages = [] if args.evaluate_only else [dict(name='train', argv=train)]
     geometry, cache = str(model/'occlusion_geometry.npz'), str(model/'occlusion_depth_cache')
     def evaluation(path, mode, name):
@@ -134,7 +154,8 @@ def build_plan(args):
         video_root = args.video_output.expanduser().resolve() if args.video_output else model/'comparisons'
         for video in ('random', 'actual'):
             command = ['scripts/render.py', '--video', video, '--source', str(source), '--models', str(baseline), str(model),
-                '--labels', '3DGS + AA', schedule_label(schedule), '--aa', 'on', 'on', '--occlusion', 'off', 'saved',
+                '--labels', '3DGS + AA', schedule_label(schedule) + (' + view-tangent growth' if args.view_tangent else ''),
+                '--aa', 'on', 'on', '--occlusion', 'off', 'saved',
                 '--iteration', str(args.iterations), '--gpu', args.gpu, '--in-process', '--width', '1280', '--fps', '30',
                 '--output', str(video_root/video)]
             if video == 'random':
@@ -142,7 +163,8 @@ def build_plan(args):
             else:
                 command += ['--actual-poses', 'source']
             stages.append(dict(name=video+'_video', argv=command))
-    return dict(source=str(source), model=str(model), gpu=args.gpu, training_schedule=schedule, stages=stages)
+    return dict(source=str(source), model=str(model), gpu=args.gpu, training_schedule=schedule,
+                view_tangent_options=tangent_options, stages=stages)
 
 
 def invoke(command):
@@ -184,6 +206,8 @@ def main(argv=None):
     if not args.evaluate_only:
         # Compile/check CUDA before spending time fitting a large cloud.
         invoke(['scripts/smoke_occlusion.py', '--gpu', args.gpu])
+        if args.view_tangent:
+            invoke(['scripts/smoke_view_tangent.py', '--gpu', args.gpu])
     model = Path(plan['model'])
     model.mkdir(parents=True, exist_ok=True)
     if not args.evaluate_only:

@@ -244,8 +244,37 @@ class GaussianModel:
         thinness = (confidence * (ratio - 0.25).clamp_min(0).square()).sum() / denominator
         return position_weight * position + normal_weight * alignment + thickness_weight * thinness
 
+    def initialize_view_surface(self):
+        """Allocate empty references; only trusted rendered observations fill them."""
+        xyz = self._xyz.detach()
+        self.surface_mode = 'view_tangent'
+        self.surface_refs = dict(anchor=torch.zeros_like(xyz), normal=torch.zeros_like(xyz),
+            confidence=xyz.new_zeros(len(xyz)), support=xyz.new_zeros(len(xyz)),
+            tolerance=xyz.new_zeros(len(xyz)))
+
+    @torch.no_grad()
+    def observe_view_surface(self, camera, visible, frame, chunk_size=131072):
+        from utils.view_tangent import match_visible_surface
+        cfg = self.view_tangent_options
+        indices, refs = match_visible_surface(camera, self._xyz, visible, frame,
+            cfg['view_tangent_depth_abs'], cfg['view_tangent_depth_relative'], chunk_size)
+        previous = self.surface_refs
+        agreement = (previous['normal'][indices]*refs['normal']).sum(-1).abs() >= .95
+        separation = ((previous['anchor'][indices]-refs['anchor'])*refs['normal']).sum(-1).abs()
+        changed = (previous['confidence'][indices] > 0) & (~agreement | (separation > refs['tolerance']))
+        self.xyz_gradient_accum[indices[changed]] = 0
+        self.denom[indices[changed]] = 0
+        for key, values in refs.items():
+            self.surface_refs[key][indices] = values
+        return indices
+
     def training_setup(self, training_args):
         self.surface_mode = training_args.surface_mode
+        if self.surface_mode == 'view_tangent':
+            from utils.view_tangent import options
+            self.view_tangent_options = options(training_args)
+            if len(self._xyz) > self.view_tangent_options['view_tangent_max_points']:
+                raise ValueError('Initialization exceeds view_tangent_max_points; increase the explicit point budget')
         self.percent_dense = training_args.percent_dense
         self.position_warmup_steps = training_args.position_warmup_steps
         self.position_ramp_steps = training_args.position_ramp_steps
@@ -556,6 +585,8 @@ class GaussianModel:
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_surface_refs)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, max_grad_abs=None):
+        if self.surface_mode == 'view_tangent':
+            return self.densify_view_tangent(max_grad, min_opacity, extent, max_screen_size, radii)
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
         clone_grads = grads[:, :1]
@@ -580,6 +611,70 @@ class GaussianModel:
         self.tmp_radii = None
 
         torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def densify_view_tangent(self, max_grad, min_opacity, extent, max_screen_size, radii):
+        """Gradient-ranked growth from measured visible surface neighborhoods.
+
+        Every selected parent adds exactly one net Gaussian: one displaced clone
+        or two split children replacing the parent. No fallback volumetric growth
+        for unsupported/hidden parents. Pruning and opacity rules remain native.
+        """
+        from utils.view_tangent import eligible_parents, tangent_children
+        from utils.occlusion_culling import rotation_matrix
+        cfg, refs = self.view_tangent_options, self.surface_refs
+        count = len(self._xyz)
+        previous_max_radii = self.max_radii2D
+        gradient = (self.xyz_gradient_accum[:, 0]/self.denom[:, 0].clamp_min(1)).nan_to_num()
+        good = eligible_parents(self._xyz, refs, self.denom, cfg['view_tangent_min_observations'])
+        good &= (gradient >= max_grad) & (self.get_opacity[:, 0] >= min_opacity)
+        # Parents that are about to be pruned should not consume the growth budget.
+        scales = self.get_scaling
+        if max_screen_size:
+            good &= (self.max_radii2D <= max_screen_size) & (scales.max(dim=1).values <= .1*extent)
+        candidates = good.nonzero().flatten()
+        budget = min(cfg['view_tangent_max_parents'], max(0, cfg['view_tangent_max_points']-count))
+        selected = candidates
+        if len(selected) > budget:
+            selected = selected[torch.topk(gradient[selected], budget, sorted=False).indices]
+        split = scales[selected].amax(dim=1) > self.percent_dense*extent
+        split_parents = selected[split]
+        # First child for all selected parents; second only for split parents.
+        parents = torch.cat((selected, split_parents))
+        child_split = torch.cat((split, torch.ones_like(split_parents, dtype=torch.bool)))
+        self.tmp_radii = radii
+        if len(parents):
+            # Draw once per parent, then use opposite offsets for its split pair.
+            samples = torch.randn_like(self._xyz[selected])*scales[selected]
+            offsets = torch.bmm(rotation_matrix(self._rotation[selected]), samples[..., None]).squeeze(-1)
+            offsets = torch.cat((offsets, -offsets[split]))
+            child_refs = {key: value[parents] for key, value in refs.items()}
+            new_xyz = tangent_children(self._xyz[parents], offsets, child_refs)
+            new_scaling = self._scaling[parents].clone()
+            new_scaling[child_split] -= np.log(1.6)
+            self.densification_postfix(new_xyz, self._features_dc[parents], self._features_rest[parents],
+                self._opacity[parents], new_scaling, self._rotation[parents], radii[parents], child_refs)
+        # Always reset the accumulation window, even when no surface is trusted
+        # or the budget is full. Unsupported historical gradients must not build up.
+        self.xyz_gradient_accum.zero_()
+        self.denom.zero_()
+        prune_mask = self.get_opacity[:, 0] < min_opacity
+        prune_mask[split_parents] = True
+        if max_screen_size:
+            # postfix resets radii; use the pre-growth values for original rows.
+            prune_mask[:count] |= previous_max_radii > max_screen_size
+            prune_mask |= self.get_scaling.amax(dim=1) > .1*extent
+        pruned = int(prune_mask.sum().item())
+        if pruned:
+            self.prune_points(prune_mask)
+        self.max_radii2D.zero_()
+        self.tmp_radii = None
+        self.last_view_tangent_stats = dict(points_before=count, eligible_parents=len(candidates),
+            selected_parents=len(selected), cloned_parents=int((~split).sum().item()),
+            split_parents=len(split_parents), added_children=len(parents), pruned=pruned,
+            points_after=len(self._xyz), point_budget=cfg['view_tangent_max_points'])
+        torch.cuda.empty_cache()
+        return self.last_view_tangent_stats
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         grad = viewspace_point_tensor.grad

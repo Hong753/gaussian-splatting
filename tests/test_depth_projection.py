@@ -1,4 +1,6 @@
 import sys
+import importlib.util
+from pathlib import Path
 import types
 import unittest
 from unittest.mock import patch
@@ -43,7 +45,13 @@ class DepthProjectionTests(unittest.TestCase):
         intrinsic = types.SimpleNamespace(model="PINHOLE", params=[2, 2, 2, 2], width=4, height=4)
         image = np.zeros((4, 4), dtype=np.uint16)
         image[2, 2], image[2, 3] = 32768, 16384
-        with patch.dict(sys.modules, {"torch": torch}):
+        # Load the real CPU COLMAP reader without importing scene's CUDA model.
+        scene = types.ModuleType('scene')
+        scene.__path__ = [str(Path(__file__).resolve().parents[1]/'scene')]
+        spec = importlib.util.spec_from_file_location('scene.colmap_loader', Path(scene.__path__[0])/'colmap_loader.py')
+        loader = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(loader)
+        with patch.dict(sys.modules, {"torch": torch, 'scene': scene, 'scene.colmap_loader': loader}):
             prediction, reference = sample_projected_points(points, camera, intrinsic, image.shape, image, 1, 20)
         np.testing.assert_allclose(prediction, [0.5, 0.25])
         np.testing.assert_allclose(reference, [0.5, 0.5])

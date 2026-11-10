@@ -24,6 +24,7 @@ class AbsGSStatisticsTests(unittest.TestCase):
         densify = method("densify_and_prune")
         calls = []
         model = SimpleNamespace(
+            surface_mode='off',
             use_absgs=True,
             xyz_gradient_accum=np.array([[0.0003, 0.0009], [0.0001, 0.0008]]).view(Array),
             denom=np.ones((2, 1)),
