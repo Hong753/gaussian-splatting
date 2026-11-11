@@ -188,10 +188,10 @@ def cross_view_support(depth, valid, intrinsic, extrinsic, neighbors, tolerance=
     return count
 
 
-def training_tiles(depth, valid, predicted_k, camera, relative_margin=.05, edge_pixels=1):
+def training_pixel_depth(depth, valid, predicted_k, camera, relative_margin=.05, edge_pixels=1):
     """Reproject to the exact training pixel grid and keep unknown depths infinite."""
     import torch
-    from utils.occlusion_depth import tile_maxima
+    from utils.occlusion_depth import pixel_bounds
     height, width = camera.image_height, camera.image_width
     yy, xx = np.indices((height, width), dtype=np.float32)
     fx, fy = width/(2*np.tan(camera.FoVx/2)), height/(2*np.tan(camera.FoVy/2))
@@ -201,7 +201,14 @@ def training_tiles(depth, valid, predicted_k, camera, relative_margin=.05, edge_
     inside = (u >= 0) & (v >= 0) & (u < pw) & (v < ph)
     u, v = u.clip(0, pw-1), v.clip(0, ph-1)
     values = np.where(inside & valid[v, u], depth[v, u]*(1+relative_margin), np.inf).astype(np.float32)
-    return tile_maxima(torch.from_numpy(values), edge_pixels).numpy()
+    return pixel_bounds(torch.from_numpy(values), edge_pixels).numpy()
+
+
+def training_tiles(depth, valid, predicted_k, camera, relative_margin=.05, edge_pixels=1):
+    import torch
+    from utils.occlusion_depth import tile_maxima
+    values = training_pixel_depth(depth, valid, predicted_k, camera, relative_margin, edge_pixels)
+    return tile_maxima(torch.from_numpy(values), 0).numpy()
 
 
 class TrainingDepthCache:
@@ -226,6 +233,7 @@ class TrainingDepthCache:
         self.edge_pixels, self.memory_views = edge_pixels, memory_views
         self.memory = OrderedDict()
         self.surface_memory = OrderedDict()
+        self.pixel_memory = OrderedDict()
         self.available_images = set()
         for camera in cameras:
             if (self.root/'frames'/frame_filename(camera.image_name)).is_file():
@@ -250,6 +258,21 @@ class TrainingDepthCache:
             with np.load(path, allow_pickle=False) as data:
                 result['anchors'] = {key: data[key].copy() for key in ('u', 'v', 'z')}
         return result
+
+    def pixel_depth(self, camera, device):
+        import torch
+        self.tiles(camera, device)  # Validate camera and cache identity.
+        key = (camera.image_name, str(device))
+        if key not in self.pixel_memory:
+            with np.load(self.root/'frames'/frame_filename(camera.image_name), allow_pickle=False) as data:
+                report = json.loads(str(data['report']))
+                values = training_pixel_depth(data['depth'], data['valid'], data['intrinsics'], camera,
+                                              report['relative_margin'], self.edge_pixels)
+            self.pixel_memory[key] = torch.as_tensor(values, device=device)
+            while len(self.pixel_memory) > self.memory_views:
+                self.pixel_memory.popitem(last=False)
+        self.pixel_memory.move_to_end(key)
+        return self.pixel_memory[key]
 
     def tiles(self, camera, device):
         import torch

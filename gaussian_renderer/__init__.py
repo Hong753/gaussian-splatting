@@ -15,7 +15,7 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, occlusion_tiles=None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, occlusion_tiles=None, occlusion_depth=None):
     """
     Render the scene. 
     
@@ -23,7 +23,22 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     """
  
     use_absgs = getattr(pipe, "absgs", False)
-    if use_absgs:
+    ray_mode = occlusion_depth is not None or (getattr(pipe, 'occlusion_backend', 'whole') == 'ray'
+        and getattr(pipe, 'occlusion_mode', 'off') != 'off')
+    if ray_mode:
+        if use_absgs or occlusion_tiles is not None:
+            raise ValueError('Ray clipping uses native signed-gradient 3DGS + AA and full pixel depths')
+        from diff_gaussian_rasterization_occlusion import GaussianRasterizationSettings as RasterSettings, GaussianRasterizer as Rasterizer
+        from utils.ray_occlusion import pixel_cutoff
+        if occlusion_depth is None:
+            occlusion_depth = pixel_cutoff(viewpoint_camera, pc, pipe)
+        else:
+            occlusion_depth = occlusion_depth.detach().to(device=pc.get_xyz.device, dtype=torch.float32)
+            occlusion_depth = occlusion_depth + pipe.occlusion_margin
+        occlusion_depth = occlusion_depth.contiguous()
+        separate_sh = False
+        screenspace_points = torch.zeros_like(pc.get_xyz, requires_grad=True) + 0
+    elif use_absgs:
         try:
             from diff_gaussian_rasterization_abs import GaussianRasterizationSettings as RasterSettings, GaussianRasterizer as Rasterizer
         except ImportError as exc:
@@ -58,7 +73,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         debug=pipe.debug,
-        antialiasing=pipe.antialiasing
+        antialiasing=pipe.antialiasing,
+        **({'occlusion_depth': occlusion_depth} if ray_mode else {})
     )
 
     rasterizer = Rasterizer(raster_settings=raster_settings)
@@ -74,7 +90,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         occlusion_keep = conservative_keep(viewpoint_camera, pc.get_xyz.detach(), pc.get_scaling.detach(),
             pc.get_rotation.detach(), occlusion_tiles, pipe.occlusion_margin, pipe.occlusion_sigma,
             pipe.occlusion_chunk_size, scaling_modifier)
-    elif getattr(pipe, "occlusion_mode", "off") in ("lidar", "mesh"):
+    elif not ray_mode and getattr(pipe, "occlusion_mode", "off") in ("lidar", "mesh"):
         from utils.occlusion_culling import visibility_mask
         occlusion_keep = visibility_mask(viewpoint_camera, pc, pipe, scaling_modifier)
 
@@ -141,7 +157,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             cov3D_precomp = cov3D_precomp)
 
     else:
-        rendered_image, radii, depth_image = rasterizer(
+        raster_result = rasterizer(
             means3D = means3D,
             means2D = means2D,
             shs = shs,
@@ -150,8 +166,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             scales = scales,
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
+        rendered_image, radii, depth_image = raster_result[:3]
+        if ray_mode:
+            fragment_flags = raster_result[3]
+            occlusion_keep = (fragment_flags & 1) != 0
+            raster_radii = radii
+            radii = torch.where(occlusion_keep, radii, torch.zeros_like(radii))
 
-    if occlusion_keep is not None:
+    if occlusion_keep is not None and not ray_mode:
         full_radii = torch.zeros(pc.get_xyz.shape[0], dtype=radii.dtype, device=radii.device)
         full_radii[occlusion_keep] = radii
         radii = full_radii
@@ -173,6 +195,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         }
     if occlusion_keep is not None:
         out["occlusion_keep"] = occlusion_keep
+    if ray_mode:
+        out['occlusion_fragment_flags'] = fragment_flags
+        out['occlusion_culled'] = fragment_flags == 2
+        out['raster_radii'] = raster_radii
     
     return out
 

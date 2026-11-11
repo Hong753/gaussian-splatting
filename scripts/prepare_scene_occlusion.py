@@ -32,12 +32,17 @@ def fuse(args):
     from tqdm import tqdm
     depth_dir, output, cloud = args.depth_dir.resolve(), args.output.resolve(), args.point_cloud.resolve()
     metadata = json.loads((depth_dir/'metadata.json').read_text())
-    if metadata.get('version') != 2 or not metadata.get('complete'):
+    diagnostic = bool(getattr(args, 'allow_partial', False))
+    if metadata.get('version') != 2 or (not metadata.get('complete') and not diagnostic):
         raise ValueError('Prepare the COMPLETE v2 DA3 training cache before scene fusion; a diagnostic view is insufficient')
     cloud_hash = file_digest(cloud)
     if metadata['point_cloud_sha256'] != cloud_hash:
         raise ValueError('LiDAR cloud differs from the depth calibration cloud')
     names = metadata['images']
+    if diagnostic:
+        names = [n for n in names if (depth_dir/'frames'/frame_filename(n)).is_file()]
+        if len(names) < 3:
+            raise ValueError('A multi-frame surface preview requires at least three prepared views')
     frame_paths = [depth_dir/'frames'/frame_filename(name) for name in names]
     identity = [(name, file_digest(path)) for name, path in zip(names, frame_paths)]
     config = dict(format=FORMAT, source=metadata['source'], training_images=names,
@@ -46,6 +51,8 @@ def fuse(args):
         depth_frames_sha256=hashlib.sha256(json.dumps(identity).encode()).hexdigest(),
         voxel_size=args.voxel_size, truncation=args.truncation, depth_max=args.depth_max,
         lidar_support_distance=args.lidar_support_distance, relative_margin=args.relative_margin)
+    if diagnostic:
+        config['diagnostic_only'] = True
     output.mkdir(parents=True, exist_ok=True)
     manifest = output/'scene.json'
     if manifest.exists():
@@ -121,6 +128,11 @@ def precompute_views(args):
     from utils.occlusion_diagnostics import reference_panels, write_report
     from PIL import Image
     scene, mesh = load_scene(args.scene, args.point_cloud)
+    visibility_backend = getattr(args, 'visibility_backend', 'auto')
+    if visibility_backend == 'auto':
+        visibility_backend = 'cuda' if args.device == 'cuda' else 'exact'
+    if visibility_backend == 'cuda' and args.device != 'cuda':
+        raise ValueError('CUDA visibility requires --device cuda')
     source = Path(scene['source'])
     output = args.output.resolve() if args.output else args.scene.resolve().parent/'visibility'
     records = read_colmap_records(source)
@@ -135,7 +147,9 @@ def precompute_views(args):
         camera_signatures={name: camera_signature(camera, 1) for name, camera in cameras.items()},
         absolute_margin=args.margin, relative_margin=scene['relative_margin'], edge_pixels=1,
         point_ids='original input PLY vertex row indices',
-        classification='exact first-hit mesh ray per point; outside/invalid rows are omitted')
+        classification=('CUDA first-hit pixel depth lookup per point; outside/invalid rows are omitted'
+                        if visibility_backend == 'cuda' else
+                        'exact first-hit mesh ray per point; outside/invalid rows are omitted'))
     output.mkdir(parents=True, exist_ok=True)
     status_path = output/'metadata.json'
     if status_path.exists():
@@ -144,7 +158,7 @@ def precompute_views(args):
             raise ValueError('Visibility output has different inputs/settings; choose a new directory')
     atomic_json(status_path, dict(config, complete=False))
     points = read_points(args.point_cloud)
-    raycaster = TriangleRaycaster(*mesh_arrays(mesh), threads=args.threads)
+    raycaster = TriangleRaycaster(*mesh_arrays(mesh), threads=args.threads) if visibility_backend == 'exact' else None
     provider = MeshDepthCache(args.scene)
     preview_names = {all_names[i] for i in np.linspace(0, len(all_names)-1, min(16, len(all_names)), dtype=int)}
     if args.image:
@@ -163,9 +177,16 @@ def precompute_views(args):
                 rows[name] = json.loads(str(previous['report']))
             continue
         k, e = camera_intrinsics(camera, 'cpu').numpy(), camera.world_view_transform.T.numpy()
-        ids = classify_lidar(points, k, e, camera.image_width, camera.image_height, raycaster,
-            args.margin, scene['relative_margin'], args.device)
         depth = provider.raw_depth(camera, args.device)
+        if visibility_backend == 'cuda':
+            from utils.ray_occlusion import classify_points_depth
+            labels = classify_points_depth(points, k, e, depth, args.margin, scene['relative_margin'])
+            mapping = dict(visible='on_surface', occluded='culled', unknown='unknown', in_front='in_front')
+            id_type = np.uint32 if len(points) <= np.iinfo(np.uint32).max else np.uint64
+            ids = {name+'_ids': labels[value+'_ids'].astype(id_type) for name,value in mapping.items()}
+        else:
+            ids = classify_lidar(points, k, e, camera.image_width, camera.image_height, raycaster,
+                args.margin, scene['relative_margin'], args.device)
         tiles = provider.tiles(camera, args.device)
         counts = {key: len(ids[key+'_ids']) for key in POINT_CLASSES}
         in_view = sum(counts.values())
@@ -224,6 +245,7 @@ def parser():
     f.add_argument('--lidar-support-distance', type=float, default=.20)
     f.add_argument('--relative-margin', type=float, default=.10)
     f.add_argument('--threads', type=int, default=8)
+    f.add_argument('--allow-partial', action='store_true', help='Diagnostic multi-frame mesh; cannot be used for training')
     v = sub.add_parser('views', help='Precompute all registered camera views, using the fixed training mesh')
     v.add_argument('--scene', type=Path, required=True)
     v.add_argument('--point-cloud', type=Path, required=True)
@@ -231,6 +253,8 @@ def parser():
     v.add_argument('--resolution', type=int, default=-1)
     v.add_argument('--gpu', default='5')
     v.add_argument('--device', choices=('cpu', 'cuda'), default='cuda')
+    v.add_argument('--visibility-backend', choices=('auto', 'cuda', 'exact'), default='auto',
+                   help='auto uses CUDA pixel-depth classification on GPU; exact uses CPU triangle BVH rays')
     v.add_argument('--split', choices=('all', 'train'), default='all')
     v.add_argument('--image', help='Inspect one view first; omit to finish all views')
     v.add_argument('--margin', type=float, default=.05)

@@ -142,6 +142,15 @@ class SceneOcclusionTests(unittest.TestCase):
                 '--output', str(output), '--voxel-size', '.05', '--truncation', '.15', '--threads', '1']
             with self.assertRaisesRegex(ValueError, 'COMPLETE'):
                 main(command)
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(command+['--output',str(root/'preview'),'--allow-partial'])
+            preview_report,_=load_scene(root/'preview/scene.json')
+            self.assertTrue(preview_report['diagnostic_only'])
+            from scripts.occlusion_options import prepare_training_geometry
+            dataset=SimpleNamespace(occlusion_mode='mesh',occlusion_geometry=str(root/'preview/scene.json'),
+                model_path=str(root),source_path=str(root))
+            with self.assertRaisesRegex(ValueError,'diagnostic preview'):
+                prepare_training_geometry(dataset)
             config['complete'] = True
             (depth_dir/'metadata.json').write_text(json.dumps(config))
             with contextlib.redirect_stdout(io.StringIO()):

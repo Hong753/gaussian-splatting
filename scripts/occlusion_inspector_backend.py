@@ -63,6 +63,8 @@ class InspectorBackend:
         self.torch, self.render, self.args = torch, render, args
         self.spec = model_info(args.model)
         self.cfg = self.spec['cfg']
+        if self.cfg.get('occlusion_backend', 'whole') == 'ray':
+            raise ValueError('This is a per-ray checkpoint. Use scripts/inspect_ray_occlusion.py to inspect actual CUDA fragment flags')
         if self.spec['type'] != '3dgs':
             raise ValueError('This diagnostic supports native 3DGS checkpoints')
         self.iteration, self.ply = choose_iteration(self.spec['path'], args.iteration)

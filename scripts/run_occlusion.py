@@ -32,6 +32,7 @@ def parser(*, depth_maps=False):
         p.add_argument('--max-radius', type=float, default=.1)
         p.add_argument('--scene-geometry', type=Path, help='Use a fixed whole-scene scene.json instead of LiDAR patches')
     p.add_argument('--margin', type=float, default=.05)
+    p.add_argument('--occlusion-backend', choices=('whole', 'ray'), default='whole')
     p.add_argument('--position-warmup-steps', type=int, default=0,
                    help='Freeze xyz and its Adam state for this many initial steps')
     p.add_argument('--position-ramp-steps', type=int, default=0,
@@ -109,17 +110,24 @@ def build_plan(args):
     if args.evaluate_only and not (model/f'point_cloud/iteration_{args.iterations}/point_cloud.ply').is_file():
         raise FileNotFoundError('Requested saved iteration is missing')
     schedule = training_schedule(args)
+    backend = args.occlusion_backend
+    if args.evaluate_only:
+        from scripts.eval_all_frames import read_config
+        backend = read_config(model/'cfg_args').get('occlusion_backend', 'whole')
     steps = sorted(set(i for i in (7000, args.iterations) if i <= args.iterations))
     train = ['train.py', '-s', str(source), '-m', str(model), '--iterations', str(args.iterations),
              '--resolution', str(args.resolution), '--data_device', 'cpu', '--disable_viewer', '--antialiasing',
              '--keyframe_manifest', str(model/'keyframes.json'), '--occlusion_mode', 'lidar',
              '--occlusion_voxel_size', str(args.voxel_size), '--occlusion_max_radius', str(args.max_radius),
-             '--occlusion_margin', str(args.margin), '--test_iterations', *map(str, steps),
+             '--occlusion_margin', str(args.margin), '--occlusion_backend', backend,
+             '--test_iterations', *map(str, steps),
              '--save_iterations', *map(str, steps)]
     scene_geometry = getattr(args, 'scene_geometry', None)
     if scene_geometry:
         from utils.scene_occlusion import load_scene
         report, _ = load_scene(scene_geometry, source=source)
+        if report.get('diagnostic_only'):
+            raise ValueError('Finish full-scene fusion before training; this is a diagnostic preview mesh')
         if not args.keyframes:
             raise ValueError('Scene mesh training requires its exact keyframe manifest')
         if set(json.loads(args.keyframes.read_text())['selected_images']) != set(report['training_images']):
@@ -157,6 +165,7 @@ def build_plan(args):
         options = ['--model', str(path), '--iteration', str(args.iterations), '--antialiasing', '--occlusion', mode]
         if mode == 'on':
             options += ['--occlusion-geometry', geometry, '--occlusion-cache', cache, '--occlusion-margin', str(args.margin)]
+            options += ['--occlusion-backend', backend]
         stages.append(dict(name=name+'_psnr', argv=['scripts/eval_all_frames.py', '--source', str(source), *options]))
         stages.append(dict(name=name+'_images', argv=['scripts/render.py', '--split', 'both', '--max-views',
             str(args.report_max_views), '--gpu', args.gpu, '--in-process', *options]))
@@ -227,6 +236,8 @@ def main(argv=None):
         raise RuntimeError('Install requirements-occlusion.txt in the native 3dgs environment first') from exc
     if not args.evaluate_only:
         # Compile/check CUDA before spending time fitting a large cloud.
+        if args.occlusion_backend == 'ray':
+            invoke(['scripts/smoke_ray_occlusion.py', '--gpu', args.gpu])
         invoke(['scripts/smoke_occlusion.py', '--gpu', args.gpu, *(['--mesh'] if args.scene_geometry else [])])
         if args.view_tangent:
             invoke(['scripts/smoke_view_tangent.py', '--gpu', args.gpu])

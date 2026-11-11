@@ -3,7 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 
-DEFAULTS = dict(occlusion_mode="off", occlusion_geometry="", occlusion_cache="",
+DEFAULTS = dict(occlusion_mode="off", occlusion_backend="whole", occlusion_geometry="", occlusion_cache="",
                 occlusion_margin=0.05, occlusion_sigma=3.0, occlusion_edge_pixels=1,
                 occlusion_chunk_size=131072)
 
@@ -14,6 +14,7 @@ def add_arguments(parser, per_model=False):
     parser.add_argument("--occlusion-geometry", type=Path, help="Fixed LiDAR surfels (.npz) or scene mesh manifest (scene.json)")
     parser.add_argument("--occlusion-cache", type=Path)
     parser.add_argument("--occlusion-margin", type=float)
+    parser.add_argument("--occlusion-backend", choices=('whole', 'ray'))
 
 
 def settings(cfg):
@@ -26,7 +27,7 @@ def apply_overrides(spec, args, mode=None):
     mode = mode or getattr(args, "occlusion", None) or "saved"
     if mode != "saved":
         current["occlusion_mode"] = (saved['occlusion_mode'] if saved['occlusion_mode'] != 'off' else 'lidar') if mode == 'on' else 'off'
-    for key in ("occlusion_geometry", "occlusion_cache", "occlusion_margin"):
+    for key in ("occlusion_geometry", "occlusion_cache", "occlusion_margin", "occlusion_backend"):
         value = getattr(args, key, None)
         if value is not None:
             current[key] = str(value.expanduser().resolve()) if isinstance(value, Path) else value
@@ -47,6 +48,8 @@ def apply_overrides(spec, args, mode=None):
 def validate(cfg):
     import math
     c = settings(cfg)
+    if c['occlusion_backend'] not in ('whole', 'ray'):
+        raise ValueError('occlusion_backend must be whole or ray')
     if c["occlusion_mode"] not in ("off", "lidar", "mesh"):
         raise ValueError("occlusion_mode must be off, lidar, or mesh")
     if c["occlusion_mode"] == "off":
@@ -75,7 +78,7 @@ def configure_pipeline(pipe, cfg):
 
 def worker_arguments(args):
     result = []
-    for key in ("occlusion", "occlusion_geometry", "occlusion_cache", "occlusion_margin"):
+    for key in ("occlusion", "occlusion_geometry", "occlusion_cache", "occlusion_margin", "occlusion_backend"):
         value = getattr(args, key, None)
         if value is not None:
             result += ["--" + key.replace("_", "-"), str(value)]
@@ -106,6 +109,8 @@ def prepare_training_geometry(dataset, cameras=None):
     if dataset.occlusion_mode == 'mesh':
         from utils.scene_occlusion import load_scene
         report, _ = load_scene(dataset.occlusion_geometry, Path(dataset.model_path)/'input.ply', dataset.source_path)
+        if report.get('diagnostic_only'):
+            raise ValueError('Use the full scene fusion for training; this mesh is a diagnostic preview')
         selected = set(json.loads(Path(dataset.keyframe_manifest).read_text())['selected_images'])
         if set(report['training_images']) != selected:
             raise ValueError('Scene surface fusion and training keyframes differ')

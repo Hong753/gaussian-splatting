@@ -49,6 +49,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         raise ValueError("Occlusion culling currently requires the default Adam optimizer")
     if depth_directory and dataset.occlusion_mode != "off":
         raise ValueError("Choose either training depth maps or LiDAR surfel culling")
+    if (dataset.occlusion_mode != 'off' or depth_directory) and getattr(dataset, 'occlusion_backend', 'whole') == 'ray' and opt.absgs:
+        raise ValueError('CUDA ray occlusion currently uses native signed-gradient 3DGS + AA; disable AbsGS')
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -180,9 +182,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        training_tiles = training_occluders.tiles(viewpoint_cam, gaussians.get_xyz.device) if training_occluders else None
+        ray_depth = None
+        training_tiles = None
+        if training_occluders:
+            if pipe.occlusion_backend == 'ray':
+                ray_depth = training_occluders.pixel_depth(viewpoint_cam, gaussians.get_xyz.device)
+            else:
+                training_tiles = training_occluders.tiles(viewpoint_cam, gaussians.get_xyz.device)
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp,
-                            separate_sh=SPARSE_ADAM_AVAILABLE, occlusion_tiles=training_tiles)
+                            separate_sh=SPARSE_ADAM_AVAILABLE, occlusion_tiles=training_tiles, occlusion_depth=ray_depth)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if viewpoint_cam.alpha_mask is not None:
@@ -248,7 +256,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     progress["LiDAR"] = f"{ema_lidar_for_log:.{7}f}"
                 if opt.position_warmup_steps or opt.position_ramp_steps:
                     progress["xyz lr"] = f"{position_lr:.2e}"
-                if "occlusion_keep" in render_pkg:
+                if 'occlusion_culled' in render_pkg:
+                    progress['ray-blocked'] = f"{100*render_pkg['occlusion_culled'].float().mean().item():.1f}%"
+                elif "occlusion_keep" in render_pkg:
                     progress["culled"] = f"{100*(1-render_pkg['occlusion_keep'].float().mean().item()):.1f}%"
                 if training_tiles is not None:
                     progress["depth coverage"] = f"{100*torch.isfinite(training_tiles).float().mean().item():.1f}%"

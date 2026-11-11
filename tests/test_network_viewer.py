@@ -32,7 +32,7 @@ class NetworkViewerTests(unittest.TestCase):
                      "dataset": SimpleNamespace(train_test_exp=True),
                      "custom_cam": SimpleNamespace(),
                      "viewpoint_cam": SimpleNamespace(image_name="frame.png"),
-                     "bg": object(), "training_tiles": None}
+                     "bg": object(), "training_tiles": None, "ray_depth": None}
         for camera in ("custom_cam", "viewpoint_cam"):
             expr = ast.Expression(body=calls_by_camera[camera])
             eval(compile(expr, "train.py", "eval"), namespace)

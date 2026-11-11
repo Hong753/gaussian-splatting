@@ -97,6 +97,16 @@ class DA3Tests(unittest.TestCase):
                 trajectory_args += ['--view-grouping', 'trajectory']
                 self.assertEqual(prepare_da3_occlusion.main(trajectory_args+['--inspect-views', '1']), 0)
                 self.assertTrue((root/'trajectory/predictions/group_00000.npz').is_file())
+                from scripts import prepare_ray_surface_preview
+                preview_args=['--depth-dir',str(root/'trajectory'),'--image',names[1],
+                              '--output',str(root/'ray_preview'),'--point-cloud',str(cloud)]
+                with patch.object(prepare_ray_surface_preview,'read_colmap_records',return_value=records):
+                    self.assertEqual(prepare_ray_surface_preview.main(preview_args),0)
+                    self.assertEqual(prepare_ray_surface_preview.main(preview_args),0)
+                preview_meta=json.loads((root/'ray_preview/depth/metadata.json').read_text())
+                self.assertTrue(preview_meta['diagnostic_only'])
+                self.assertFalse(preview_meta['complete'])
+                self.assertEqual(len(list((root/'ray_preview/depth/frames').glob('*.npz'))),3)
                 self.assertEqual(prepare_da3_occlusion.main(trajectory_args), 0)
                 trajectory_meta = json.loads((root/'trajectory/metadata.json').read_text())
                 self.assertTrue(trajectory_meta['complete'])

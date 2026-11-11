@@ -70,14 +70,20 @@ class LidarDepthRenderer:
             return depth.flip(0).contiguous()
 
 
-def tile_maxima(depth, edge_pixels=1):
+def pixel_bounds(depth, edge_pixels=1):
     import torch
     import torch.nn.functional as F
     depth = torch.where(torch.isfinite(depth) & (depth > 0), depth, torch.full_like(depth, float("inf")))
     depth = depth[None, None]
     if edge_pixels:
         depth = F.max_pool2d(F.pad(depth, (edge_pixels,)*4, value=float("inf")), 2*edge_pixels+1, stride=1)
-    return F.max_pool2d(depth, TILE, stride=TILE, ceil_mode=True)[0, 0]
+    return depth[0, 0]
+
+
+def tile_maxima(depth, edge_pixels=1):
+    import torch.nn.functional as F
+    return F.max_pool2d(pixel_bounds(depth, edge_pixels)[None, None], TILE,
+                        stride=TILE, ceil_mode=True)[0, 0]
 
 
 class LidarDepthCache:
@@ -89,6 +95,17 @@ class LidarDepthCache:
         self.edge_pixels, self.memory_views = edge_pixels, memory_views
         self.memory, self.renderer = OrderedDict(), None
         self.surface_memory = OrderedDict()
+        self.pixel_memory = OrderedDict()
+
+    def pixel_depth(self, camera, device):
+        """Full-resolution conservative first-hit bounds, without tile reduction."""
+        key = (camera_signature(camera, self.edge_pixels), str(device))
+        if key not in self.pixel_memory:
+            self.pixel_memory[key] = pixel_bounds(self.tile_depth(self.raw_depth(camera, device)), self.edge_pixels)
+            while len(self.pixel_memory) > self.memory_views:
+                self.pixel_memory.popitem(last=False)
+        self.pixel_memory.move_to_end(key)
+        return self.pixel_memory[key]
 
     def make_renderer(self, device):
         return LidarDepthRenderer(self.geometry, device)

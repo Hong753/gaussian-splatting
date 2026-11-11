@@ -70,7 +70,8 @@ def main(argv=None):
     model = Path(plan['model'])
     model.mkdir(parents=True, exist_ok=True)
     if not args.evaluate_only:
-        run_occlusion.invoke(['scripts/smoke_da3_occlusion.py', '--gpu', args.gpu])
+        run_occlusion.invoke(['scripts/smoke_ray_occlusion.py' if args.occlusion_backend == 'ray'
+                             else 'scripts/smoke_da3_occlusion.py', '--gpu', args.gpu])
         if args.view_tangent:
             run_occlusion.invoke(['scripts/smoke_view_tangent.py', '--gpu', args.gpu])
         if args.keyframes.resolve() != model/'keyframes.json':

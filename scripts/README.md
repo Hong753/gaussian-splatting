@@ -1,5 +1,8 @@
 # Training
 
+For CUDA per-pixel surface clipping and the all-points/frustum/surface/culling
+viewer, see [RAY_OCCLUSION.md](RAY_OCCLUSION.md).
+
 For trajectory-spanning DA3 groups inspired by PlanarGS geometry priors and
 diagnostics for empty depth references, see [DA3_TRAJECTORY.md](DA3_TRAJECTORY.md).
 

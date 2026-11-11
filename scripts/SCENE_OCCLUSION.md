@@ -1,5 +1,9 @@
 # Fixed scene surfaces and per-view LiDAR visibility
 
+For per-pixel CUDA clipping and a multi-frame preview before full preparation,
+use [RAY_OCCLUSION.md](RAY_OCCLUSION.md). The older whole-Gaussian culler remains
+available for comparison.
+
 This path addresses missing wall coverage in per-image occluders. It builds one
 fixed mesh from all selected training views, then projects that same scene into
 every registered camera. It is independent of Proxy-GS and learned Gaussian
@@ -23,9 +27,10 @@ surface coverage: unseen or unsupported surfaces stay unknown and are reported.
    by voxel resolution and depth accuracy.
 4. For **all registered frames** (default, including unselected frames), render
    first-hit depth from this mesh and cache conservative Gaussian-culling tiles.
-5. Project every original LiDAR row into the camera and cast an exact mesh ray
-   through each in-view point. The hit parameter is **camera z**, not Euclidean
-   range. Save original PLY row IDs in four disjoint sets:
+5. On CUDA, project every original LiDAR row and compare its camera z with the
+   nearest pixel's first-hit mesh depth. `--visibility-backend exact` retains
+   CPU BVH rays through the exact point projections as a reference. Depth is
+   **camera z**, not Euclidean range. Save original PLY row IDs in four disjoint sets:
 
 | Array | Meaning | Viewer color |
 | --- | --- | --- |
@@ -42,14 +47,15 @@ The blue transparent geometry is the fixed occluding mesh.
 The cached point sets support inspection and visible-only LiDAR supervision.
 They are **not reused as permanent Gaussian IDs** after movement or densification.
 Native training tests the current Gaussian support against mesh depth on each
-iteration and freezes culled optimizer rows/momentum. Novel and held-out views
+iteration and freezes noncontributing optimizer rows/momentum. Novel and held-out views
 raycast the same mesh; no new DA3 inference or opacity warmup is required for
-the reference. Partial/unknown Gaussian footprints remain conservatively kept.
+the reference. The legacy `whole` backend retains partial/unknown footprints;
+the `ray` backend blocks each covered pixel fragment independently.
 
-CPU preprocessing uses Open3D 0.19 scalable TSDF fusion and a triangle BVH for
-exact point-ray tests. CUDA handles per-camera mesh depth with nvdiffrast,
-LiDAR projection when `--device cuda`, and the existing PyTorch Gaussian culler.
-The occlusion query is not a custom fused CUDA kernel. APIs:
+CPU preprocessing uses Open3D 0.19 scalable TSDF fusion. CUDA handles per-camera
+mesh depth with nvdiffrast, point projection/depth lookup, and the custom
+forward/backward splat cutoff when `--occlusion-backend ray` is selected.
+The optional exact point-ray reference still uses a CPU triangle BVH. APIs:
 [TSDF integration](https://www.open3d.org/docs/release/tutorial/pipelines/rgbd_integration.html),
 [ray casting](https://www.open3d.org/docs/release/tutorial/geometry/ray_casting.html).
 
