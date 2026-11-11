@@ -5,6 +5,20 @@ from types import SimpleNamespace
 import numpy as np
 
 
+def read_lidar_cloud(path):
+    """Keep original PLY row identities and optional RGB for the independent layer."""
+    from plyfile import PlyData
+    vertex=PlyData.read(str(path))['vertex']
+    points=np.stack([vertex[k] for k in ('x','y','z')],axis=1).astype(np.float32)
+    colors=None
+    if all(k in vertex.data.dtype.names for k in ('red','green','blue')):
+        colors=np.stack([vertex[k] for k in ('red','green','blue')],axis=1)
+        if colors.dtype.kind=='f' and np.isfinite(colors).all() and colors.size and colors.max()<=1:
+            colors=colors*255
+        colors=np.nan_to_num(colors).clip(0,255).astype(np.uint8)
+    return points,colors
+
+
 def fragment_layers(flags, raster_radii):
     """Disjoint CUDA states; percentages use pre-culling image candidates."""
     flags, raster_radii = np.asarray(flags).reshape(-1), np.asarray(raster_radii).reshape(-1)
@@ -31,7 +45,6 @@ class RayInspector:
     def __init__(self, args):
         import torch
         from utils.scene_occlusion import MeshDepthCache, load_scene, mesh_arrays
-        from scripts.prepare_scene_occlusion import read_points
         from scripts.view_comparisons import read_colmap_records, model_info, choose_iteration
         self.args,self.torch=args,torch
         if not torch.cuda.is_available():
@@ -41,7 +54,7 @@ class RayInspector:
         self.supplement_arrays=(mesh_arrays(args.scene.parent/self.scene['supplement_mesh'])
                                if self.scene.get('supplement_mesh') else None)
         self.provider=MeshDepthCache(args.scene,edge_pixels=1)
-        self.points=read_points(args.point_cloud)
+        self.points,self.lidar_colors=read_lidar_cloud(args.point_cloud)
         self.records=read_colmap_records(Path(self.scene['source']))
         self.names=sorted(self.records)
         self.model=None

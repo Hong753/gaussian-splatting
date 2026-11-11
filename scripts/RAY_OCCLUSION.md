@@ -207,7 +207,7 @@ conda activate 3dgs
 python -u scripts/inspect_ray_occlusion.py \
   --scene /path/to/model_parent/lidar_scene_surface_v1/scene.json \
   --point-cloud /path/to/model/input.ply --model /path/to/model \
-  --iteration -1 --image 06663.jpg --point-set Gaussians \
+  --iteration -1 --image 06663.jpg --point-set Both --mesh-style hidden \
   --gpu 0 --host 0.0.0.0 --port 8086
 ```
 
@@ -215,10 +215,24 @@ With a checkpoint, the default 3D colors are actual CUDA states: red = fully
 blocked, orange = partly blocked and contributing, green = contributing with no
 blocked fragments, gray = no encountered contribution. Gray does not imply
 geometric visibility or occlusion. The four groups are disjoint, so green cannot
-hide the partly blocked orange group. Blue is the occlusion mesh. LiDAR and
-point-center surface/frustum layers remain selectable. Use the Camera dropdown
-or Previous/Next frame buttons to change the reference view. Merely orbiting the
-3D scene does not change the reference camera used for classification.
+hide the partly blocked orange group. These are Gaussian centers, not rendered
+ellipsoids. **Show LiDAR** and **Show Gaussians** are independent toggles, both on
+by default with a checkpoint. LiDAR has its own point size and either original
+RGB (neutral blue-gray if absent) or depth-class colors. The original PLY rows
+remain the identities used by the classification exports.
+
+The blue mesh is initially hidden in the 3D display. **Surface display (visual
+only)** can show its wireframe or filled triangles without changing CUDA culling.
+The LiDAR/Gaussian clouds can also overlap: **Show contributing Gaussians only**
+hides LiDAR, both mesh overlays and noncontributing Gaussian groups, leaving the
+green and orange centers. Display controls reuse point buffers instead of
+rerendering or reclassifying. The status reports actual post-culling contribution
+counts; missing green markers alone do not establish excessive culling. Inspect
+the GT and culling ON/OFF images alongside those counts to check the effect.
+
+Use the Camera dropdown or Previous/Next frame buttons to change the reference
+view. Merely orbiting the 3D scene does not change the reference camera used for
+classification.
 
 Blocked percentages use pre-culling image candidates, not all scene Gaussians.
 Per-frame results are written below `MODEL/ray_inspection/iteration_N/`.

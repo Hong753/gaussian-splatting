@@ -5,6 +5,7 @@ import io
 from pathlib import Path
 import socket
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock,patch
@@ -19,6 +20,28 @@ from test_occlusion import camera
 
 
 class RayTests(unittest.TestCase):
+    def test_lidar_overlay_preserves_original_rows_and_rgb(self):
+        from plyfile import PlyData,PlyElement
+        from scripts.ray_inspector_backend import read_lidar_cloud
+        xyz=np.array([[0,0,2],[np.nan,0,3],[1,0,4]],np.float32)
+        rgb=np.array([[255,0,0],[0,255,0],[0,0,255]],np.uint8)
+        with tempfile.TemporaryDirectory() as directory:
+            for color_type in (None,'u1','f4'):
+                with self.subTest(color_type=color_type):
+                    fields=[(key,'f4') for key in ('x','y','z')]
+                    if color_type:fields.extend((key,color_type) for key in ('red','green','blue'))
+                    rows=np.empty(3,dtype=fields)
+                    for column,key in enumerate(('x','y','z')):rows[key]=xyz[:,column]
+                    if color_type:
+                        for column,key in enumerate(('red','green','blue')):
+                            rows[key]=rgb[:,column]/255 if color_type=='f4' else rgb[:,column]
+                    path=Path(directory)/'cloud.ply'
+                    PlyData([PlyElement.describe(rows,'vertex')]).write(path)
+                    points,colors=read_lidar_cloud(path)
+                    np.testing.assert_equal(points,xyz)
+                    if color_type:np.testing.assert_array_equal(colors,rgb)
+                    else:self.assertIsNone(colors)
+
     def test_cuda_viewer_states_are_disjoint_and_use_image_candidate_denominator(self):
         from scripts.ray_inspector_backend import fragment_layers
         flags=np.array([0,1,2,3,0])
@@ -201,7 +224,7 @@ class RayTests(unittest.TestCase):
                     '--host','127.0.0.1','--port',str(port)]),0)
 
     @unittest.skipUnless(importlib.util.find_spec('viser'),'viser required')
-    def test_checkpoint_viewer_defaults_to_actual_cuda_states(self):
+    def test_checkpoint_viewer_keeps_lidar_and_gaussians_independent(self):
         import viser
         from scripts import inspect_ray_occlusion as viewer
         from scripts.ray_inspector_backend import fragment_layers
@@ -215,24 +238,68 @@ class RayTests(unittest.TestCase):
             report=dict(integrated_frames=0,depth_coverage=1.,fragments=fragments,
                         checkpoint=dict(iteration=30000)),images={'gt':('Actual',pixels),'on':('ON',pixels),'off':('OFF',pixels)})
         fake=SimpleNamespace(vertices=vertices,faces=faces,names=['a.jpg','b.jpg'],
-            point_sets={'LiDAR':points,'Gaussians':points},analyze=lambda _:result)
+            point_sets={'LiDAR':points,'Gaussians':points},analyze=Mock(side_effect=lambda name:dict(result,name=name)))
         with socket.socket() as connection:
             connection.bind(('127.0.0.1',0));port=connection.getsockname()[1]
         with contextlib.redirect_stdout(io.StringIO()):
             server=viser.ViserServer(host='127.0.0.1',port=port)
+            controls,clouds,meshes,buttons,markdowns={},{},{},{},{}
+            def capture(method,handles):
+                def call(*args,**kwargs):
+                    handle=method(*args,**kwargs)
+                    handles[args[0]]=handle
+                    return handle
+                return call
+            def visible_gaussians():
+                return {name.rsplit('/',1)[1] for name,handle in clouds.items()
+                        if name.startswith('/points/Gaussians/') and handle.visible}
+            def exercise_controls(_):
+                self.assertTrue(controls['Show LiDAR'].value)
+                self.assertTrue(controls['Show Gaussians'].value)
+                self.assertNotIn('Point set',controls)
+                self.assertFalse(meshes['/surface'].visible)
+                self.assertEqual(visible_gaussians(),viewer.default_layers('Gaussians'))
+                np.testing.assert_allclose(clouds['/points/LiDAR/raw'].points,points,atol=.001)
+                np.testing.assert_array_equal(clouds['/points/Gaussians/contributing'].points,points[[0]])
+                np.testing.assert_allclose(clouds['/points/Gaussians/fragment_partial'].points,points[[3]],atol=.001)
+                self.assertIn('CUDA contributing: 2',markdowns[''].content)
+                # Toggling either cloud must retain the other's visible nodes.
+                original_green=clouds['/points/Gaussians/contributing']
+                controls['Show LiDAR'].value=False
+                self.assertFalse(clouds['/points/LiDAR/raw'].visible)
+                self.assertEqual(visible_gaussians(),viewer.default_layers('Gaussians'))
+                self.assertIs(clouds['/points/Gaussians/contributing'],original_green)
+                controls['Show LiDAR'].value=True
+                controls['Show Gaussians'].value=False
+                self.assertTrue(clouds['/points/LiDAR/raw'].visible)
+                self.assertEqual(visible_gaussians(),set())
+                controls['Surface display (visual only)'].value='wireframe'
+                self.assertTrue(meshes['/surface'].wireframe)
+                self.assertTrue(meshes['/surface'].visible)
+                buttons['Show contributing Gaussians only'].value=True
+                self.assertFalse(meshes['/surface'].visible)
+                self.assertFalse(clouds['/points/LiDAR/raw'].visible)
+                self.assertEqual(visible_gaussians(),{'contributing','fragment_partial'})
+                self.assertEqual(fake.analyze.call_count,1)  # Display controls never rerender/reclassify.
+                raw=clouds['/points/LiDAR/raw']
+                controls['Camera'].value='b.jpg'
+                self.assertEqual(fake.analyze.call_count,2)
+                self.assertIs(clouds['/points/LiDAR/raw'],raw)  # Static layer retained between frames.
+                self.assertIsNot(clouds['/points/Gaussians/contributing'],original_green)
+                self.assertEqual(visible_gaussians(),{'contributing','fragment_partial'})
+                raise KeyboardInterrupt
             try:
                 with patch('viser.ViserServer',return_value=server), \
-                     patch.object(server.gui,'add_dropdown',wraps=server.gui.add_dropdown) as dropdown, \
-                     patch.object(server.gui,'add_checkbox',wraps=server.gui.add_checkbox) as checkbox, \
+                     patch.object(server.gui,'add_dropdown',side_effect=capture(server.gui.add_dropdown,controls)), \
+                     patch.object(server.gui,'add_checkbox',side_effect=capture(server.gui.add_checkbox,controls)), \
+                     patch.object(server.gui,'add_button',side_effect=capture(server.gui.add_button,buttons)), \
+                     patch.object(server.gui,'add_markdown',side_effect=capture(server.gui.add_markdown,markdowns)), \
+                     patch.object(server.scene,'add_point_cloud',side_effect=capture(server.scene.add_point_cloud,clouds)), \
+                     patch.object(server.scene,'add_mesh_simple',side_effect=capture(server.scene.add_mesh_simple,meshes)), \
                      patch('scripts.ray_inspector_backend.RayInspector',return_value=fake), \
-                     patch.object(viewer,'time',SimpleNamespace(sleep=Mock(side_effect=KeyboardInterrupt))):
+                     patch.object(viewer,'time',SimpleNamespace(sleep=exercise_controls)):
                     self.assertEqual(viewer.main(['--scene','fixture.json','--point-cloud','fixture.ply',
                         '--model','checkpoint','--image','a.jpg','--host','127.0.0.1','--port',str(port)]),0)
-                point_dropdown=next(c for c in dropdown.call_args_list if c.args[0]=='Point set')
-                self.assertEqual(point_dropdown.kwargs['initial_value'],'Gaussians')
-                selected={c.args[0] for c in checkbox.call_args_list if c.kwargs.get('initial_value')}
-                for key,(label,_,_) in viewer.LAYERS.items():
-                    self.assertEqual(label in selected,key in viewer.default_layers('Gaussians'))
             finally:
                 server.stop()
 
