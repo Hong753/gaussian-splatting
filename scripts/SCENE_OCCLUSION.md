@@ -1,4 +1,10 @@
-# Fixed scene surfaces and per-view LiDAR visibility
+# Optional DA3 scene fusion and per-view LiDAR visibility
+
+**The default occluder is now the full LiDAR mesh described in
+[RAY_OCCLUSION.md](RAY_OCCLUSION.md).** The DA3-only path below is retained for
+comparison and optional gap supplementation. Its LiDAR support filter does not
+reconstruct missing measured walls; low trusted DA3 coverage can therefore leave
+large holes. The LiDAR-primary builder does not use these acceptance masks.
 
 For per-pixel CUDA clipping and a multi-frame preview before full preparation,
 use [RAY_OCCLUSION.md](RAY_OCCLUSION.md). The older whole-Gaussian culler remains

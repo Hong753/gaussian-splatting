@@ -1,104 +1,137 @@
-# CUDA ray clipping and a multi-frame surface preview
+# Full LiDAR surfaces and CUDA ray clipping
 
-The former whole-Gaussian test kept every splat whose tile footprint touched any
-unknown depth. The new opt-in `occlusion_backend=ray` tests every pixel fragment
-inside the CUDA forward/backward compositor. It retains native 3DGS + AA and
-uses the same Gaussian center camera-z convention as native splat depth sorting.
-No derivative passes through the fixed visibility decision.
+The primary occluder is now a connected triangle mesh built directly from the
+**entire initialization LiDAR cloud**. DA3 confidence, local calibration, and
+multiview acceptance masks cannot delete measured walls. The earlier TSDF
+preview used only accepted DA3 pixels, with LiDAR as a support filter; displaying
+the gray LiDAR cloud did not make those points occlude anything.
 
-The full pixel depth comes from CUDA triangle rasterization of a fixed TSDF
-mesh. Unknown pixels affect only their own ray (plus one pixel of conservative
-boundary padding). There is no 16x16 tile coverage gate. Gaussians without any
-contributing fragments have frozen optimizer rows/momentum and do not add
-densification statistics for that image. Actual fragment flags distinguish
-fully blocked and partially blocked splats. Point-center labels are separate.
+`prepare_lidar_scene.py` selects measured representatives at 5 cm spacing, then
+meshes overlapping spatial blocks using two-sided ball pivoting. Vertices remain
+in their original coordinates. Triangle edges are capped at 20 cm; local tangent
+agreement and measured support at midpoints/centroids reject unsupported bridges.
+Both pivot orientations are used so a nearby parallel wall does not prevent the
+front sheet from being reconstructed. Duplicate triangles are removed. Doorways
+are not closed by a convex hull, Poisson completion, or global voxel dilation.
+Features below the selected spatial scale and sparsely measured surfaces can
+still be missing; image coverage is measured separately from mesh vertex coverage.
 
-## First preview: many input views, one inspected camera
+Meshing is one-time **CPU preprocessing** with bounded spatial blocks. Fixed-mesh
+depth rasterization, point projection/depth comparisons, and per-pixel Gaussian
+forward/backward clipping are **CUDA**. This remains native 3DGS + AA, independent
+of Proxy-GS. The mesh also supplies depth for novel camera poses.
+
+## Inspect the failing wall
 
 ```bash
-source /opt/anaconda3/etc/profile.d/conda.sh
+source /path/to/anaconda3/etc/profile.d/conda.sh
 conda activate 3dgs
-cd /home/sequor_vfm/gaussian-splatting
+cd /path/to/gaussian-splatting
 git pull --ff-only
 bash scripts/inspect_ray_surface.sh 5 \
-  /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_occlusion \
-  06663.jpg
+  /path/to/native_checkpoint \
+  FRAME.jpg
 ```
 
-The wrapper builds the separate CUDA extension and runs the real GPU wall/hole
-and gradient checks **before** preprocessing. It also runs
-`smoke_occlusion.py --mesh --backend ray` to check the full CUDA triangle-depth
-provider and ray compositor together, including a moved camera and zero hidden
-gradients. The standalone geometry smoke defaults to `--backend whole` for
-legacy runs; its hidden test point is inside tiles covered by the near surface.
-The ray backend retains the original tile-boundary case and must block it.
-The preview reuses the cached DA3 owning
-group (up to 38 views with the current 40-view budget), validates every group
-image, and fuses those surfaces into a diagnostic TSDF mesh. Existing single-view
-previews did not fuse the other group views. No extra DA3 forward is necessary
-when its raw group cache exists. Surface fusion is CPU preprocessing; mesh depth
-rasterization, point visibility tests, and splat forward/backward clipping are
-CUDA. This workflow does not launch training.
+Replace the placeholder paths and `FRAME.jpg` with the checkpoint and camera
+being inspected. The wrapper activates `3dgs`, builds the CUDA extension, runs native/ray AA
+forward/backward checks, and runs `smoke_occlusion.py --lidar-mesh --backend ray`.
+The latter reconstructs an actual measured-point fixture before testing CUDA
+depth, a novel camera, rendering, and zero gradients for a hidden Gaussian.
+Next it meshes the full cloud once, caches original LiDAR row IDs for the selected
+view, and opens the viewer at **http://HOST:8085**. It does not launch
+training or run DA3. Existing checkpoints and DA3 caches are preserved.
 
-The smoke test includes native/ray RGB and inverse-depth parity with AA off/on,
-finite gradients for every parameter, and direct CUDA binding checks using
-expanded and transposed inverse-depth gradients. A reduction such as
-`depth.sum()` supplies a zero-stride gradient; the binding materializes it before
-CUDA reads a dense pixel array. The shared render wrapper protects the installed
-native baseline the same way. If updating after the original NaN parity failure,
-rerun the wrapper after `git pull --ff-only`; it rebuilds the extension and retains
-the existing DA3 predictions. A new smoke failure names the backend, AA setting,
-and offending parameter instead of only reporting an anonymous tensor mismatch.
+Default output: `MODEL_PARENT/lidar_scene_surface_v1`.
+This global mesh is reused when selecting another camera. `RAY_SURFACE_OUTPUT`
+overrides that directory; use a new directory when changing meshing settings.
+`RAY_SKIP_INSTALL=1` skips dependency rebuilding on subsequent launches.
+`RAY_INSPECTOR_PORT` overrides 8085. `DA3_CONDA_SH` overrides the conda profile path.
 
-Open `http://211.172.247.108:8085`. The point-set selector switches between
-original LiDAR rows and checkpoint Gaussian centers. Toggle:
-
-| Layer | Color | Meaning |
+| Viewer layer | Color | Meaning |
 |---|---|---|
-| All scene points | Gray | Every finite point, including outside the camera |
-| Camera frustum points | Cyan | Positive depth and projected inside the image |
-| Culled points | Red | Point center behind the first surface plus margin |
-| Points on surface | Yellow | Within the surface tolerance band |
-| Occlusion surface | Blue mesh | Connected triangles, not point markers |
-| Unknown depth | Purple | In-frustum point without a reliable surface hit |
-| In front of surface | Green | Geometry ahead of the reconstructed surface |
-| CUDA blocked / partial / contributing | Red / orange / green | Actual Gaussian fragment flags |
+| Outside reference frustum | Gray | Scene context outside the selected camera |
+| All scene points (optional) | Gray | Raw-cloud overlay; may cover colored labels |
+| All frustum points (optional) | Cyan | Full in-view point set |
+| Culled point centers | Red | Behind first-hit depth plus the culling margin |
+| Near surface | Yellow | Within 3 cm of the first hit, independent of culling tolerance |
+| Rear tolerance band | Orange | Behind the narrow band but not beyond the cutoff |
+| Unknown depth | Purple | In-frustum ray with no mesh hit |
+| In front of mesh | Green | Inspect missing foreground geometry or disagreement |
+| Primary occluding surface | Blue mesh | Connected LiDAR triangles |
+| Actual Gaussian fragments | Separate toggles | Fully blocked, partly blocked, contributing |
 
-All points are displayed by default; `--max-points` is an explicit display-only
-cap. The panel reports exact counts, the number of fused frames, depth coverage,
-GT / culling OFF / culling ON images, a difference image, and a gradient probe.
-Labels, reports and PNGs are saved beside the diagnostic mesh under
-`ray_inspection/`. Model parameters are not optimized or overwritten.
+Default point classes are disjoint; they collectively show the whole scene.
+No display subsampling occurs unless `--max-points` is provided. The small RGB
+plane is a camera visualization at an arbitrary distance, not measured wall depth.
+Point-center labels and actual Gaussian fragment flags are distinct.
 
-The preview mesh is explicitly marked diagnostic and rejected for training.
-It may contain multiple surfaces; the inspected ray uses only its first hit.
-Unsupported depth regions remain unknown. A visible wall with no supported
-surface is a reconstruction/calibration failure, not something hidden by
-inflating a voxel to close all openings.
+The **foreground audit** projects the nearest measured LiDAR point into each
+native camera pixel and compares it with mesh first-hit depth. Its RGB overlay
+uses green for agreement, red for a mesh hit behind measured foreground, purple
+for missing mesh depth, and cyan for a mesh hit in front of the measured sample.
+These are sparse samples, not ground-truth dense depth: mixed pixels, outliers,
+and calibration errors can cause disagreements. The sparse projection is never
+used as the occluder. A passing gradient check alone does not prove wall coverage.
 
-## Full-scene training
+`ray_inspection/<image-id>/` saves GT, culling OFF/ON renders, difference and depth
+images, the foreground overlay, point-ID sets, `depth_audit.npz`, and HTML/JSON.
+`unmeshed_lidar.npz` lists original PLY rows for representatives without triangles.
+Culling uses a 5 cm absolute margin and **zero relative margin** by default; the
+former 10% depth tolerance is not inherited by the new mesh. All distances are
+in the input scene's coordinate units (meters for the registered metric LiDAR).
 
-Finish the full trajectory depth cache and scene fusion as described in
-[SCENE_OCCLUSION.md](SCENE_OCCLUSION.md). Then select the new compositor explicitly:
+## Cache every registered view
+
+Set `RAY_PRECOMPUTE_ALL=1` when running the wrapper, or finish the resumable cache
+separately after inspecting the selected wall:
 
 ```bash
-source /opt/anaconda3/etc/profile.d/conda.sh
+source /path/to/anaconda3/etc/profile.d/conda.sh
 conda activate 3dgs
-cd /home/sequor_vfm/gaussian-splatting
-ray_root=/data/3dgs_outputs/orange_4F/1_full
+cd /path/to/gaussian-splatting
+ray_root=/path/to/model_parent
+python -u scripts/prepare_scene_occlusion.py views \
+  --scene "$ray_root/lidar_scene_surface_v1/scene.json" \
+  --point-cloud /path/to/native_checkpoint/input.ply \
+  --split all --resolution -1 --device cuda --visibility-backend cuda --gpu 5
+```
+
+This saves visibility for all registered frames, including unselected frames,
+using stable original PLY row IDs. A single-view cache remains explicitly partial.
+The mesh is complete independently of that cache; training requires the full
+visibility cache and matching training keyframes/camera signatures.
+
+## Optional DA3 supplement
+
+`prepare_lidar_scene.py --supplement-scene PATH/scene.json` accepts a complete,
+validated DA3-only TSDF scene made by the existing fusion pipeline. The source,
+initialization cloud, and training keyframes must match. Diagnostic partial
+meshes are rejected. The wrapper accepts `RAY_DA3_SUPPLEMENT_SCENE` for this option.
+
+The two meshes remain separate. A finite LiDAR depth always wins; the DA3 depth
+is used only on rays where the LiDAR mesh has no hit. This priority is shared by
+CUDA depth, exact CPU point-ray checks, training, and novel views. DA3 candidate
+geometry is an optional orange mesh layer in the viewer, off by default.
+
+## Training after the coverage check
+
+```bash
+source /path/to/anaconda3/etc/profile.d/conda.sh
+conda activate 3dgs
+cd /path/to/gaussian-splatting
+ray_root=/path/to/model_parent
 ray_base=$(python -c 'from scripts.render import resolve_models; import sys; print(resolve_models(None, sys.argv[1], ["sharp_keyframes_stride3_aa"])[0])' "$ray_root")
-python scripts/run_occlusion.py \
-  --source /data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full \
-  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_ray_occlusion_warm7k_lr50 \
+python -u scripts/run_occlusion.py \
+  --source /path/to/colmap_scene \
+  --model "$ray_root/3dgs_stride3_aa_lidar_mesh_ray_warm7k_lr50" \
   --baseline "$ray_base" --keyframes "$ray_base/keyframes.json" \
-  --scene-geometry /data/3dgs_outputs/orange_4F/1_full/scene_occlusion_stride3_trajectory40_v1/scene.json \
+  --scene-geometry "$ray_root/lidar_scene_surface_v1/scene.json" \
   --occlusion-backend ray --position-warmup-steps 7000 --position-ramp-steps 2000 \
   --position-lr-scale .02 --gpu 5
 ```
 
-Use the resolved baseline path for this experiment, with the same keyframe
-manifest as fusion. The launcher retains GT comparisons for both saved splits,
-all-frame PSNR, and actual/novel trajectory comparison videos. The fixed mesh is
-available at novel poses; target RGB is not needed for its rendering-time depth.
-`--occlusion-backend ray` is also supported by rendering/evaluation overrides.
-Legacy checkpoints default to their original `whole` backend.
+The launcher retains train/eval GT comparisons, all-frame PSNR, and actual/novel
+trajectory videos. Current Gaussian fragments are clipped every iteration;
+precomputed LiDAR IDs are not reused as Gaussian IDs after movement/densification.
+Noncontributing Gaussian optimizer rows and momentum remain frozen for that view.

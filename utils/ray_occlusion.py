@@ -20,20 +20,27 @@ def pixel_cutoff(camera, pc, pipe):
 
 @torch.no_grad()
 def classify_points_depth(points, intrinsic, extrinsic, depth, margin=.05, relative_margin=.10,
-                          chunk_size=262144):
+                          chunk_size=262144, surface_band=None):
     """Original-row IDs, full pixel first-hit z; CUDA projection/lookup/comparison.
 
     Unknown pixel depths stay unknown. Out-of-frustum/invalid rows are separate.
-    The mask partitions all input rows; on_surface uses the same margin band as
-    the depth cutoff. This discretizes each point ray to a nearest image pixel.
+    With surface_band=None, on_surface retains the legacy cutoff tolerance band.
+    An explicit metric surface_band separates surface proximity from the culling
+    safety margin; points in the rear margin are 'uncertain', not surface points.
+    This discretizes each point ray to a nearest image pixel.
     """
-    if min(margin, relative_margin) < 0 or chunk_size < 1:
+    import math
+    if (not all(math.isfinite(x) for x in (margin, relative_margin)) or
+            min(margin, relative_margin) < 0 or chunk_size < 1 or
+            (surface_band is not None and (not math.isfinite(surface_band) or surface_band < 0))):
         raise ValueError('Invalid point visibility parameters')
     device = depth.device
     k = torch.as_tensor(intrinsic, dtype=torch.float32, device=device)
     e = torch.as_tensor(extrinsic, dtype=torch.float32, device=device)
     h, w = depth.shape
     parts = {key: [] for key in ('frustum', 'outside', 'on_surface', 'culled', 'unknown', 'in_front')}
+    if surface_band is not None:
+        parts['uncertain'] = []
     for start in range(0, len(points), chunk_size):
         xyz = torch.as_tensor(points[start:start+chunk_size], dtype=torch.float32, device=device)
         cam = xyz @ e[:3, :3].T + e[:3, 3]
@@ -51,12 +58,65 @@ def classify_points_depth(points, intrinsic, extrinsic, depth, margin=.05, relat
         known = torch.isfinite(hit) & (hit > .2)
         delta = z[ids]-hit
         tolerance = margin + relative_margin*hit
-        masks = dict(on_surface=known & (delta.abs() <= tolerance), culled=known & (delta > tolerance),
-                     in_front=known & (delta < -tolerance), unknown=~known)
+        band = tolerance if surface_band is None else surface_band
+        culled = known & (delta > tolerance)
+        masks = dict(on_surface=known & (delta.abs() <= band) & ~culled, culled=culled,
+                     in_front=known & (delta < -band), unknown=~known)
+        if surface_band is not None:
+            masks['uncertain'] = known & (delta > band) & ~culled
         for key, mask in masks.items():
             parts[key].append((ids[mask]+start).cpu())
     return {key+'_ids': torch.cat(values).numpy() if values else torch.empty(0,dtype=torch.long).numpy()
             for key, values in parts.items()}
+
+
+@torch.no_grad()
+def projected_lidar_depth(points, intrinsic, extrinsic, height, width, device, chunk_size=262144):
+    """Nearest measured point per native camera pixel, for auditing the mesh.
+
+    This sparse z-buffer is diagnostic only. It is never substituted for the
+    connected occlusion surface and never dilated across an opening.
+    """
+    k = torch.as_tensor(intrinsic, dtype=torch.float32, device=device)
+    e = torch.as_tensor(extrinsic, dtype=torch.float32, device=device)
+    depth = torch.full((height*width,), float('inf'), device=device)
+    for start in range(0, len(points), chunk_size):
+        xyz = torch.as_tensor(points[start:start+chunk_size], dtype=torch.float32, device=device)
+        cam = xyz @ e[:3, :3].T + e[:3, 3]
+        z = cam[:, 2]
+        u, v = k[0, 0]*cam[:, 0]/z+k[0, 2], k[1, 1]*cam[:, 1]/z+k[1, 2]
+        inside = torch.isfinite(cam).all(1) & (z > .2) & (u >= -.5) & (u < width-.5) & (v >= -.5) & (v < height-.5)
+        ui = torch.floor(u[inside]+.5).long().clamp(0, width-1)
+        vi = torch.floor(v[inside]+.5).long().clamp(0, height-1)
+        depth.scatter_reduce_(0, vi*width+ui, z[inside], reduce='amin', include_self=True)
+    return depth.reshape(height, width)
+
+
+def first_surface_audit(lidar_depth, mesh_depth, rgb, tolerance=.05):
+    """Image-space measured-foreground disagreement; does not certify alignment."""
+    import numpy as np
+    if not np.isfinite(tolerance) or tolerance < 0:
+        raise ValueError('Invalid first-surface audit tolerance')
+    measured, hit = np.isfinite(lidar_depth), np.isfinite(mesh_depth)
+    both = measured & hit
+    delta = np.zeros_like(mesh_depth)
+    delta[both] = mesh_depth[both]-lidar_depth[both]
+    masks = dict(agreement=both & (np.abs(delta) <= tolerance),
+        missing_mesh=measured & ~hit, mesh_behind_lidar=both & (delta > tolerance),
+        mesh_in_front_of_lidar=both & (delta < -tolerance))
+    overlay = (np.asarray(rgb, dtype=np.float32)*.35).astype(np.uint8)
+    colors = dict(agreement=(35,210,90), missing_mesh=(175,80,225),
+                  mesh_behind_lidar=(245,55,55), mesh_in_front_of_lidar=(30,195,235))
+    for key, mask in masks.items():
+        overlay[mask] = colors[key]
+    count = int(measured.sum())
+    report = dict(measured_pixels=count, measured_pixel_fraction=float(measured.mean()),
+        tolerance=tolerance, counts={k: int(v.sum()) for k, v in masks.items()},
+        agreement_fraction_of_measured=float(masks['agreement'].sum()/max(count, 1)),
+        foreground_miss_fraction_of_measured=float((masks['missing_mesh'] | masks['mesh_behind_lidar']).sum()/max(count, 1)),
+        median_absolute_error=float(np.median(np.abs(delta[both]))) if both.any() else None,
+        note='Nearest projected LiDAR vs mesh at the same pixel; sparse samples, mixed pixels, outliers and calibration errors can disagree')
+    return report, overlay
 
 
 def reference_composite(alpha, colors, z, cutoff, background):

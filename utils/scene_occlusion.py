@@ -21,6 +21,11 @@ def load_scene(path, point_cloud=None, source=None):
     mesh = path.parent / report['mesh']
     if not mesh.is_file() or file_digest(mesh) != report['mesh_sha256']:
         raise ValueError('Scene mesh is missing or changed; rebuild its visibility cache')
+    if report.get('supplement_mesh'):
+        supplement = path.parent/report['supplement_mesh']
+        if (report.get('supplement_policy') != 'missing_lidar_rays_only' or not supplement.is_file() or
+                file_digest(supplement) != report.get('supplement_mesh_sha256')):
+            raise ValueError('Invalid or changed supplementary surface')
     if point_cloud and file_digest(point_cloud) != report['point_cloud_sha256']:
         raise ValueError('Scene mesh and initialization LiDAR cloud differ')
     if source and Path(source).resolve() != Path(report['source']).resolve():
@@ -149,7 +154,16 @@ class MeshDepthCache(LidarDepthCache):
         super().__init__(geometry, directory, edge_pixels, memory_views)
 
     def make_renderer(self, device):
-        return MeshDepthRenderer(self.mesh, device)
+        primary = MeshDepthRenderer(self.mesh, device)
+        if not self.report.get('supplement_mesh'):
+            return primary
+        supplement = MeshDepthRenderer(self.geometry.parent/self.report['supplement_mesh'], device)
+        def render(camera):
+            import torch
+            depth = primary(camera)
+            # A predicted surface must never override a measured LiDAR hit.
+            return torch.where(torch.isfinite(depth), depth, supplement(camera))
+        return render
 
     def tile_depth(self, depth):
         return depth*(1+self.report['relative_margin'])
@@ -159,3 +173,20 @@ class MeshDepthCache(LidarDepthCache):
         result['report'] = dict(kind=FORMAT, relative_margin=self.report['relative_margin'],
             reason='fixed scene mesh; missing intersections stay unknown')
         return result
+
+
+def scene_raycaster(report, mesh, threads=0):
+    """Same LiDAR-priority rule for exact CPU point rays and CUDA pixel depth."""
+    primary = TriangleRaycaster(*mesh_arrays(mesh), threads=threads)
+    if not report.get('supplement_mesh'):
+        return primary
+    supplement = TriangleRaycaster(*mesh_arrays(Path(mesh).parent/report['supplement_mesh']), threads=threads)
+    class PriorityRaycaster:
+        def cast(self, origins, directions):
+            hit = primary.cast(origins, directions)
+            missing = ~np.isfinite(hit)
+            if missing.any():
+                origins = np.broadcast_to(origins, directions.shape)
+                hit[missing] = supplement.cast(origins[missing], directions[missing])
+            return hit
+    return PriorityRaycaster()

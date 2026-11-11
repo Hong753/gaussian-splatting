@@ -1,4 +1,4 @@
-# Fixed scene TSDF fusion and exact point-ray visibility are CPU preprocessing.
+# Full LiDAR surface meshing, optional DA3 TSDF and exact rays are CPU preprocessing.
 # Native per-camera depth rasterization uses requirements-occlusion.txt on CUDA.
 open3d-cpu==0.19.0
 numpy>=1.26,<2

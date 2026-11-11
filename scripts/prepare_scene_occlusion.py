@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT))
 from scripts.prepare_da3_occlusion import save_npz
 from scripts.view_comparisons import atomic_json, read_colmap_records
 from utils.lidar_occlusion import file_digest
-from utils.scene_occlusion import FORMAT, POINT_CLASSES, MeshDepthCache, TriangleRaycaster, classify_lidar, load_scene, mesh_arrays
+from utils.scene_occlusion import FORMAT, POINT_CLASSES, MeshDepthCache, classify_lidar, load_scene, scene_raycaster
 from utils.sparse_lidar import frame_filename
 
 
@@ -158,7 +158,7 @@ def precompute_views(args):
             raise ValueError('Visibility output has different inputs/settings; choose a new directory')
     atomic_json(status_path, dict(config, complete=False))
     points = read_points(args.point_cloud)
-    raycaster = TriangleRaycaster(*mesh_arrays(mesh), threads=args.threads) if visibility_backend == 'exact' else None
+    raycaster = scene_raycaster(scene, mesh, threads=args.threads) if visibility_backend == 'exact' else None
     provider = MeshDepthCache(args.scene)
     preview_names = {all_names[i] for i in np.linspace(0, len(all_names)-1, min(16, len(all_names)), dtype=int)}
     if args.image:

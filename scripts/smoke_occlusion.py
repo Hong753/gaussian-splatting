@@ -22,9 +22,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpu", default="2")
     parser.add_argument('--mesh', action='store_true', help='Test the whole-scene mesh renderer and native AA culling')
+    parser.add_argument('--lidar-mesh', action='store_true', help='Reconstruct the test mesh from measured samples, with no DA3 input')
     parser.add_argument('--backend', choices=('whole','ray'), default='whole',
                         help='Exercise the same geometry-to-renderer path as the selected workflow')
     args = parser.parse_args(argv)
+    args.mesh = args.mesh or args.lidar_mesh
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     import torch
     if not torch.cuda.is_available():
@@ -42,6 +44,8 @@ def main(argv=None):
         geometry = Path(tmp)/"two_depths.npz"
         centers, radii = [], []
         for z, low, high, step in [(2, -2, 0, .125), (4, 0, 4, .25)]:
+            if args.lidar_mesh:
+                step = .1
             x, y = np.meshgrid(np.arange(-z, z+step/2, step), np.arange(low, high+step/2, step))
             centers.extend(np.stack((x.ravel(), y.ravel(), np.full(x.size, z)), axis=1))
             radii.extend([step*1.2]*x.size)
@@ -54,10 +58,14 @@ def main(argv=None):
             vertices = np.array([[-3,-3,2],[3,-3,2],[3,0,2],[-3,0,2],
                                  [-5,0,4],[5,0,4],[5,5,4],[-5,5,4]], np.float32)
             faces = np.array([[0,1,2],[0,2,3],[4,5,6],[4,6,7]], np.int32)
+            if args.lidar_mesh:
+                from utils.lidar_surface import build_lidar_mesh
+                vertices, faces, _, _, stats = build_lidar_mesh(np.asarray(centers), threads=2)
+                print(f"LiDAR smoke fixture: {stats['triangles']:,} measured triangles; no predicted depths", flush=True)
             np.savez(mesh_path, vertices=vertices, faces=faces)
             geometry = Path(tmp)/'scene.json'
             geometry.write_text(json.dumps(dict(format=FORMAT, complete=True, mesh='mesh.npz',
-                mesh_sha256=file_digest(mesh_path), relative_margin=.05)))
+                mesh_sha256=file_digest(mesh_path), relative_margin=0. if args.lidar_mesh else .05)))
         view = torch.eye(4, device="cuda")
         projection = getProjectionMatrix(.01, 100., math.pi/2, math.pi/2).cuda().T
         cam = SimpleNamespace(image_width=128, image_height=128, FoVx=math.pi/2, FoVy=math.pi/2,

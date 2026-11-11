@@ -560,6 +560,11 @@ Override `SCENE`, `MODEL_ROOT`, `OUTPUT_ROOT`, `ITERATION` (default 30000),
 
 ### Standalone LiDAR occlusion: 3DGS + AA
 
+For the current **full-cloud connected LiDAR mesh + per-pixel CUDA culling**, use
+[RAY_OCCLUSION.md](RAY_OCCLUSION.md) and `bash scripts/inspect_ray_surface.sh`.
+That path does not gate measured walls by DA3 confidence or sparse planar-patch
+acceptance. The original patch/whole-Gaussian ablation is documented below.
+
 The occlusion framework builds its own fixed surface patches directly from the
 same `input.ply` used to initialize native 3DGS. It needs no Proxy-GS repository,
 environment, model, mesh, depth files, or training stage. `--occlusion_mode lidar`
