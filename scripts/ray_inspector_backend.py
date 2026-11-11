@@ -5,6 +5,28 @@ from types import SimpleNamespace
 import numpy as np
 
 
+def fragment_layers(flags, raster_radii):
+    """Disjoint CUDA states; percentages use pre-culling image candidates."""
+    flags, raster_radii = np.asarray(flags).reshape(-1), np.asarray(raster_radii).reshape(-1)
+    if flags.shape != raster_radii.shape or np.any((flags < 0) | (flags > 3)):
+        raise ValueError('Invalid Gaussian fragment flags/radii')
+    candidates = raster_radii > 0
+    ids = dict(fragment_blocked_ids=np.flatnonzero(flags==2),
+               fragment_partial_ids=np.flatnonzero(flags==3),
+               contributing_ids=np.flatnonzero(flags==1),
+               fragment_inactive_ids=np.flatnonzero(flags==0),
+               fragment_frustum_ids=np.flatnonzero(candidates))
+    count = int(candidates.sum())
+    report = dict(total=len(flags), image_candidates=count,
+        no_encountered_contribution=len(ids['fragment_inactive_ids']),
+        contributing_only=len(ids['contributing_ids']), fully_blocked=len(ids['fragment_blocked_ids']),
+        partially_blocked=len(ids['fragment_partial_ids']),
+        fully_blocked_fraction_in_image=float(((flags==2)&candidates).sum()/max(count,1)),
+        partially_blocked_fraction_in_image=float(((flags==3)&candidates).sum()/max(count,1)),
+        note='Flags record encountered fragments before native opacity early termination; zero does not prove geometric occlusion')
+    return ids, report
+
+
 class RayInspector:
     def __init__(self, args):
         import torch
@@ -32,6 +54,7 @@ class RayInspector:
             if spec['type']!='3dgs' or Path(spec['cfg']['source_path']).resolve()!=Path(self.scene['source']).resolve():
                 raise ValueError('Choose a native checkpoint for the same camera scene')
             self.iteration,self.ply=choose_iteration(spec['path'],args.iteration)
+            self.output=args.output or spec['path']/'ray_inspection'/f'iteration_{self.iteration}'
             self.cfg=spec['cfg']
             self.model=GaussianModel(self.cfg.get('sh_degree',3))
             self.model.load_ply(str(self.ply))
@@ -102,21 +125,20 @@ class RayInspector:
                         stats=gradient_statistics(PARAMETERS,gradients,hidden)
                     pixels=(predicted.detach().permute(1,2,0).cpu().numpy()*255).round().clip(0,255).astype(np.uint8)
                 for p in self.parameters:p.requires_grad_(False)
-                return pixels,flags,stats
-            on,flags,on_grad=render_one(True)
-            off,_,off_grad=render_one(False,flags==2)
+                return pixels,flags,stats,result.get('raster_radii')
+            on,flags,on_grad,raster_radii=render_one(True)
+            off,_,off_grad,_=render_one(False,flags==2)
             flags=flags.cpu().numpy()
             images.update(on=('CUDA ray culling ON',on),off=('Culling OFF',off),
                 difference=('Absolute ON/OFF difference x10',np.minimum(np.abs(on.astype(int)-off.astype(int))*10,255).astype(np.uint8)))
-            report['fragments']=dict(no_encountered_contribution=int((flags==0).sum()),
-                contributing_only=int((flags==1).sum()),fully_blocked=int((flags==2).sum()),
-                partially_blocked=int((flags==3).sum()),
-                note='Flags record fragments encountered before native opacity early termination; zero does not prove geometric occlusion')
+            fragment_ids,report['fragments']=fragment_layers(flags,raster_radii.cpu().numpy())
+            report['checkpoint']=dict(model=str(self.args.model),iteration=self.iteration,ply=str(self.ply),
+                saved_inference_occlusion=self.cfg.get('occlusion_inference_mode','saved'),
+                display='Fixed saved checkpoint; change camera freely, restart to load newer weights')
             if self.args.check_gradients:
                 report['gradient_probe']=dict(on=on_grad,off=off_grad,
                     verdict=probe_verdict(on_grad,off_grad,int((flags==2).sum())))
-            groups['Gaussians'].update(fragment_blocked_ids=np.flatnonzero(flags==2),
-                fragment_partial_ids=np.flatnonzero(flags==3),contributing_ids=np.flatnonzero(flags&1))
+            groups['Gaussians'].update(fragment_ids)
         directory=self.output/image_id(name)
         directory.mkdir(parents=True,exist_ok=True)
         for key,value in groups.items():save_npz(directory/(key.lower()+'_ids.npz'),**value)

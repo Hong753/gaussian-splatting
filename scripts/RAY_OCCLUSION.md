@@ -194,3 +194,34 @@ point zero and the fraction at most 0.9. These check new child placement, not la
 optimizer motion. Disk depth caches persist; depth and derived surface-frame GPU
 caches each retain at most four views. Surface frames are recomputed from disk
 depth when evicted, rather than keeping all scene views in memory.
+
+## Inspect each saved camera after densification
+
+The inspector loads every Gaussian from the selected checkpoint and recomputes
+CUDA fragment flags for each camera, including cloned and split children. It
+renders both culling ON and OFF alongside GT even when the saved inference policy
+is OFF. This diagnostic does not change the training or saved inference policy.
+
+```bash
+conda activate 3dgs
+python -u scripts/inspect_ray_occlusion.py \
+  --scene /path/to/model_parent/lidar_scene_surface_v1/scene.json \
+  --point-cloud /path/to/model/input.ply --model /path/to/model \
+  --iteration -1 --image 06663.jpg --point-set Gaussians \
+  --gpu 0 --host 0.0.0.0 --port 8086
+```
+
+With a checkpoint, the default 3D colors are actual CUDA states: red = fully
+blocked, orange = partly blocked and contributing, green = contributing with no
+blocked fragments, gray = no encountered contribution. Gray does not imply
+geometric visibility or occlusion. The four groups are disjoint, so green cannot
+hide the partly blocked orange group. Blue is the occlusion mesh. LiDAR and
+point-center surface/frustum layers remain selectable. Use the Camera dropdown
+or Previous/Next frame buttons to change the reference view. Merely orbiting the
+3D scene does not change the reference camera used for classification.
+
+Blocked percentages use pre-culling image candidates, not all scene Gaussians.
+Per-frame results are written below `MODEL/ray_inspection/iteration_N/`.
+The viewer shows a fixed saved checkpoint, with its iteration displayed; restart
+to load newer weights. With the default 7k/30k save schedule, the 7k checkpoint
+predates adaptive densification, whereas the 30k checkpoint contains its result.

@@ -19,6 +19,26 @@ from test_occlusion import camera
 
 
 class RayTests(unittest.TestCase):
+    def test_cuda_viewer_states_are_disjoint_and_use_image_candidate_denominator(self):
+        from scripts.ray_inspector_backend import fragment_layers
+        flags=np.array([0,1,2,3,0])
+        radii=np.array([0,3,3,3,2])
+        ids,report=fragment_layers(flags,radii)
+        self.assertEqual(ids['contributing_ids'].tolist(),[1])
+        self.assertEqual(ids['fragment_partial_ids'].tolist(),[3])
+        shown=np.concatenate([ids[k] for k in ('fragment_blocked_ids','fragment_partial_ids',
+                                              'contributing_ids','fragment_inactive_ids')])
+        self.assertEqual(sorted(shown.tolist()),list(range(5)))
+        self.assertEqual(report['fully_blocked_fraction_in_image'],.25)
+        # Densified children are rows in the current checkpoint, not original
+        # LiDAR IDs. They are classified without a fixed initial population.
+        grown,growth=fragment_layers(np.r_[flags,[2,1]],np.r_[radii,[2,2]])
+        self.assertEqual(grown['fragment_blocked_ids'].tolist(),[2,5])
+        self.assertEqual(grown['contributing_ids'].tolist(),[1,6])
+        self.assertEqual(growth['fully_blocked_fraction_in_image'],2/6)
+        _,empty=fragment_layers(np.zeros(3,int),np.zeros(3,int))
+        self.assertEqual(empty['fully_blocked_fraction_in_image'],0.)
+
     def test_smoke_finiteness_check_identifies_backend_and_parameter(self):
         from scripts.smoke_ray_occlusion import require_finite
         require_finite([('_xyz',torch.zeros(2,3))],'AA=False native gradient')
@@ -179,6 +199,42 @@ class RayTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(viewer.main(['--scene','fixture.json','--point-cloud','fixture.ply','--image','a.jpg',
                     '--host','127.0.0.1','--port',str(port)]),0)
+
+    @unittest.skipUnless(importlib.util.find_spec('viser'),'viser required')
+    def test_checkpoint_viewer_defaults_to_actual_cuda_states(self):
+        import viser
+        from scripts import inspect_ray_occlusion as viewer
+        from scripts.ray_inspector_backend import fragment_layers
+        from test_scene_occlusion import quad
+        vertices,faces=quad()
+        points=np.array([[0,0,2],[0,0,4],[0,0,-2],[.1,0,3]],np.float32)
+        ids,fragments=fragment_layers(np.array([1,2,0,3]),np.array([2,2,0,2]))
+        pixels=np.zeros((64,64,3),np.uint8)
+        result=dict(name='a.jpg',k=np.array([[32,0,31.5],[0,32,31.5],[0,0,1]]),c2w=np.eye(4),
+            groups={'LiDAR':{},'Gaussians':ids},counts={'LiDAR':{'total':4},'Gaussians':{'total':4}},
+            report=dict(integrated_frames=0,depth_coverage=1.,fragments=fragments,
+                        checkpoint=dict(iteration=30000)),images={'gt':('Actual',pixels),'on':('ON',pixels),'off':('OFF',pixels)})
+        fake=SimpleNamespace(vertices=vertices,faces=faces,names=['a.jpg','b.jpg'],
+            point_sets={'LiDAR':points,'Gaussians':points},analyze=lambda _:result)
+        with socket.socket() as connection:
+            connection.bind(('127.0.0.1',0));port=connection.getsockname()[1]
+        with contextlib.redirect_stdout(io.StringIO()):
+            server=viser.ViserServer(host='127.0.0.1',port=port)
+            try:
+                with patch('viser.ViserServer',return_value=server), \
+                     patch.object(server.gui,'add_dropdown',wraps=server.gui.add_dropdown) as dropdown, \
+                     patch.object(server.gui,'add_checkbox',wraps=server.gui.add_checkbox) as checkbox, \
+                     patch('scripts.ray_inspector_backend.RayInspector',return_value=fake), \
+                     patch.object(viewer,'time',SimpleNamespace(sleep=Mock(side_effect=KeyboardInterrupt))):
+                    self.assertEqual(viewer.main(['--scene','fixture.json','--point-cloud','fixture.ply',
+                        '--model','checkpoint','--image','a.jpg','--host','127.0.0.1','--port',str(port)]),0)
+                point_dropdown=next(c for c in dropdown.call_args_list if c.args[0]=='Point set')
+                self.assertEqual(point_dropdown.kwargs['initial_value'],'Gaussians')
+                selected={c.args[0] for c in checkbox.call_args_list if c.kwargs.get('initial_value')}
+                for key,(label,_,_) in viewer.LAYERS.items():
+                    self.assertEqual(label in selected,key in viewer.default_layers('Gaussians'))
+            finally:
+                server.stop()
 
 
 if __name__=='__main__':unittest.main()
