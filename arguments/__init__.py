@@ -136,6 +136,9 @@ class OptimizationParams(ParamGroup):
         self.view_tangent_min_observations = 2
         self.view_tangent_max_parents = 50000
         self.view_tangent_max_points = 12000000
+        from utils.soft_surface import DEFAULTS as soft_surface_defaults
+        for name, value in soft_surface_defaults.items():
+            setattr(self, name, value)
         self.depth_l1_weight_init = 1.0
         self.depth_l1_weight_final = 0.01
         self.random_background = False

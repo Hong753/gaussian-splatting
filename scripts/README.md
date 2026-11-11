@@ -927,3 +927,71 @@ The usual exponential schedule starts after this ramp. Other Gaussian
 attributes still train during warmup. Set `--densification_phase_offset N` to
 shift the ordinary densification and opacity-reset schedule by N iterations;
 without these options the original training behavior is unchanged.
+
+### Soft surface opacity and position attraction
+
+`scripts/run_soft_surface.py` is a separate native 3DGS + AA ablation. Both
+training RGB and inference use ordinary alpha compositing, with hard culling
+off. The full LiDAR scene mesh supplies fixed first-hit depths and local planes
+for two training losses; it is not required to render the resulting PLY.
+
+For each training view, current Gaussian centers are associated with trusted
+local surface interiors. A second native CUDA pass uses white colors for
+surface-associated Gaussians, black colors for the others, and black background.
+All Gaussians remain in the transmittance product. Its image is
+`A_surface(p) = sum_i T_i(p) alpha_i(p) q_i`, where `q_i` is the per-view surface
+membership tag. The loss is the mean squared positive deficit below 0.98,
+weighted by 0.05, over trusted pixels. Geometry and tags are detached in this
+pass: it only trains opacities. Unassociated foreground floaters can lose opacity;
+far background Gaussians are not tagged as foreground coverage. Membership is
+per Gaussian, not an exact per-fragment surface-depth test.
+
+The normal attraction loss applies only to centers within 0.10 scene units of
+a supported first-hit surface, in both camera depth and local plane distance.
+It uses Smooth L1 of signed plane distance divided by 0.10, with beta 0.2 and
+weight 0.01. Tangential motion stays free. Opacity membership uses a narrower
+0.05 band. Distances are scene units (meters if the LiDAR coordinates are metric).
+Missing depths, holes, depth discontinuities, masked pixels and unsupported local
+planes are skipped. Both associations are recomputed each view, including for
+newly cloned/split Gaussians. Neither loss pulls distant rooms onto the front wall.
+
+Defaults: 30k steps; xyz and its Adam state frozen through 7k; 2k linear LR ramp;
+xyz LR endpoints 3.2e-6 to 3.2e-8 before the usual scene-extent multiplier (50x
+below baseline). Ordinary densification runs from 7,600 through 21,900. Periodic
+opacity resets are disabled to preserve the learned barrier. Each loss ramps
+over 1k steps from its start (opacity at step 1, attraction after xyz warmup).
+This soft version reduces rear gradients through learned opacity; it does not
+guarantee zero gradients, freeze rear optimizer momentum, or fill pixels with
+no Gaussian support. The chosen weights and bands are experimental defaults.
+
+Run from a fresh output directory; the baseline provides the keyframe manifest
+and comparison checkpoint, not the initialization weights:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh
+conda activate 3dgs
+python -u scripts/run_soft_surface.py \
+  --source "$SOURCE" --baseline "$BASE" --model "$MODEL" \
+  --scene-geometry "$SCENE_JSON" --gpu 0
+```
+
+For the existing stride-3 floor study, `bash scripts/run_soft_surface.sh 0`
+resolves the original AA baseline and uses a fresh `soft_surface_warm7k_lr50_v1`
+output. It activates `3dgs` itself. Pass `--dry-run` to inspect stages, or
+`--evaluate-only` to retry post-training outputs. Weight flags include
+`--soft-surface-opacity-weight` and `--soft-surface-position-weight`; either can
+be set to zero for a single-term ablation with a separate `--model` directory.
+
+Before training, `scripts/smoke_soft_surface.py` runs actual CUDA mesh-depth,
+opacity-gradient, normal-attraction and rear-gradient-attenuation checks. The
+workflow then trains, evaluates PSNR over every registered frame, renders train
+and held-out GT comparisons, and produces actual/novel trajectory comparison
+videos when a baseline is supplied. Every evaluation uses culling off.
+
+Raw per-view depths are saved in the existing mesh depth cache and reused;
+at most four derived surface maps reside in the GPU LRU cache. No all-view
+Gaussian membership array is saved or loaded. The auxiliary pass follows RGB
+backward to limit peak graph memory. `soft_surface_training.jsonl` logs surface
+coverage, composited opacity, both losses, normal residuals, position LR and
+Gaussian counts before/after population changes every 100 steps. CUDA smoke
+results are saved as `soft_surface_cuda_smoke.json`.

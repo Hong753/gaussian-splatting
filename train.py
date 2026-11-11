@@ -45,6 +45,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     dataset.optimization_settings = vars(opt).copy()
     from scripts.occlusion_options import configure_pipeline, prepare_training_geometry, inference_pipeline
     depth_directory = getattr(dataset, "train_depth_occlusion_dir", "")
+    soft_surface = bool(opt.soft_surface_geometry)
+    if soft_surface:
+        from utils.soft_surface import options as soft_surface_options
+        if (dataset.occlusion_mode != 'off' or depth_directory or opt.surface_mode != 'off' or
+                opt.absgs or opt.optimizer_type != 'default'):
+            raise ValueError('Soft surfaces use native 3DGS, default Adam and ordinary densification; disable hard culling and other surface modes')
+        for name, value in soft_surface_options(opt).items():
+            setattr(dataset, name, value)
+        dataset.soft_surface_opacity_resets = False
+        dataset.occlusion_inference_mode = 'off'
     if (dataset.occlusion_mode != "off" or depth_directory) and opt.optimizer_type != "default":
         raise ValueError("Occlusion culling currently requires the default Adam optimizer")
     if depth_directory and dataset.occlusion_mode != "off":
@@ -119,6 +129,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     elif opt.surface_mode != "off":
         gaussians.initialize_surface(opt.surface_patches, opt.surface_mode, opt.surface_confidence, opt.surface_thickness)
     gaussians.training_setup(opt)
+    soft_regularizer = None
+    if soft_surface:
+        from utils.soft_surface import SoftSurfaceRegularizer
+        soft_regularizer = SoftSurfaceRegularizer(opt, dataset, scene.getTrainCameras())
+        print('Soft surface training: native RGB compositing; opacity-only coverage loss and local normal pull. '
+              'Hard culling and periodic opacity resets are disabled; inference needs no reference mesh.')
     if opt.lidar_depth_weight > 0:
         from utils.sparse_lidar import check_dataset, load_frame, lidar_loss
         check_dataset(opt.lidar_depth_dir, dataset.source_path, scene.getTrainCameras(), dataset.resolution)
@@ -239,6 +255,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if tb_writer and iteration % 100 == 0:
                 tb_writer.add_scalar('train_loss_patches/surface_loss', surface_loss.item(), iteration)
         loss.backward()
+        soft_stats = None
+        if soft_regularizer is not None:
+            # Release the RGB backward graph before the auxiliary native CUDA
+            # pass. Its geometry is detached; growth still uses RGB gradients.
+            soft_loss, soft_stats = soft_regularizer.loss(
+                viewpoint_cam, gaussians, pipe, visibility_filter, iteration)
+            if soft_loss.requires_grad:
+                soft_loss.backward()
+            loss = loss.detach() + soft_loss.detach()
+            del soft_loss
         if iteration <= opt.position_warmup_steps:
             # Do not accumulate Adam moments while the positions are frozen.
             gaussians._xyz.grad = None
@@ -267,6 +293,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     progress["depth coverage"] = f"{100*torch.isfinite(training_tiles).float().mean().item():.1f}%"
                 if surface_match_fraction is not None:
                     progress['surface match'] = f'{100*surface_match_fraction:.1f}%'
+                if soft_stats is not None:
+                    progress['surface alpha'] = f"{soft_stats['surface_opacity_mean'].item():.3f}"
+                    progress['Gaussians'] = f'{len(gaussians.get_xyz):,}'
                 progress_bar.set_postfix(progress)
                 progress_bar.update(10)
             if iteration == opt.iterations:
@@ -310,8 +339,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                 if name != 'iteration':
                                     tb_writer.add_scalar('view_tangent/'+name, value, iteration)
                 
-                if phase_iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and phase_iteration == opt.densify_from_iter):
+                if (not soft_surface and (phase_iteration % opt.opacity_reset_interval == 0 or
+                        (dataset.white_background and phase_iteration == opt.densify_from_iter))):
                     gaussians.reset_opacity()
+
+            if soft_stats is not None and (iteration == 1 or iteration % 100 == 0):
+                import json
+                stats = {key: value.item() if torch.is_tensor(value) else value for key, value in soft_stats.items()}
+                stats.update(iteration=iteration, image=viewpoint_cam.image_name,
+                    gaussians_before=len(radii), gaussians_after=len(gaussians.get_xyz), position_lr=position_lr)
+                with open(os.path.join(scene.model_path, 'soft_surface_training.jsonl'), 'a') as stream:
+                    stream.write(json.dumps(stats) + '\n')
+                if tb_writer:
+                    for key, value in stats.items():
+                        if key not in ('iteration', 'image'):
+                            tb_writer.add_scalar('soft_surface/'+key, value, iteration)
 
             # Optimizer step
             if iteration < opt.iterations:

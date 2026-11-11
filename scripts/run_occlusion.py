@@ -31,6 +31,13 @@ def parser(*, depth_maps=False):
         p.add_argument('--voxel-size', type=float, default=.05)
         p.add_argument('--max-radius', type=float, default=.1)
         p.add_argument('--scene-geometry', type=Path, help='Use a fixed whole-scene scene.json instead of LiDAR patches')
+        p.add_argument('--soft-surface', action='store_true',
+                       help='Use training-only surface opacity and normal attraction, without hard culling')
+        from utils.soft_surface import DEFAULTS as soft_defaults
+        for name, value in soft_defaults.items():
+            if name == 'soft_surface_geometry':
+                continue  # Supplied by --scene-geometry.
+            p.add_argument('--'+name.replace('_', '-'), type=type(value), default=value)
     p.add_argument('--margin', type=float, default=.05)
     p.add_argument('--occlusion-backend', choices=('whole', 'ray'), default='whole')
     p.add_argument('--inference-occlusion', choices=('saved', 'off'), default=None,
@@ -115,13 +122,22 @@ def build_plan(args):
         raise FileNotFoundError('Requested saved iteration is missing')
     schedule = training_schedule(args)
     backend = args.occlusion_backend
+    soft_surface = getattr(args, 'soft_surface', False)
     inference_mode = getattr(args, 'inference_occlusion', None)
     if args.evaluate_only:
         from scripts.eval_all_frames import read_config
         saved_cfg = read_config(model/'cfg_args')
+        saved_soft = bool(saved_cfg.get('soft_surface_geometry'))
+        if soft_surface and not saved_soft:
+            raise ValueError('This checkpoint was not trained with soft surface regularization')
+        soft_surface = saved_soft
         backend = saved_cfg.get('occlusion_backend', 'whole')
         if inference_mode is None:
             inference_mode = saved_cfg.get('occlusion_inference_mode', 'saved')
+    if soft_surface:
+        if args.view_tangent or args.prepare_visibility or inference_mode not in (None, 'off'):
+            raise ValueError('Soft surfaces use ordinary densification, no point-ID visibility preprocessing, and mesh-free inference')
+        inference_mode = 'off'
     inference_mode = inference_mode or 'saved'
     steps = sorted(set(i for i in (7000, args.iterations) if i <= args.iterations))
     train = ['train.py', '-s', str(source), '-m', str(model), '--iterations', str(args.iterations),
@@ -133,6 +149,16 @@ def build_plan(args):
              '--test_iterations', *map(str, steps),
              '--save_iterations', *map(str, steps)]
     scene_geometry = getattr(args, 'scene_geometry', None)
+    soft_options = {}
+    if soft_surface:
+        from utils.soft_surface import options
+        if not args.evaluate_only and not scene_geometry:
+            raise ValueError('--soft-surface requires the full --scene-geometry')
+        soft_options = options(saved_cfg if args.evaluate_only else
+            dict(vars(args), soft_surface_geometry=str(scene_geometry.resolve())))
+        train[train.index('--occlusion_mode')+1] = 'off'
+        for key, value in soft_options.items():
+            train += ['--'+key, str(value)]
     preparation_stages = []
     if args.prepare_visibility and (not scene_geometry or args.evaluate_only):
         raise ValueError('--prepare-visibility requires --scene-geometry and a new training run')
@@ -146,11 +172,11 @@ def build_plan(args):
         if set(json.loads(args.keyframes.read_text())['selected_images']) != set(report['training_images']):
             raise ValueError('Scene fusion and training keyframes differ')
         visibility_path = scene_geometry.resolve().parent/'visibility/metadata.json'
-        visibility = json.loads(visibility_path.read_text()) if visibility_path.is_file() else {}
-        if not visibility.get('complete') and not args.prepare_visibility:
+        visibility = json.loads(visibility_path.read_text()) if not soft_surface and visibility_path.is_file() else {}
+        if not soft_surface and not visibility.get('complete') and not args.prepare_visibility:
             raise ValueError('Finish whole-scene per-view visibility preprocessing and inspect its coverage before training')
         from utils.lidar_occlusion import file_digest
-        if visibility and (visibility['scene_sha256'] != file_digest(scene_geometry) or
+        if not soft_surface and visibility and (visibility['scene_sha256'] != file_digest(scene_geometry) or
                 not set(report['training_images']).issubset(visibility['images'])):
             raise ValueError('Per-view visibility belongs to a different scene or omits training views')
         if args.prepare_visibility:
@@ -162,9 +188,10 @@ def build_plan(args):
                 '--point-cloud', report['point_cloud'], '--resolution', str(args.resolution),
                 '--margin', str(args.margin), '--split', 'all', '--device', 'cuda',
                 '--visibility-backend', 'cuda', '--gpu', args.gpu]))
-        train[train.index('--occlusion_mode')+1] = 'mesh'
-        train += ['--occlusion_geometry', str(scene_geometry.resolve()), '--occlusion_cache',
-                  str(scene_geometry.resolve().parent/'occlusion_depth_cache')]
+        if not soft_surface:
+            train[train.index('--occlusion_mode')+1] = 'mesh'
+            train += ['--occlusion_geometry', str(scene_geometry.resolve()), '--occlusion_cache',
+                      str(scene_geometry.resolve().parent/'occlusion_depth_cache')]
     for key, value in schedule.items():
         train += ['--'+key, str(value)]
     tangent_options = {}
@@ -203,15 +230,23 @@ def build_plan(args):
         from scripts.eval_all_frames import read_config
         cfg = read_config(baseline/'cfg_args')
         if (cfg.get('model_type', '3dgs') != '3dgs' or (baseline/'proxygs_run.json').exists() or
-                cfg.get('train_test_exp', False) or cfg.get('occlusion_mode', 'off') != 'off'):
-            raise ValueError('Baseline must be native 3DGS without exposure compensation or culling')
+                cfg.get('train_test_exp', False) or cfg.get('occlusion_mode', 'off') != 'off' or
+                cfg.get('soft_surface_geometry')):
+            raise ValueError('Baseline must be native 3DGS without exposure compensation, culling or soft surface regularization')
         evaluation(baseline, 'off', 'baseline_off')
         if inference_mode != 'off':
             evaluation(baseline, 'on', 'baseline_on')
         video_root = args.video_output.expanduser().resolve() if args.video_output else model/'comparisons'
+        label = schedule_label(schedule).replace('LiDAR culling',
+            'soft surface opacity + normal pull' if soft_surface else
+            ('fixed scene mesh culling' if scene_geometry else 'LiDAR culling'))
+        if args.view_tangent:
+            label += ' + view-tangent growth'
+        if inference_mode == 'off' and not soft_surface:
+            label += ' | culling during training only'
         for video in ('random', 'actual'):
             command = ['scripts/render.py', '--video', video, '--source', str(source), '--models', str(baseline), str(model),
-                '--labels', '3DGS + AA', schedule_label(schedule).replace('LiDAR culling', 'fixed scene mesh culling' if scene_geometry else 'LiDAR culling') + (' + view-tangent growth' if args.view_tangent else '') + (' | culling during training only' if inference_mode == 'off' else ''),
+                '--labels', '3DGS + AA', label,
                 '--aa', 'on', 'on', '--occlusion', 'off', 'off' if inference_mode == 'off' else 'saved',
                 '--iteration', str(args.iterations), '--gpu', args.gpu, '--in-process', '--width', '1280', '--fps', '30',
                 '--output', str(video_root/video)]
@@ -221,7 +256,8 @@ def build_plan(args):
                 command += ['--actual-poses', 'source']
             stages.append(dict(name=video+'_video', argv=command))
     return dict(source=str(source), model=str(model), gpu=args.gpu, training_schedule=schedule,
-                view_tangent_options=tangent_options, inference_occlusion=inference_mode, stages=stages)
+                view_tangent_options=tangent_options, soft_surface_options=soft_options,
+                inference_occlusion=inference_mode, stages=stages)
 
 
 def invoke(command):
@@ -242,8 +278,8 @@ def invoke(command):
             torch.cuda.empty_cache()
 
 
-def main(argv=None):
-    args = parser().parse_args(argv)
+def main(argv=None, argument_parser=None):
+    args = (argument_parser or parser()).parse_args(argv)
     if args.baseline and not args.keyframes:
         args.keyframes = args.baseline/'keyframes.json'
     plan = build_plan(args)
@@ -263,10 +299,14 @@ def main(argv=None):
             raise RuntimeError('Install requirements-occlusion.txt in the native 3dgs environment first') from exc
     if not args.evaluate_only:
         # Compile/check CUDA before spending time fitting a large cloud.
-        if args.occlusion_backend == 'ray':
-            invoke(['scripts/smoke_ray_occlusion.py', '--gpu', args.gpu])
-        invoke(['scripts/smoke_occlusion.py', '--gpu', args.gpu, '--backend', args.occlusion_backend,
-                *(['--mesh'] if args.scene_geometry else [])])
+        if plan['soft_surface_options']:
+            invoke(['scripts/smoke_soft_surface.py', '--gpu', args.gpu,
+                    '--output', str(Path(plan['model'])/'soft_surface_cuda_smoke.json')])
+        else:
+            if args.occlusion_backend == 'ray':
+                invoke(['scripts/smoke_ray_occlusion.py', '--gpu', args.gpu])
+            invoke(['scripts/smoke_occlusion.py', '--gpu', args.gpu, '--backend', args.occlusion_backend,
+                    *(['--mesh'] if args.scene_geometry else [])])
         if args.view_tangent:
             invoke(['scripts/smoke_view_tangent.py', '--gpu', args.gpu,
                     '--backend', args.occlusion_backend,
