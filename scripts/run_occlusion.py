@@ -238,7 +238,8 @@ def main(argv=None):
         # Compile/check CUDA before spending time fitting a large cloud.
         if args.occlusion_backend == 'ray':
             invoke(['scripts/smoke_ray_occlusion.py', '--gpu', args.gpu])
-        invoke(['scripts/smoke_occlusion.py', '--gpu', args.gpu, *(['--mesh'] if args.scene_geometry else [])])
+        invoke(['scripts/smoke_occlusion.py', '--gpu', args.gpu, '--backend', args.occlusion_backend,
+                *(['--mesh'] if args.scene_geometry else [])])
         if args.view_tangent:
             invoke(['scripts/smoke_view_tangent.py', '--gpu', args.gpu])
     model = Path(plan['model'])

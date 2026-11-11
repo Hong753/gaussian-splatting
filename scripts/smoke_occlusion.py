@@ -11,12 +11,20 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+# At 128px/90deg, the hidden center projects to row 31.5, safely inside the
+# near surface. Row 47.5 touched a tile contaminated by the farther surface
+# through edge padding, so the legacy whole-Gaussian test correctly kept it.
+GAUSSIAN_CENTERS = ((0., -.5, 1.), (0., -1.5, 3.), (0., 1.5, 3.))
+TILE_BOUNDARY_GAUSSIAN = (0., -.75, 3.)
 
-def main():
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpu", default="2")
     parser.add_argument('--mesh', action='store_true', help='Test the whole-scene mesh renderer and native AA culling')
-    args = parser.parse_args()
+    parser.add_argument('--backend', choices=('whole','ray'), default='whole',
+                        help='Exercise the same geometry-to-renderer path as the selected workflow')
+    args = parser.parse_args(argv)
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     import torch
     if not torch.cuda.is_available():
@@ -68,7 +76,12 @@ def main():
 
         pc = GaussianModel(0)
         p = lambda x: torch.nn.Parameter(torch.tensor(x, dtype=torch.float32, device="cuda"))
-        pc._xyz = p([[0, -.5, 1], [0, -.75, 3], [0, 1.5, 3]])
+        centers = list(GAUSSIAN_CENTERS)
+        if args.backend == 'ray':
+            # Preserve the original boundary case: ray clipping must reject
+            # it even when the conservative whole-tile bound cannot.
+            centers[1] = TILE_BOUNDARY_GAUSSIAN
+        pc._xyz = p(centers)
         pc._scaling = p([[math.log(.03)]*3]*3)
         pc._rotation = p([[1, 0, 0, 0]]*3)
         pc._opacity = p([[0]]*3)
@@ -77,9 +90,14 @@ def main():
         pipe = SimpleNamespace(convert_SHs_python=False, compute_cov3D_python=False, debug=False, antialiasing=True)
         bg = torch.zeros(3, device="cuda")
         plain = render(cam, pc, pipe, bg)["render"].detach()
-        configure_pipeline(pipe, dict(occlusion_mode='mesh' if args.mesh else 'lidar', occlusion_geometry=str(geometry), occlusion_cache=tmp))
+        configure_pipeline(pipe, dict(occlusion_mode='mesh' if args.mesh else 'lidar',
+            occlusion_backend=args.backend, occlusion_geometry=str(geometry), occlusion_cache=tmp))
         result = render(cam, pc, pipe, bg)
-        assert result["occlusion_keep"].tolist() == [True, False, True]
+        actual = result['occlusion_keep'].tolist()
+        assert actual == [True, False, True], f'{args.backend} culling: expected [True, False, True], got {actual}'
+        if args.backend == 'ray':
+            flags = result['occlusion_fragment_flags'].tolist()
+            assert flags == [1, 2, 1], f'Expected contributing/blocked/contributing CUDA flags, got {flags}'
         assert result["radii"][1].item() == 0
         assert not torch.allclose(plain, result["render"])
         result["render"].square().sum().backward()
@@ -88,7 +106,7 @@ def main():
             assert gradient is not None and torch.count_nonzero(gradient[1]).item() == 0, attribute
         assert torch.count_nonzero(pc._features_dc.grad[[0,2]]).item() > 0
         assert torch.count_nonzero(result["viewspace_points"].grad[1]).item() == 0
-        print(f"CUDA smoke test passed: {'scene mesh' if args.mesh else 'LiDAR'} depth/orientation, unseen camera pose, AA rendering, and zero hidden gradients.")
+        print(f"CUDA smoke test passed ({args.backend} backend): {'scene mesh' if args.mesh else 'LiDAR'} depth/orientation, unseen camera pose, AA rendering, and zero hidden gradients.")
 
 
 if __name__ == "__main__":

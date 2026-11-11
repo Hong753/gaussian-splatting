@@ -33,7 +33,7 @@ python -m pip install --no-build-isolation ./submodules/diff-gaussian-rasterizat
 python -m pip install -r requirements-scene-occlusion.txt
 python -m pip install --no-build-isolation -r requirements-occlusion.txt
 python scripts/smoke_ray_occlusion.py --gpu "$ray_gpu" --output "$ray_output/cuda_smoke.json"
-python scripts/smoke_occlusion.py --mesh --gpu "$ray_gpu"
+python scripts/smoke_occlusion.py --mesh --backend ray --gpu "$ray_gpu"
 conda activate da3-depth
 python -m pip install -r requirements-da3.txt
 python scripts/check_da3_environment.py --gpu "$ray_gpu"

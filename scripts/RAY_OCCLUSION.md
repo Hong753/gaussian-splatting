@@ -26,7 +26,13 @@ bash scripts/inspect_ray_surface.sh 5 \
 ```
 
 The wrapper builds the separate CUDA extension and runs the real GPU wall/hole
-and gradient checks **before** preprocessing. It reuses the cached DA3 owning
+and gradient checks **before** preprocessing. It also runs
+`smoke_occlusion.py --mesh --backend ray` to check the full CUDA triangle-depth
+provider and ray compositor together, including a moved camera and zero hidden
+gradients. The standalone geometry smoke defaults to `--backend whole` for
+legacy runs; its hidden test point is inside tiles covered by the near surface.
+The ray backend retains the original tile-boundary case and must block it.
+The preview reuses the cached DA3 owning
 group (up to 38 views with the current 40-view budget), validates every group
 image, and fuses those surfaces into a diagnostic TSDF mesh. Existing single-view
 previews did not fuse the other group views. No extra DA3 forward is necessary

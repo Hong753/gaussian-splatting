@@ -29,6 +29,28 @@ def camera(size=256, translation=(0, 0, 0)):
 
 
 class OcclusionTests(unittest.TestCase):
+    def test_mesh_smoke_hidden_point_is_inside_uncontaminated_tiles(self):
+        from scripts.smoke_occlusion import GAUSSIAN_CENTERS, TILE_BOUNDARY_GAUSSIAN
+        from utils.occlusion_depth import pixel_bounds
+        depth = torch.full((128,128),4.)
+        depth[:64] = 2.
+        tiles = tile_maxima(depth*1.05,edge_pixels=1)
+        points = torch.tensor(GAUSSIAN_CENTERS)
+        keep = conservative_keep(camera(128),points,torch.full_like(points,.03),
+            torch.tensor([[1.,0,0,0]]).repeat(3,1),tiles)
+        self.assertEqual(keep.tolist(),[True,False,True])
+        # The original fixture was not fully occluded according to the tile
+        # bound: tile row 3 includes the 4m depth step via one-pixel padding.
+        boundary = torch.tensor([TILE_BOUNDARY_GAUSSIAN])
+        keep,details = conservative_keep(camera(128),boundary,torch.full_like(boundary,.03),
+            torch.tensor([[1.,0,0,0]]),tiles,return_details=True)
+        self.assertEqual(keep.tolist(),[True])
+        self.assertAlmostEqual(float(details['surface_bound_z'][0]),4.2,places=5)
+        # Full-pixel ray clipping still has a valid near-wall cutoff here.
+        cutoff = pixel_bounds(depth*1.05,edge_pixels=1)+.05
+        self.assertAlmostEqual(float(cutoff[48,64]),2.15,places=5)
+        self.assertLess(float(cutoff[48,64]),float(boundary[0,2]))
+
     def test_wall_front_hidden_near_surface_and_large_extent(self):
         points = torch.tensor([[0., 0., 1.], [0., 0., 3.], [0., 0., 2.05], [0., 0., 3.], [0., 0., -.1]])
         scales = torch.full_like(points, .02)
