@@ -92,36 +92,46 @@ class LidarDepthCache:
 
     def surface(self, camera, device, radius_pixels=3, max_radius=.1):
         """Uninflated first-hit LiDAR depth for local tangent neighborhoods."""
-        import torch
         from utils.view_tangent import camera_intrinsics, surface_frame
         signature = camera_signature(camera, self.edge_pixels)
         key = (signature, str(device), radius_pixels, max_radius)
         if key not in self.surface_memory:
-            path = self.directory / (signature + '.depth.npz')
-            if path.is_file():
-                with np.load(path, allow_pickle=False) as data:
-                    array = data['depth']
-                if (array.shape != (camera.image_height, camera.image_width) or
-                        np.isnan(array).any() or np.any(array <= 0)):
-                    raise ValueError(f'Invalid raw LiDAR surface depth: {path}')
-                depth = torch.as_tensor(array, device=device, dtype=torch.float32)
-            else:
-                if self.renderer is None:
-                    self.renderer = LidarDepthRenderer(self.geometry, device)
-                depth = self.renderer(camera)
-                self.directory.mkdir(parents=True, exist_ok=True)
-                temporary = path.with_name(path.stem + f'.{os.getpid()}.{uuid.uuid4().hex}.tmp.npz')
-                try:
-                    np.savez_compressed(temporary, depth=depth.cpu().numpy())
-                    os.replace(temporary, path)
-                finally:
-                    temporary.unlink(missing_ok=True)
+            import torch
+            depth = self.raw_depth(camera, device)
             self.surface_memory[key] = surface_frame(depth, torch.isfinite(depth),
                 camera_intrinsics(camera, device), radius_pixels, max_radius)
             while len(self.surface_memory) > self.memory_views:
                 self.surface_memory.popitem(last=False)
         self.surface_memory.move_to_end(key)
         return self.surface_memory[key]
+
+    def raw_depth(self, camera, device):
+        import torch
+        path = self.directory / (camera_signature(camera, self.edge_pixels) + '.depth.npz')
+        if path.is_file():
+            with np.load(path, allow_pickle=False) as data:
+                array = data['depth']
+            if (array.shape != (camera.image_height, camera.image_width) or
+                    np.isnan(array).any() or np.any(array <= 0)):
+                raise ValueError(f'Invalid raw LiDAR surface depth: {path}')
+            return torch.as_tensor(array, device=device, dtype=torch.float32)
+        if self.renderer is None:
+            self.renderer = LidarDepthRenderer(self.geometry, device)
+        depth = self.renderer(camera)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.stem + f'.{os.getpid()}.{uuid.uuid4().hex}.tmp.npz')
+        try:
+            np.savez_compressed(temporary, depth=depth.cpu().numpy())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return depth
+
+    def diagnostic_frame(self, camera, device):
+        from utils.view_tangent import camera_intrinsics
+        depth = self.raw_depth(camera, device).cpu().numpy()
+        return dict(depth=depth, valid=np.isfinite(depth) & (depth > 0),
+                    intrinsics=camera_intrinsics(camera, 'cpu').numpy(), report={})
 
     def tiles(self, camera, device):
         import torch

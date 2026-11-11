@@ -5,6 +5,74 @@ calibration and training resolution, and its saved LiDAR or DA3 culling settings
 It uses the exact `occlusion_keep` returned by `gaussian_renderer.render`.
 It does not optimize weights, modify checkpoints, or interrupt training jobs.
 
+## Compare LiDAR patches with LiDAR-calibrated dense depth
+
+The old LiDAR-only run uses isolated planar patches, not DA3 depth. Its blue
+points visualize only those accepted patches' first-hit depths; green points
+are retained raster candidates, not physically verified visible points. A small
+patch-retention fraction does not establish adequate image coverage. One unknown
+pixel invalidates its 16x16 tile, and a Gaussian is kept if its conservative
+footprint includes any such unknown tile. Sparse wall coverage can therefore
+make culling ineffective even when the gradient masking mechanism is correct.
+
+To check this on identical saved weights, stop the previous inspector with
+Ctrl+C and run (use an available GPU):
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh
+conda activate 3dgs
+cd /home/sequor_vfm/gaussian-splatting
+git pull --ff-only origin experiment/my-3dgs-changes
+bash scripts/inspect_da3_occlusion.sh 5 \
+  /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_occlusion
+```
+
+The script explicitly activates `da3-depth`, prepares three distributed training
+views with their usual neighboring context, then activates `3dgs` for the viewer.
+The depth prediction is calibrated to the checkpoint's exact initial LiDAR PLY,
+using nearest projected anchors, held-out calibration residuals, confidence,
+depth-boundary and multiview consistency checks. These checks reduce visibility
+errors in the merged cloud; they do not replace per-frame LiDAR visibility.
+`DA3_DEPTH_DIR` overrides the cache directory. An optional third positional
+argument selects one exact training image instead of three distributed views.
+
+Open `http://211.172.247.108:8082` from the remote client. The wrapper binds
+`0.0.0.0`; `OCCLUSION_INSPECTOR_PORT` changes the port. It does not start training.
+Inspect-only caches remain incomplete and are rejected by training. Running
+the ordinary preparation without `--inspect-views`/`--inspect-image` later resumes
+the same cache and processes all keyframes.
+
+If the calibrated cache already exists, the direct command is:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh
+conda activate 3dgs
+cd /home/sequor_vfm/gaussian-splatting
+python -u scripts/inspect_occlusion.py \
+  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_occlusion \
+  --depth-dir /data/3dgs_outputs/orange_4F/1_full/da3_lidar_depth_stride3 \
+  --gpu 5 --host 0.0.0.0 --port 8082 --check-gradients
+```
+
+With `--depth-dir`, the inspector computes both references on the **same saved
+checkpoint and exact camera**. The default displayed reference is DA3; the
+dropdown switches between it and the saved LiDAR patches without reloading
+weights. Reports identify DA3 as a diagnostic override, not a change to the
+checkpoint's training history. Image gradients are checked for the selected
+reference; choose another reference and click **Check image gradients** to test
+that source too. Culling decisions and coverage are computed for both sources.
+
+The comparison table reports trusted pixel coverage, usable tile coverage, and
+the fraction of OFF raster candidates culled. Retained candidates are separated
+into missing depth coverage, overlap with depth/margin, and those outside the
+conservative test. **Show reference surface only** hides Gaussian markers.
+Additional 2D panels show raw depth, trusted coverage over GT, usable tiles, and
+LiDAR anchor agreement. The coverage image uses green for usable tiles, blue for
+accepted pixels lost to whole-tile checks, and black for unknown/rejected pixels.
+This panel's colors are separate from the 3D Gaussian legend.
+
+## Inspect only the reference saved with a run
+
 ```bash
 source /opt/anaconda3/etc/profile.d/conda.sh
 conda activate 3dgs
@@ -82,7 +150,9 @@ substantial fraction of the Gaussians intersecting the selected view.
 Each inspected view writes into
 `MODEL/occlusion_diagnostics/iteration_N/IMAGE_HASH/`:
 
-- `index.html`, six full-resolution PNGs and `summary.json`.
+- Separate `saved/` and, when supplied, `da3/` subdirectories. Each contains
+  `index.html`, full-resolution comparison/coverage PNGs and `summary.json`.
+  Neither source overwrites the other's report.
 - `labels.npy`: one uint8 label per original checkpoint PLY row (0 other,
   1 active, 2 culled); no sampling. `summary.json` records the checkpoint SHA256.
 - `occlusion_tiles.npy`: the actual bounds used for the selected camera.

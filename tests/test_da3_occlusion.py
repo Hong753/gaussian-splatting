@@ -71,9 +71,27 @@ class DA3Tests(unittest.TestCase):
                 stack.enter_context(patch.dict(sys.modules, {
                     'depth_anything_3.api': SimpleNamespace(DepthAnything3=FakeModel),
                     'huggingface_hub': SimpleNamespace(model_info=lambda *a, **k: SimpleNamespace(sha='fixed-revision'))}))
+                self.assertEqual(prepare_da3_occlusion.main(args+['--inspect-views', '1']), 0)
+                partial = json.loads((root/'output/metadata.json').read_text())
+                self.assertFalse(partial['complete'])
+                self.assertEqual(partial['summary']['frames'], 1)
+                cams = [record_camera(records[n], -1, 'cpu') for n in names]
+                with self.assertRaisesRegex(ValueError, 'incomplete'):
+                    TrainingDepthCache(root/'output', root, cams, -1, point_cloud=cloud)
+                diagnostic = TrainingDepthCache(root/'output', root, cams, -1,
+                                                point_cloud=cloud, allow_partial=True)
+                self.assertEqual(diagnostic.available_images, {names[1]})
+                frame = diagnostic.diagnostic_frame(cams[1], 'cpu')
+                self.assertIn('anchors', frame)
+                self.assertGreater(frame['valid'].mean(), .1)
+                copied_cloud = root/'copied_input.ply'
+                copied_cloud.write_bytes(cloud.read_bytes())
+                copied_args = args[:]
+                copied_args[copied_args.index('--point-cloud')+1] = str(copied_cloud)
+                self.assertEqual(prepare_da3_occlusion.main(copied_args+['--inspect-views', '1']), 0)
                 self.assertEqual(prepare_da3_occlusion.main(args), 0)
                 self.assertEqual(prepare_da3_occlusion.main(args), 0)
-            self.assertEqual(len(calls), 1)  # Complete preparation is reused.
+            self.assertEqual(len(calls), 2)  # One preview, one full batch; both reused.
             metadata = json.loads((root/'output/metadata.json').read_text())
             self.assertTrue(metadata['complete'])
             self.assertGreater(metadata['summary']['mean_reliable_tile_fraction'], .1)

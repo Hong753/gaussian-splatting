@@ -702,6 +702,10 @@ For per-image 3D inspection of the actual native culling mask, use
 `scripts/inspect_occlusion.py --model MODEL --gpu 5 --check-gradients`.
 It displays complete active/culled Gaussian populations, reference depth and
 camera geometry, ON/OFF renders, and an optional native image-gradient check.
+Use `bash scripts/inspect_da3_occlusion.sh GPU MODEL` to prepare three training
+views and compare the saved patches against LiDAR-calibrated DA3 depth on the
+same checkpoint. The viewer shows reference coverage, missing-depth retention,
+and a reference-only display. This diagnostic does not start training.
 See [OCCLUSION_INSPECTOR.md](OCCLUSION_INSPECTOR.md) for setup and interpretation.
 
 To stop the two earlier all-frame rendering jobs on their server, the scoped

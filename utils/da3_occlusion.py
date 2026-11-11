@@ -128,10 +128,11 @@ def training_tiles(depth, valid, predicted_k, camera, relative_margin=.05, edge_
 
 class TrainingDepthCache:
     """Explicit training-only input; ordinary render calls never consult this cache."""
-    def __init__(self, directory, source, cameras, resolution, edge_pixels=1, memory_views=4, point_cloud=None):
+    def __init__(self, directory, source, cameras, resolution, edge_pixels=1, memory_views=4, point_cloud=None,
+                 allow_partial=False):
         self.root = Path(directory).expanduser().resolve()
         report = json.loads((self.root/'metadata.json').read_text())
-        if (report.get('version') != VERSION or not report.get('complete') or
+        if (report.get('version') != VERSION or (not report.get('complete') and not allow_partial) or
                 Path(report['source']).resolve() != Path(source).resolve() or
                 report['resolution'] != resolution or report['edge_pixels'] != edge_pixels):
             raise ValueError('DA3 cache is incomplete or has incompatible source/resolution/edge padding')
@@ -142,13 +143,31 @@ class TrainingDepthCache:
             from utils.lidar_occlusion import file_digest
             if file_digest(point_cloud) != report.get('point_cloud_sha256'):
                 raise ValueError('DA3 calibration cloud differs from the Gaussian initialization cloud')
+        self.report = report
         self.signatures = report['camera_signatures']
         self.edge_pixels, self.memory_views = edge_pixels, memory_views
         self.memory = OrderedDict()
         self.surface_memory = OrderedDict()
+        self.available_images = set()
         for camera in cameras:
-            if not (self.root/'frames'/frame_filename(camera.image_name)).is_file():
+            if (self.root/'frames'/frame_filename(camera.image_name)).is_file():
+                self.available_images.add(camera.image_name)
+            elif not allow_partial:
                 raise FileNotFoundError(f'Missing DA3 frame: {camera.image_name}')
+        if not self.available_images:
+            raise ValueError('DA3 cache has no prepared frames; run prepare_da3_occlusion.py first')
+
+    def diagnostic_frame(self, camera, device):
+        """Expose raw prediction, trusted mask and calibration anchors separately."""
+        self.tiles(camera, device)  # Same identity validation as training.
+        with np.load(self.root/'frames'/frame_filename(camera.image_name), allow_pickle=False) as data:
+            result = {key: data[key].copy() for key in ('depth', 'valid', 'intrinsics')}
+            result['report'] = json.loads(str(data['report'])) if 'report' in data else {}
+        path = self.root/'anchors'/frame_filename(camera.image_name)
+        if path.is_file():
+            with np.load(path, allow_pickle=False) as data:
+                result['anchors'] = {key: data[key].copy() for key in ('u', 'v', 'z')}
+        return result
 
     def tiles(self, camera, device):
         import torch

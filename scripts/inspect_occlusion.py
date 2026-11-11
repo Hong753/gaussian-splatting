@@ -35,6 +35,9 @@ class InspectorViewer:
                          'A raster footprint does not guarantee a final pixel contribution.')
         self.selection = gui.add_dropdown('Image', tuple(backend.names),
             initial_value=backend.args.image or backend.names[len(backend.names)//2])
+        self.reference = gui.add_dropdown('Occluding reference', tuple(backend.source_options.values()),
+            initial_value=backend.source_options[backend.source_key])
+        self.comparison = gui.add_markdown('')
         self.load = gui.add_button('Inspect image')
         self.probe = gui.add_button('Check image gradients')
         self.status = gui.add_markdown('Choose an image to inspect.')
@@ -48,6 +51,7 @@ class InspectorViewer:
             self.point_size = gui.add_slider('Center size (scene units)', min=.001, max=.06, step=.001, initial_value=.012)
             self.view_camera = gui.add_button('Go to image camera')
             self.view_side = gui.add_button('Side view')
+            self.reference_only = gui.add_button('Show reference surface only')
             self.export = gui.add_button('Export all green + red centers to PLY')
             gui.add_markdown('Hide green to inspect red points behind surfaces; orbit to view their depth. '
                              'Depth surface is sampled every 3 pixels; Gaussian layers are complete at cap 0.')
@@ -60,16 +64,22 @@ class InspectorViewer:
         with gui.add_folder('Image comparisons'):
             for key, label in (('gt', 'Actual image'), ('culling_off', 'Culling OFF'), ('culling_on', 'Culling ON'),
                                ('difference', 'Absolute difference x10'), ('centers', 'Centers over GT (no z-buffer)'),
-                               ('depth', 'Conservative depth bounds; black = unknown')):
+                               ('depth', 'Conservative depth bounds; black = unknown'),
+                               ('reference_raw', 'Raw reference depth (may include rejected pixels)'),
+                               ('reference_trusted', 'Trusted depth coverage over GT'),
+                               ('coverage', 'Green usable tiles / blue trusted pixels / black unknown'),
+                               ('anchors', 'LiDAR anchors: green agree / red disagree / gold untrusted')):
                 self.images[key] = gui.add_image(np.zeros((32, 32, 3), np.uint8), label=label)
         self.load.on_click(lambda _: self.inspect(self.selection.value))
         self.probe.on_click(lambda _: self.inspect(self.backend.current['name'] if self.ready else self.selection.value, True))
+        self.reference.on_update(lambda _: self.inspect(self.backend.current['name'] if self.ready else self.selection.value))
         for name, handle in self.layers.items():
             handle.on_update(lambda _, name=name: self.update_layer(name))
         self.limit.on_update(lambda _: self.update_layers())
         self.point_size.on_update(lambda _: self.update_layers())
         self.view_camera.on_click(lambda event: self.set_camera(event.client, side=False))
         self.view_side.on_click(lambda event: self.set_camera(event.client, side=True))
+        self.reference_only.on_click(lambda _: self.show_reference_only())
         self.inspect_button.on_click(lambda _: self.inspect_gaussian(int(self.identifier.value)))
         self.export.on_click(lambda _: self.export_ply())
         server.on_client_connect(lambda client: self.set_camera(client, side=True))
@@ -79,14 +89,14 @@ class InspectorViewer:
         def run():
             if not self.lock.acquire(blocking=False):
                 return
-            self.load.disabled = self.probe.disabled = self.export.disabled = self.inspect_button.disabled = True
+            self.load.disabled = self.probe.disabled = self.export.disabled = self.inspect_button.disabled = self.reference.disabled = True
             try:
                 action()
             except Exception as exc:
                 self.status.content = f'**Failed:** {exc}'
                 traceback.print_exc()
             finally:
-                self.load.disabled = self.probe.disabled = self.export.disabled = self.inspect_button.disabled = False
+                self.load.disabled = self.probe.disabled = self.export.disabled = self.inspect_button.disabled = self.reference.disabled = False
                 self.lock.release()
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
@@ -96,19 +106,36 @@ class InspectorViewer:
         def action():
             self.ready = False
             self.status.content = f'Computing native culling {"and image gradients " if gradients else ""}for `{name}`…'
-            result = self.backend.analyze(name, gradients)
+            source = next(key for key, label in self.backend.source_options.items() if label == self.reference.value)
+            result = self.backend.analyze(name, gradients, source)
             self.ready = True
             for node in self.nodes.values(): node.remove()
             self.nodes.clear()
             self.rows.clear()
-            for key, (_, value) in result['images'].items(): self.images[key].image = thumbnail(value)
+            for key, handle in self.images.items():
+                handle.image = thumbnail(result['images'][key][1]) if key in result['images'] else np.zeros((32, 32, 3), np.uint8)
             counts = result['summary']['counts']
             self.counts.content = '\n'.join(f'- {name}: **{counts[name]:,}**' for name in ('active', 'culled', 'other', 'total'))
             summary = result['summary']
+            comparison = summary.get('reference_comparison', {})
+            lines = ['| Reference | Trusted pixels | Usable tiles | Culled candidates |',
+                     '| --- | ---: | ---: | ---: |']
+            for row in comparison.values():
+                lines.append(f"| {row['culling_source']} | {row['coverage']['trusted_pixel_fraction']:.1%} | "
+                             f"{row['reliable_tile_fraction']:.1%} | {row['culled_fraction_raster_candidates']:.1%} |")
+            self.comparison.content = '\n'.join(lines) if comparison else ''
             message = (f"**{name} — iteration {self.backend.iteration}**\n\n"
+                f"**Reference: {summary.get('culling_source', self.reference.value)}**\n\n"
                 f"Depth-culled: {100*summary['culled_fraction_all']:.2f}% of all Gaussians; "
                 f"{100*summary['culled_fraction_raster_candidates']:.2f}% of OFF raster candidates. "
                 f"Reliable depth tiles: {100*summary['reliable_tile_fraction']:.1f}%.\n\n")
+            if summary.get('diagnostic_override'):
+                message += f"Diagnostic override; this checkpoint was trained with **{summary['saved_training_reference']}**.\n\n"
+            if summary.get('candidate_reasons'):
+                message += 'OFF raster candidates:\n\n'+'\n'.join(
+                    f'- {key.replace("_", " ")}: **{value:,}**' for key, value in summary['candidate_reasons'].items())+'\n\n'
+                if not summary['candidate_reasons']['culled']:
+                    message += '**No raster candidates were removed for this view.**\n\n'
             if summary['gradient_probe']:
                 message += summary['gradient_probe']['verdict']+'\n\n'
             else:
@@ -127,6 +154,11 @@ class InspectorViewer:
 
     def update_layers(self):
         for name in self.layers: self.update_layer(name)
+
+    def show_reference_only(self):
+        for name, handle in self.layers.items():
+            handle.value = name == 'surface'
+        self.update_layers()
 
     def update_layer(self, name):
         if not self.ready:
@@ -221,6 +253,10 @@ def parser():
     p.add_argument('--iteration', type=int, default=-1, help='Latest saved PLY by default')
     p.add_argument('--image', help='Exact registered image name; otherwise the middle training image')
     p.add_argument('--split', choices=('train', 'eval', 'all'), default='train')
+    p.add_argument('--depth-dir', type=Path,
+                   help='Compare a LiDAR-calibrated DA3 cache against the saved reference on the same checkpoint')
+    p.add_argument('--reference', choices=('saved', 'da3'),
+                   help='Initial displayed reference; defaults to DA3 when --depth-dir is supplied')
     p.add_argument('--gpu', default='5')
     p.add_argument('--port', type=int, default=8082)
     p.add_argument('--host', default='127.0.0.1')
@@ -251,7 +287,7 @@ def main(argv=None):
     server = viser.ViserServer(host=args.host, port=args.port, label='GS Occlusion Inspector')
     viewer = InspectorViewer(server, backend, args.max_points)
     viewer.inspect(name, args.check_gradients)
-    print(f'Open http://127.0.0.1:{server.get_port()} on the GPU host (or forward this port over SSH).', flush=True)
+    print(f'Listening on {args.host}:{server.get_port()}; use this host IP for a remote connection when bound to 0.0.0.0.', flush=True)
     try:
         while True: time.sleep(1)
     except KeyboardInterrupt:

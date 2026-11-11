@@ -7,7 +7,7 @@ import numpy as np
 from scripts.view_comparisons import model_info, image_id
 from scripts.eval_all_frames import choose_iteration
 from utils.occlusion_diagnostics import (classify, depth_points, depth_rgb,
-                                         projected_overlay, write_report)
+                                         projected_overlay, write_report, reference_panels, reason_counts)
 
 PARAMETERS = ('_xyz', '_opacity', '_scaling', '_rotation', '_features_dc', '_features_rest')
 
@@ -67,9 +67,10 @@ class InspectorBackend:
             raise ValueError('This diagnostic supports native 3DGS checkpoints')
         self.iteration, self.ply = choose_iteration(self.spec['path'], args.iteration)
         self.depth_dir = self.cfg.get('train_depth_occlusion_dir', '')
-        self.is_da3 = bool(self.depth_dir)
+        override = getattr(args, 'depth_dir', None)
+        self.is_da3 = bool(self.depth_dir or override)
         if not self.is_da3 and self.cfg.get('occlusion_mode', 'off') != 'lidar':
-            raise ValueError('Choose a trained LiDAR or DA3 occlusion run with saved culling settings')
+            raise ValueError('Choose a LiDAR/DA3 run, or pass --depth-dir for diagnostic culling on any native checkpoint')
         self.names = sorted(self.spec['splits'][args.split])
         if self.is_da3:
             self.names = [n for n in self.names if n in self.spec['splits']['train']]
@@ -92,22 +93,43 @@ class InspectorBackend:
         aa = self.cfg.get('antialiasing', True)
         common = dict(convert_SHs_python=False, compute_cov3D_python=False, debug=False, antialiasing=aa)
         self.pipe, self.off_pipe = SimpleNamespace(**common), SimpleNamespace(**common)
-        configure_pipeline(self.pipe, self.cfg)
+        # Always pass the selected depth explicitly to the unchanged renderer.
+        # This prevents saved LiDAR settings silently overriding a DA3 selection.
+        configure_pipeline(self.pipe, {**self.cfg, 'occlusion_mode': 'off'})
         configure_pipeline(self.off_pipe, {**self.cfg, 'occlusion_mode': 'off'})
-        if self.is_da3:
+        self.providers, self.source_options = {}, {}
+        self.saved_reference = ('LiDAR-calibrated DA3' if self.depth_dir else
+            'LiDAR patches' if self.cfg.get('occlusion_mode') == 'lidar' else 'none')
+        if self.depth_dir or override:
             from utils.da3_occlusion import TrainingDepthCache
-            self.provider = TrainingDepthCache(self.depth_dir, self.cfg['source_path'],
-                [SimpleNamespace(image_name=n) for n in self.spec['splits']['train']],
-                self.cfg.get('resolution', -1), self.pipe.occlusion_edge_pixels,
-                point_cloud=self.spec['path']/'input.ply')
-        else:
+            def da3_provider(path, partial=False):
+                return TrainingDepthCache(path, self.cfg['source_path'],
+                    [SimpleNamespace(image_name=n) for n in self.spec['splits']['train']],
+                    self.cfg.get('resolution', -1), self.pipe.occlusion_edge_pixels,
+                    point_cloud=self.spec['path']/'input.ply', allow_partial=partial)
+        if self.depth_dir:
+            self.providers['saved'] = da3_provider(self.depth_dir)
+            self.source_options['saved'] = 'LiDAR-calibrated DA3 used in training'
+        elif self.cfg.get('occlusion_mode') == 'lidar':
             from utils.occlusion_depth import LidarDepthCache
-            self.provider = LidarDepthCache(self.pipe.occlusion_geometry, self.pipe.occlusion_cache,
-                                           self.pipe.occlusion_edge_pixels)
-            self.pipe._occlusion_provider = self.provider
+            self.providers['saved'] = LidarDepthCache(self.pipe.occlusion_geometry, self.pipe.occlusion_cache,
+                                                    self.pipe.occlusion_edge_pixels)
+            self.source_options['saved'] = 'LiDAR patches used in training'
+        if override:
+            self.providers['da3'] = da3_provider(override, partial=True)
+            self.source_options['da3'] = 'LiDAR-calibrated DA3 (diagnostic override)'
+        for provider in self.providers.values():
+            if hasattr(provider, 'available_images'):
+                self.names = [n for n in self.names if n in provider.available_images]
+        if not self.names or (args.image and args.image not in self.names):
+            raise ValueError('No matching prepared DA3 image; prepare --inspect-image for the desired training view')
+        self.source_key = getattr(args, 'reference', None) or ('da3' if override else 'saved')
+        if self.source_key not in self.providers:
+            raise ValueError('Selected reference is unavailable; --reference da3 requires --depth-dir')
         self.background = torch.tensor([1., 1., 1.] if self.cfg.get('white_background') else [0., 0., 0.], device='cuda')
         self.root = args.output or self.spec['path']/'occlusion_diagnostics'/f'iteration_{self.iteration}'
         self.current = None
+        self.views = {}
         print(f'{len(self.xyz):,} Gaussians; {len(self.names):,} selectable images; AA={aa}', flush=True)
 
     def camera(self, name):
@@ -121,7 +143,7 @@ class InspectorBackend:
 
     def render_state(self, camera, tiles, enabled, check_gradients=False, hidden=None):
         torch = self.torch
-        kwargs = dict(occlusion_tiles=tiles) if enabled and self.is_da3 else {}
+        kwargs = dict(occlusion_tiles=tiles) if enabled else {}
         try:
             for parameter in self.parameters:
                 parameter.requires_grad_(check_gradients)
@@ -154,24 +176,66 @@ class InspectorBackend:
             for parameter in self.parameters:
                 parameter.requires_grad_(False)
 
-    def analyze(self, name, check_gradients=False):
+    def analyze(self, name, check_gradients=False, source=None):
+        source = source or self.source_key
+        if source not in self.providers or name not in self.names:
+            raise ValueError('Image or reference is not available')
+        self.source_key = source
+        if self.current is not None and self.current['name'] == name and not check_gradients:
+            self.current = self.views[source]
+            return self.current
+        self.current, self.views = None, {}
+        camera = self.camera(name)
+        off, radii_off, _, _ = self.render_state(camera, None, False)
+        for key in self.providers:
+            self.views[key] = self.analyze_source(camera, off, radii_off, key, check_gradients and key == source)
+        comparison = {key: {k: v for k, v in view['summary'].items() if k in (
+            'culling_source', 'diagnostic_override', 'coverage', 'candidate_reasons', 'counts',
+            'reliable_tile_fraction', 'culled_fraction_raster_candidates', 'psnr_db', 'gradient_probe')}
+            for key, view in self.views.items()}
+        for view in self.views.values():
+            view['summary']['reference_comparison'] = comparison
+            write_report(view['directory'], view['summary'], view['images'])
+        self.current = self.views[source]
+        self.torch.cuda.empty_cache()
+        return self.current
+
+    def decision_counts(self, camera, tiles, keep, radii_off):
+        """Bounded scratch even for tens of millions of checkpoint Gaussians."""
+        from utils.occlusion_culling import conservative_keep
+        counts = {}
+        chunk = self.pipe.occlusion_chunk_size
+        with self.torch.no_grad():
+            for start in range(0, len(keep), chunk):
+                sl = slice(start, start+chunk)
+                tested, info = conservative_keep(camera, self.model.get_xyz[sl], self.model._scaling[sl].exp(),
+                    self.model._rotation[sl], tiles, self.pipe.occlusion_margin, self.pipe.occlusion_sigma,
+                    chunk, return_details=True)
+                if not np.array_equal(tested.cpu().numpy(), keep[sl]):
+                    raise RuntimeError('Diagnostic reasons disagree with the native renderer mask')
+                row = reason_counts(keep[sl], info['reliable'].cpu().numpy(),
+                                    info['surface_bound_z'].cpu().numpy(), radii_off[sl])
+                for key, value in row.items(): counts[key] = counts.get(key, 0)+value
+        return counts
+
+    def analyze_source(self, camera, off, radii_off, source, check_gradients=False):
         from utils.view_tangent import camera_intrinsics
         from utils.image_utils import psnr
         torch = self.torch
-        if name not in self.names:
-            raise ValueError('Image is not in the available diagnostic split')
-        camera = self.camera(name)
-        tiles = self.provider.tiles(camera, self.model.get_xyz.device)
-        print(f'Inspecting {name}; native resolution {camera.image_width}x{camera.image_height}', flush=True)
+        name, provider = camera.image_name, self.providers[source]
+        tiles = provider.tiles(camera, self.model.get_xyz.device)
+        print(f'Inspecting {name}: {self.source_options[source]}; {camera.image_width}x{camera.image_height}', flush=True)
         on, radii_on, keep, on_grad = self.render_state(camera, tiles, True, check_gradients)
-        hidden = torch.as_tensor(~keep, device=self.model.get_xyz.device)
-        off, radii_off, _, off_grad = self.render_state(camera, tiles, False, check_gradients, hidden)
+        off_grad = None
+        if check_gradients:
+            hidden = torch.as_tensor(~keep, device=self.model.get_xyz.device)
+            off, radii_off, _, off_grad = self.render_state(camera, tiles, False, True, hidden)
         labels, counts = classify(keep, radii_on, radii_off)
         w2c = camera.world_view_transform.detach().cpu().numpy().T
         c2w = np.linalg.inv(w2c)
         k = camera_intrinsics(camera, 'cpu').numpy()
-        surface = self.provider.surface(camera, self.model.get_xyz.device)
-        cloud = depth_points(surface['depth'].cpu().numpy(), surface['intrinsic'].cpu().numpy(), c2w)
+        frame = provider.diagnostic_frame(camera, self.model.get_xyz.device)
+        cloud = depth_points(np.where(frame['valid'], frame['depth'], 0), frame['intrinsics'], c2w)
         rgb = lambda t: (t.detach().cpu().permute(1, 2, 0).numpy()*255).round().clip(0, 255).astype(np.uint8)
         gt = camera.original_image[:3].cpu()
         gt_rgb = rgb(gt)
@@ -180,8 +244,14 @@ class InspectorBackend:
             culling_on=('Culling ON', rgb(on)), difference=('Absolute ON/OFF difference x10', rgb((on-off).abs().mul(10))),
             centers=('Gaussian centers over GT (no z-buffer)', projected_overlay(self.xyz, labels, w2c, k, gt_rgb)),
             depth=('Conservative occlusion depth bounds; black = unknown', colored_depth))
+        panels, coverage = reference_panels(frame, k, gt_rgb, tiles.cpu().numpy())
+        images.update(panels)
+        reasons = self.decision_counts(camera, tiles, keep, radii_off)
         summary = dict(image=name, iteration=self.iteration, checkpoint=str(self.ply),
-            checkpoint_sha256=self.checkpoint_sha256, culling_source='DA3' if self.is_da3 else 'LiDAR surfels',
+            checkpoint_sha256=self.checkpoint_sha256, culling_source=self.source_options[source],
+            saved_training_reference=self.saved_reference, diagnostic_override=source != 'saved',
+            reference_path=str(getattr(provider, 'root', getattr(provider, 'geometry', ''))),
+            coverage=coverage, candidate_reasons=reasons,
             antialiasing=self.pipe.antialiasing, counts=counts,
             culled_fraction_all=counts['culled']/max(counts['total'], 1),
             culled_fraction_raster_candidates=counts['culled_with_raster_footprint']/max(counts['raster_candidates_without_culling'], 1),
@@ -200,20 +270,20 @@ class InspectorBackend:
             summary['gradient_probe'] = dict(on=on_grad, off=off_grad,
                 verdict=probe_verdict(on_grad, off_grad, counts['culled']),
                 scope='L1 + SSIM image gradients on this saved view/state; no optimizer step or depth/surface loss')
-        directory = Path(self.root)/image_id(name)
-        write_report(directory, summary, images)
+        directory = Path(self.root)/image_id(name)/source
+        directory.mkdir(parents=True, exist_ok=True)
         np.save(directory/'labels.npy', labels, allow_pickle=False)
         np.save(directory/'occlusion_tiles.npy', tiles.cpu().numpy(), allow_pickle=False)
-        self.current = dict(name=name, camera=camera, c2w=c2w, tiles=tiles, labels=labels,
+        result = dict(name=name, source=source, camera=camera, c2w=c2w, tiles=tiles, labels=labels,
             radii_on=radii_on, radii_off=radii_off, summary=summary, directory=directory,
             images=images, surface=cloud)
         print(f"Active {counts['active']:,}; depth-culled {counts['culled']:,}; other {counts['other']:,}", flush=True)
+        print(f"Trusted pixels {coverage['trusted_pixel_fraction']:.1%}; usable tiles {summary['reliable_tile_fraction']:.1%}; "
+              f"candidate reasons: {reasons}", flush=True)
         if check_gradients:
             print(summary['gradient_probe']['verdict'], flush=True)
         print(f'Diagnostic report: {directory}/index.html', flush=True)
-        del hidden
-        torch.cuda.empty_cache()
-        return self.current
+        return result
 
     def gaussian_details(self, index):
         from utils.occlusion_culling import conservative_keep, rotation_matrix

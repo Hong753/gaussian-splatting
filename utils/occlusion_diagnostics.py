@@ -49,9 +49,8 @@ def depth_points(depth, intrinsic, camera_to_world, stride=3):
     return (points @ camera_to_world[:3, :3].T + camera_to_world[:3, 3]).astype(np.float32)
 
 
-def depth_rgb(tiles, width, height):
+def depth_rgb(tiles, width, height, pixel_size=16):
     """Color actual conservative tile bounds; unknown coverage is black."""
-    from utils.occlusion_depth import TILE
     values = np.asarray(tiles)
     valid = np.isfinite(values) & (values > 0)
     color = np.zeros((*values.shape, 3), np.uint8)
@@ -61,7 +60,74 @@ def depth_rgb(tiles, width, height):
         color[valid] = np.stack((255*t, 220*(1-np.abs(2*t-1)), 255*(1-t)), 1).astype(np.uint8)
     else:
         lo, hi = None, None
-    return np.repeat(np.repeat(color, TILE, axis=0), TILE, axis=1)[:height, :width], dict(low=lo, high=hi)
+    return np.repeat(np.repeat(color, pixel_size, axis=0), pixel_size, axis=1)[:height, :width], dict(low=lo, high=hi)
+
+
+def reference_on_image(frame, intrinsic, height, width):
+    """Map reference depth to native rays using both K matrices, not an image resize."""
+    depth, valid, k = frame['depth'], frame['valid'], frame['intrinsics']
+    y, x = np.indices((height, width), dtype=np.float32)
+    u = np.floor(k[0, 0]*(x-intrinsic[0, 2])/intrinsic[0, 0]+k[0, 2]+.5).astype(int)
+    v = np.floor(k[1, 1]*(y-intrinsic[1, 2])/intrinsic[1, 1]+k[1, 2]+.5).astype(int)
+    h, w = depth.shape
+    inside = (u >= 0) & (v >= 0) & (u < w) & (v < h)
+    u, v = u.clip(0, w-1), v.clip(0, h-1)
+    raw = np.where(inside, depth[v, u], 0)
+    finite = np.isfinite(raw) & (raw > 0)
+    trusted = inside & valid[v, u].astype(bool) & finite
+    return raw, trusted
+
+
+def reference_panels(frame, intrinsic, rgb, tiles):
+    """Separate reference prediction, accepted surface, and usable culling area."""
+    from PIL import Image, ImageFilter
+    h, w = rgb.shape[:2]
+    raw, trusted = reference_on_image(frame, intrinsic, h, w)
+    finite = np.isfinite(raw) & (raw > 0)
+    full_tiles = np.repeat(np.repeat(np.isfinite(tiles), 16, axis=0), 16, axis=1)[:h, :w]
+    raw_rgb, _ = depth_rgb(raw, w, h, pixel_size=1)
+    coverage = np.zeros_like(rgb)
+    coverage[trusted] = (85, 155, 255)
+    coverage[full_tiles] = (40, 220, 120)
+    overlay = (rgb*.25).astype(np.uint8)
+    overlay[trusted] = (.45*rgb[trusted]+.55*np.array([85, 155, 255])).astype(np.uint8)
+    summary = dict(raw_depth_pixel_fraction=float(finite.mean()), trusted_pixel_fraction=float(trusted.mean()),
+                   usable_tile_pixel_fraction=float(full_tiles.mean()), calibration=frame.get('report', {}))
+    images = dict(reference_raw=('Raw reference depth; may include rejected predictions', raw_rgb),
+        reference_trusted=('Trusted reference over GT; blue accepted, dark rejected/unknown', overlay),
+        coverage=('Coverage: green usable tiles, blue trusted pixels lost to tile tests, black unknown', coverage))
+    if 'anchors' in frame:
+        anchors = frame['anchors']
+        u, v, z = (np.asarray(anchors[key]) for key in ('u', 'v', 'z'))
+        inside = (u >= 0) & (v >= 0) & (u < w) & (v < h) & np.isfinite(z) & (z > 0)
+        u, v, z = u[inside].astype(int), v[inside].astype(int), z[inside]
+        known = trusted[v, u]
+        agree = known & (np.abs(raw[v, u]-z) <= .1*z)
+        mismatch = known & ~agree
+        anchor_rgb = rgb.copy()
+        for mask, color in ((~known, (255, 195, 65)), (agree, (40, 220, 120)), (mismatch, (255, 65, 80))):
+            dots = np.zeros((h, w), np.uint8)
+            dots[v[mask], u[mask]] = 255
+            dots = np.asarray(Image.fromarray(dots).filter(ImageFilter.MaxFilter(3))) > 0
+            anchor_rgb[dots] = color
+        images['anchors'] = ('Projected nearest LiDAR anchors: green within 10% of trusted depth, red disagree, gold untrusted', anchor_rgb)
+        summary['lidar_anchors'] = dict(projected=len(z), agree=int(agree.sum()), disagree=int(mismatch.sum()),
+                                        untrusted=int((~known).sum()))
+    return images, summary
+
+
+def reason_counts(keep, reliable, surface_bound, radii_off):
+    """Disjoint reasons over OFF raster candidates; no out-of-view denominator."""
+    candidate = np.asarray(radii_off) > 0
+    keep, reliable = np.asarray(keep, bool), np.asarray(reliable, bool)
+    finite = np.isfinite(np.asarray(surface_bound))
+    masks = dict(culled=~keep, outside_conservative_test=keep & ~reliable,
+                 missing_depth_coverage=keep & reliable & ~finite,
+                 overlaps_depth_or_margin=keep & reliable & finite)
+    result = {name: int(np.count_nonzero(candidate & mask)) for name, mask in masks.items()}
+    if sum(result.values()) != int(candidate.sum()):
+        raise RuntimeError('Culling reason partition does not match raster candidates')
+    return result
 
 
 def projected_overlay(xyz, labels, world_to_camera, intrinsic, rgb, chunk=131072):

@@ -31,6 +31,19 @@ def windows(names, core=4, context=2):
         yield names[max(0, start-context):min(len(names), end+context)], names[start:end]
 
 
+def inspection_targets(names, count=0, image=None):
+    """Select a few training views while retaining their normal inference windows."""
+    if image:
+        if image not in names:
+            raise ValueError('--inspect-image must be in the training keyframe manifest')
+        return {image}
+    if count:
+        indices = ([len(names)//2] if count == 1 else
+                   (np.linspace(0, len(names)-1, min(count, len(names)))+.5).astype(int))
+        return {names[i] for i in indices}
+    return set(names)
+
+
 def save_npz(path, **values):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.stem + '.' + uuid.uuid4().hex + '.tmp.npz')
@@ -101,6 +114,9 @@ def parser():
     p.add_argument('--relative-margin', type=float, default=.05)
     p.add_argument('--edge-pixels', type=int, default=1)
     p.add_argument('--preview-count', type=int, default=16)
+    p.add_argument('--inspect-views', type=int, default=0,
+                   help='Prepare only this many distributed training views for inspection; 0 prepares all')
+    p.add_argument('--inspect-image', help='Prepare this exact training image with its usual context views')
     return p
 
 
@@ -111,7 +127,7 @@ def main(argv=None):
             min(args.core_views, args.context_views, args.min_support_views, args.preview_count) < 1 or
             args.min_anchors < 100 or args.process_res < 140 or args.edge_pixels < 0 or
             min(args.max_relative_error, args.multiview_tolerance) <= 0 or args.relative_margin < 0 or
-            args.resolution == 0 or args.resolution < -1):
+            args.resolution == 0 or args.resolution < -1 or args.inspect_views < 0):
         raise ValueError('Invalid DA3 processing/calibration settings')
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     import torch
@@ -123,6 +139,8 @@ def main(argv=None):
     names = sorted(json.loads(args.keyframes.read_text())['selected_images'])
     if len(names) != len(set(names)) or len(names) < 3 or set(names)-records.keys():
         raise ValueError('Require at least three unique registered training frames')
+    targets = inspection_targets(names, args.inspect_views, args.inspect_image)
+    inspect_only = bool(args.inspect_views or args.inspect_image)
     cameras = {name: record_camera(records[name], args.resolution, device='cpu') for name in names}
     signatures = {n: camera_signature(c, args.edge_pixels) for n, c in cameras.items()}
     images_identity = [(n, Path(records[n]['image_path']).stat().st_size,
@@ -130,16 +148,22 @@ def main(argv=None):
     config = dict(version=VERSION, source=str(source), point_cloud=str(cloud), point_cloud_sha256=file_digest(cloud),
         images=names, image_identity_sha256=hashlib.sha256(json.dumps(images_identity).encode()).hexdigest(),
         camera_signatures=signatures, **{k: v for k, v in vars(args).items()
-            if k not in ('source', 'output', 'point_cloud', 'keyframes', 'gpu', 'preview_count')})
+            if k not in ('source', 'output', 'point_cloud', 'keyframes', 'gpu', 'preview_count',
+                         'inspect_views', 'inspect_image')})
     output.mkdir(parents=True, exist_ok=True)
     metadata_path = output/'metadata.json'
     existing = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
-    if existing and any(existing.get(k) != v for k, v in config.items()):
+    # Scene copies input.ply into each run. Byte-identical copies have the same
+    # geometric identity; their filesystem location must not invalidate a cache.
+    if existing and any(existing.get(k) != v for k, v in config.items() if k != 'point_cloud'):
         raise ValueError('Existing DA3 cache has different inputs/settings; use a new output directory')
     if existing.get('complete'):
         if not all((output/'frames'/frame_filename(n)).is_file() for n in names):
             raise ValueError('Completed DA3 cache is missing frames')
         print(f'Reusing complete aligned DA3 cache: {output}', flush=True)
+        return 0
+    if inspect_only and all((output/'frames'/frame_filename(n)).is_file() for n in targets):
+        print(f'Reusing {len(targets)} diagnostic DA3 views: {output} (partial cache is not training-ready)', flush=True)
         return 0
     from scripts.check_da3_environment import require_cuda
     require_cuda(torch, args.gpu)
@@ -160,9 +184,13 @@ def main(argv=None):
     points = torch.from_numpy(xyz).to('cuda')
     del xyz, vertex
     previews = set(names[i] for i in np.linspace(0, len(names)-1, min(args.preview_count, len(names)), dtype=int))
+    if inspect_only:
+        previews = targets
     (output/'previews').mkdir(exist_ok=True)
     rows = {}
-    for batch, core in tqdm(list(windows(names, args.core_views, args.context_views)), desc='Aligning DA3 windows'):
+    work = [(batch, [n for n in core if n in targets])
+            for batch, core in windows(names, args.core_views, args.context_views) if targets.intersection(core)]
+    for batch, core in tqdm(work, desc='Aligning DA3 windows'):
         if all((output/'frames'/frame_filename(n)).exists() for n in core):
             for n in core:
                 with np.load(output/'frames'/frame_filename(n), allow_pickle=False) as data:
@@ -207,6 +235,7 @@ def main(argv=None):
             pv = np.floor(k[1, 1]*(v-full_k[1, 2])/full_k[1, 1]+k[1, 2]+.5).astype(int)
             valid = reliable_pixels(raw, conf, args.confidence_percentile)
             scale, report = fit_scale(raw, valid, pu, pv, z, args.min_anchors, args.max_relative_error)
+            report.update(projected_lidar_anchors=len(z), confident_pixel_fraction=float(valid.mean()))
             depth = np.where(np.isfinite(raw), raw*(scale or 1.), 0).astype(np.float32)
             if scale is None:
                 valid[:] = False
@@ -223,25 +252,39 @@ def main(argv=None):
             report = dict(report, image=n, trusted_pixel_fraction=float(trusted.mean()),
                           reliable_tile_fraction=float(np.isfinite(tiles).mean()), relative_margin=uncertainty)
             save_npz(output/'frames'/frame_filename(n), image=n, depth=depth, valid=trusted,
-                     intrinsics=k, extrinsics=e, tiles=tiles, report=json.dumps(report))
+                     intrinsics=k, extrinsics=e, tiles=tiles, report=json.dumps(report),
+                     confidence_valid=valid, support_views=support)
             rows[n] = report
             if n in previews:
                 preview(output/'previews'/(Path(frame_filename(n)).stem+'.jpg'), records[n], depth, trusted, report)
         atomic_json(output/'calibration.json', dict(frames=[rows[n] for n in names if n in rows]))
-    summary = dict(accepted_frames=sum(r['accepted'] for r in rows.values()), frames=len(rows),
+    # Include prior diagnostic windows when resuming; never promote a partial
+    # cache to training-ready just because the sampled views calibrated well.
+    for n in names:
+        path = output/'frames'/frame_filename(n)
+        if n not in rows and path.is_file():
+            with np.load(path, allow_pickle=False) as data:
+                rows[n] = json.loads(str(data['report']))
+    atomic_json(output/'calibration.json', dict(frames=[rows[n] for n in names if n in rows]))
+    summary = dict(accepted_frames=sum(r['accepted'] for r in rows.values()), frames=len(rows), expected_frames=len(names),
                    mean_reliable_tile_fraction=float(np.mean([r['reliable_tile_fraction'] for r in rows.values()])))
     metadata.update(summary=summary)
     # Reject unusable preparations instead of silently training with empty masks.
-    usable = summary['accepted_frames'] >= .5*len(names) and summary['mean_reliable_tile_fraction'] > .01
+    usable = (len(rows) == len(names) and summary['accepted_frames'] >= .5*len(names)
+              and summary['mean_reliable_tile_fraction'] > .01)
     atomic_json(metadata_path, dict(metadata, complete=usable))
     items = ''.join('<h3>'+html.escape(n)+'</h3><pre>'+html.escape(json.dumps(rows[n], indent=2))+
-        '</pre><img style="max-width:100%" src="previews/'+Path(frame_filename(n)).stem+'.jpg">' for n in names if n in previews)
+        '</pre><img style="max-width:100%" src="previews/'+Path(frame_filename(n)).stem+'.jpg">'
+        for n in names if n in rows and (output/'previews'/(Path(frame_filename(n)).stem+'.jpg')).is_file())
     (output/'index.html').write_text('<!doctype html><meta charset="utf-8"><title>DA3 LiDAR calibration</title>'
         '<body style="background:#171b24;color:#eee;font:16px sans-serif;margin:24px"><h1>DA3 / LiDAR calibration</h1>'
         '<p>Training views only. Green regions have confidence, boundary, and cross-view checks. '
         'These checks reduce errors; they do not establish ground-truth visibility.</p><pre>'+html.escape(json.dumps(summary, indent=2))+'</pre>'+items)
     print(json.dumps(summary, indent=2))
     print(f'Calibration previews: {output}/index.html')
+    if inspect_only:
+        print('Diagnostic preparation finished. Inspect coverage before preparing all views or training.', flush=True)
+        return 0
     if not usable:
         raise RuntimeError('DA3 calibration/coverage is insufficient; inspect index.html and calibration.json before training')
     return 0

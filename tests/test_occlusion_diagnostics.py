@@ -10,7 +10,8 @@ import numpy as np
 import torch
 
 from utils.occlusion_diagnostics import (COLORS, classify, display_indices, depth_points, depth_rgb,
-    projected_overlay, write_colored_ply, nearest_ray_point, write_report)
+    projected_overlay, write_colored_ply, nearest_ray_point, write_report, reference_on_image,
+    reference_panels, reason_counts)
 from utils.occlusion_culling import conservative_keep
 from scripts.occlusion_inspector_backend import gradient_statistics, probe_verdict, InspectorBackend, PARAMETERS
 from test_occlusion import camera
@@ -115,7 +116,7 @@ class OcclusionDiagnosticTests(unittest.TestCase):
 
     def test_backend_backward_runs_on_and_off_without_changing_weights(self):
         backend = InspectorBackend.__new__(InspectorBackend)
-        backend.torch, backend.is_da3, backend.cfg = torch, True, {}
+        backend.torch, backend.is_da3, backend.cfg = torch, False, {}
         backend.parameters = [torch.nn.Parameter(torch.full((3, 1), .01), requires_grad=False) for _ in PARAMETERS]
         backend.model, backend.background = object(), torch.zeros(3)
         backend.pipe, backend.off_pipe = object(), object()
@@ -147,6 +148,102 @@ class OcclusionDiagnosticTests(unittest.TestCase):
         xyz = np.array([[2, 0, 2], [0, 0, -1], [0, 0, 4], [3, 1, 1.]])
         self.assertEqual(nearest_ray_point(xyz, np.array([1, 2, 3]), [0, 0, 0], [0, 0, 1], chunk=1), 2)
 
+    def test_dense_wall_culls_back_layer_where_floor_patches_leave_unknown(self):
+        from utils.occlusion_depth import tile_maxima
+        xyz = torch.tensor([[0., 0, 3.], [0., 0, 1.], [0., 0, .1]])
+        scale = torch.full_like(xyz, .02)
+        rot = torch.tensor([[1., 0, 0, 0]]).repeat(3, 1)
+        sparse = torch.full((128, 128), float('inf')); sparse[96:120] = 2
+        dense = torch.full_like(sparse, 2.)
+        kept_sparse, a = conservative_keep(camera(128), xyz, scale, rot, tile_maxima(sparse), return_details=True)
+        kept_dense, b = conservative_keep(camera(128), xyz, scale, rot, tile_maxima(dense), return_details=True)
+        self.assertEqual(kept_sparse.tolist(), [True, True, True])
+        self.assertEqual(kept_dense.tolist(), [False, True, True])
+        reasons = reason_counts(kept_sparse, a['reliable'], a['surface_bound_z'], [3, 3, 3])
+        self.assertEqual(reasons['missing_depth_coverage'], 2)
+        self.assertEqual(reasons['outside_conservative_test'], 1)
+        self.assertEqual(sum(reasons.values()), 3)
+        reasons = reason_counts(kept_dense, b['reliable'], b['surface_bound_z'], [3, 3, 3])
+        self.assertEqual(reasons['culled'], 1)
+        self.assertEqual(reasons['overlaps_depth_or_margin'], 1)
+        self.assertEqual(reasons['missing_depth_coverage'], 0)
+
+    def test_reference_panels_use_intrinsics_and_keep_rejected_depth_distinct(self):
+        frame = dict(depth=np.array([[2., 4.], [3., 5.]], np.float32),
+            valid=np.array([[True, False], [True, True]]), intrinsics=np.eye(3))
+        # Deliberately offset principal point; naive resizing would miss this.
+        native = np.array([[1., 0, 1.], [0, 1., 0], [0, 0, 1.]])
+        raw, valid = reference_on_image(frame, native, 2, 3)
+        np.testing.assert_allclose(raw, [[0, 2, 4], [0, 3, 5]])
+        self.assertFalse(valid[0, 2]); self.assertTrue(valid[0, 1])
+        frame['anchors'] = dict(u=np.array([1, 2, 2]), v=np.array([0, 1, 0]), z=np.array([2, 9, 4.]))
+        panels, stats = reference_panels(frame, native, np.full((2, 3, 3), 100, np.uint8), [[np.inf]])
+        self.assertEqual(stats['lidar_anchors'], dict(projected=3, agree=1, disagree=1, untrusted=1))
+        self.assertEqual(stats['trusted_pixel_fraction'], .5)
+        self.assertEqual(stats['usable_tile_pixel_fraction'], 0)
+        self.assertIn('anchors', panels)
+
+    def test_two_references_use_same_checkpoint_and_do_not_overwrite_reports(self):
+        from utils.occlusion_depth import tile_maxima
+        backend = InspectorBackend.__new__(InspectorBackend)
+        cam = camera(128)
+        cam.image_name = 'test.png'
+        cam.original_image, cam.alpha_mask = torch.zeros(3, 128, 128), None
+        xyz = torch.nn.Parameter(torch.tensor([[0., 0, 1.], [0., 0, 3.]]), requires_grad=False)
+        backend.model = SimpleNamespace(get_xyz=xyz,
+            _scaling=torch.nn.Parameter(torch.full((2, 3), .02).log(), requires_grad=False),
+            _rotation=torch.nn.Parameter(torch.tensor([[1., 0, 0, 0]]).repeat(2, 1), requires_grad=False))
+        backend.parameters = [xyz, torch.nn.Parameter(torch.ones(2, 1), requires_grad=False),
+            backend.model._scaling, backend.model._rotation,
+            torch.nn.Parameter(torch.ones(2, 1), requires_grad=False),
+            torch.nn.Parameter(torch.ones(2, 1), requires_grad=False)]
+        backend.xyz, backend.cfg, backend.background = xyz.detach().numpy(), {}, torch.zeros(3)
+        backend.pipe = SimpleNamespace(occlusion_margin=.05, occlusion_sigma=3., occlusion_chunk_size=1, antialiasing=True)
+        backend.off_pipe = object()
+        backend.torch, backend.current, backend.views = torch, None, {}
+        backend.source_key, backend.names, backend.iteration = 'da3', [cam.image_name], 7000
+        backend.saved_reference, backend.checkpoint_sha256 = 'LiDAR patches', 'synthetic-checkpoint'
+        backend.camera = lambda name: cam
+        before = [p.detach().clone() for p in backend.parameters]
+        class Provider:
+            def __init__(self, dense):
+                self.depth = torch.full((128, 128), 2. if dense else float('inf'))
+            def tiles(self, camera, device): return tile_maxima(self.depth)
+            def diagnostic_frame(self, camera, device):
+                return dict(depth=self.depth.numpy(), valid=torch.isfinite(self.depth).numpy(),
+                    intrinsics=np.array([[64., 0, 63.5], [0, 64., 63.5], [0, 0, 1.]]))
+        backend.providers = {'saved': Provider(False), 'da3': Provider(True)}
+        backend.source_options = {'saved': 'Saved LiDAR patches', 'da3': 'Diagnostic LiDAR + DA3'}
+        calls = []
+        def render(camera, model, pipe, bg, use_trained_exp, **kwargs):
+            tiles = kwargs.get('occlusion_tiles')
+            calls.append(tiles is not None)
+            keep = (torch.ones(2, dtype=torch.bool) if tiles is None else conservative_keep(
+                cam, xyz.detach(), model._scaling.detach().exp(), model._rotation.detach(), tiles))
+            value = sum(p[keep].sum() for p in backend.parameters)*.001
+            result = dict(render=value.expand(3, 128, 128), radii=keep.int()*3)
+            if tiles is not None: result['occlusion_keep'] = keep
+            return result
+        backend.render = render
+        with tempfile.TemporaryDirectory() as tmp:
+            backend.root, backend.ply = Path(tmp), Path(tmp)/'immutable.ply'
+            result = backend.analyze(cam.image_name, True, 'da3')
+            self.assertEqual(result['labels'].tolist(), [1, 2])
+            self.assertEqual(backend.views['saved']['labels'].tolist(), [1, 1])
+            self.assertEqual(result['summary']['candidate_reasons']['culled'], 1)
+            self.assertEqual(result['summary']['gradient_probe']['on']['culled_nonzero_gaussians'], 0)
+            self.assertEqual(result['summary']['gradient_probe']['off']['culled_nonzero_gaussians'], 1)
+            self.assertEqual(len(result['summary']['reference_comparison']), 2)
+            self.assertTrue(result['summary']['diagnostic_override'])
+            self.assertFalse(backend.views['saved']['summary']['diagnostic_override'])
+            self.assertEqual(len(list(Path(tmp).rglob('summary.json'))), 2)
+            count = len(calls)
+            backend.analyze(cam.image_name, False, 'saved')
+            self.assertEqual(len(calls), count)  # UI reference changes reuse the same state.
+        for old, param in zip(before, backend.parameters):
+            torch.testing.assert_close(param, old)
+            self.assertFalse(param.requires_grad)
+
     @unittest.skipUnless(importlib.util.find_spec('viser'), 'optional viewer dependency')
     def test_real_viser_layer_visibility_cap_and_ply_export(self):
         import viser
@@ -158,11 +255,12 @@ class OcclusionDiagnosticTests(unittest.TestCase):
             result['directory'] = Path(tmp)
             backend = SimpleNamespace(names=[result['name']], args=SimpleNamespace(image=None),
                 xyz=xyz, current=None, iteration=7000, torch=torch,
+                source_options={'saved': 'Synthetic saved reference'}, source_key='saved',
                 model=SimpleNamespace(get_xyz=torch.from_numpy(xyz), _scaling=torch.full((len(xyz), 3), .015).log(),
                     _rotation=torch.tensor([[1., 0, 0, 0]]).repeat(len(xyz), 1)),
                 pipe=SimpleNamespace(occlusion_margin=.05, occlusion_sigma=3., occlusion_chunk_size=131072))
             backend.gaussian_details = lambda index: InspectorBackend.gaussian_details(backend, index)
-            def analyze(name, check):
+            def analyze(name, check, source):
                 backend.current = result
                 return result
             backend.analyze = analyze
