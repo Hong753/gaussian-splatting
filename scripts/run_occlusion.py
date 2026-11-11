@@ -30,6 +30,7 @@ def parser(*, depth_maps=False):
     else:
         p.add_argument('--voxel-size', type=float, default=.05)
         p.add_argument('--max-radius', type=float, default=.1)
+        p.add_argument('--scene-geometry', type=Path, help='Use a fixed whole-scene scene.json instead of LiDAR patches')
     p.add_argument('--margin', type=float, default=.05)
     p.add_argument('--position-warmup-steps', type=int, default=0,
                    help='Freeze xyz and its Adam state for this many initial steps')
@@ -115,6 +116,25 @@ def build_plan(args):
              '--occlusion_voxel_size', str(args.voxel_size), '--occlusion_max_radius', str(args.max_radius),
              '--occlusion_margin', str(args.margin), '--test_iterations', *map(str, steps),
              '--save_iterations', *map(str, steps)]
+    scene_geometry = getattr(args, 'scene_geometry', None)
+    if scene_geometry:
+        from utils.scene_occlusion import load_scene
+        report, _ = load_scene(scene_geometry, source=source)
+        if not args.keyframes:
+            raise ValueError('Scene mesh training requires its exact keyframe manifest')
+        if set(json.loads(args.keyframes.read_text())['selected_images']) != set(report['training_images']):
+            raise ValueError('Scene fusion and training keyframes differ')
+        visibility_path = scene_geometry.resolve().parent/'visibility/metadata.json'
+        if not visibility_path.is_file() or not json.loads(visibility_path.read_text()).get('complete'):
+            raise ValueError('Finish whole-scene per-view visibility preprocessing and inspect its coverage before training')
+        from utils.lidar_occlusion import file_digest
+        visibility = json.loads(visibility_path.read_text())
+        if (visibility['scene_sha256'] != file_digest(scene_geometry) or
+                not set(report['training_images']).issubset(visibility['images'])):
+            raise ValueError('Per-view visibility belongs to a different scene or omits training views')
+        train[train.index('--occlusion_mode')+1] = 'mesh'
+        train += ['--occlusion_geometry', str(scene_geometry.resolve()), '--occlusion_cache',
+                  str(scene_geometry.resolve().parent/'occlusion_depth_cache')]
     for key, value in schedule.items():
         train += ['--'+key, str(value)]
     tangent_options = {}
@@ -131,6 +151,8 @@ def build_plan(args):
             train += ['--'+key, str(value)]
     stages = [] if args.evaluate_only else [dict(name='train', argv=train)]
     geometry, cache = str(model/'occlusion_geometry.npz'), str(model/'occlusion_depth_cache')
+    if scene_geometry:
+        geometry, cache = str(scene_geometry.resolve()), str(scene_geometry.resolve().parent/'occlusion_depth_cache')
     def evaluation(path, mode, name):
         options = ['--model', str(path), '--iteration', str(args.iterations), '--antialiasing', '--occlusion', mode]
         if mode == 'on':
@@ -154,7 +176,7 @@ def build_plan(args):
         video_root = args.video_output.expanduser().resolve() if args.video_output else model/'comparisons'
         for video in ('random', 'actual'):
             command = ['scripts/render.py', '--video', video, '--source', str(source), '--models', str(baseline), str(model),
-                '--labels', '3DGS + AA', schedule_label(schedule) + (' + view-tangent growth' if args.view_tangent else ''),
+                '--labels', '3DGS + AA', schedule_label(schedule).replace('LiDAR culling', 'fixed scene mesh culling' if scene_geometry else 'LiDAR culling') + (' + view-tangent growth' if args.view_tangent else ''),
                 '--aa', 'on', 'on', '--occlusion', 'off', 'saved',
                 '--iteration', str(args.iterations), '--gpu', args.gpu, '--in-process', '--width', '1280', '--fps', '30',
                 '--output', str(video_root/video)]
@@ -205,7 +227,7 @@ def main(argv=None):
         raise RuntimeError('Install requirements-occlusion.txt in the native 3dgs environment first') from exc
     if not args.evaluate_only:
         # Compile/check CUDA before spending time fitting a large cloud.
-        invoke(['scripts/smoke_occlusion.py', '--gpu', args.gpu])
+        invoke(['scripts/smoke_occlusion.py', '--gpu', args.gpu, *(['--mesh'] if args.scene_geometry else [])])
         if args.view_tangent:
             invoke(['scripts/smoke_view_tangent.py', '--gpu', args.gpu])
     model = Path(plan['model'])

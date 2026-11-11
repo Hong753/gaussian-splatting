@@ -265,8 +265,9 @@ def parser():
     p.add_argument('--split', choices=('train', 'eval', 'all'), default='train')
     p.add_argument('--depth-dir', type=Path,
                    help='Compare a LiDAR-calibrated DA3 cache against the saved reference on the same checkpoint')
-    p.add_argument('--reference', choices=('saved', 'da3'),
-                   help='Initial displayed reference; defaults to DA3 when --depth-dir is supplied')
+    p.add_argument('--scene-geometry', type=Path, help='Compare a fixed whole-scene mesh (scene.json)')
+    p.add_argument('--reference', choices=('saved', 'da3', 'mesh'),
+                   help='Initial reference; defaults to mesh, then DA3, then saved when supplied')
     p.add_argument('--gpu', default='5')
     p.add_argument('--port', type=int, default=8082)
     p.add_argument('--host', default='127.0.0.1')

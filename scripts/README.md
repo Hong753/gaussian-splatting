@@ -1,5 +1,9 @@
 # Training
 
+For fixed whole-scene surfaces, precomputed visible/occluded LiDAR IDs per view,
+and native 3DGS + AA culling at training and novel poses, see
+[SCENE_OCCLUSION.md](SCENE_OCCLUSION.md).
+
 For the independent LiDAR-calibrated Depth Anything 3 occlusion experiment,
 see [DA3_OCCLUSION.md](DA3_OCCLUSION.md). It includes conda setup, preprocessing,
 the warmup/reduced-LR training command, calibration previews, and automatic

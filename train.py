@@ -74,7 +74,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         raise ValueError("surface_mode must be off, tangent, constrained, or view_tangent")
     if opt.surface_mode == 'view_tangent':
         from utils.view_tangent import options
-        if (not depth_directory and dataset.occlusion_mode != 'lidar') or opt.optimizer_type != 'default':
+        if (not depth_directory and dataset.occlusion_mode not in ('lidar', 'mesh')) or opt.optimizer_type != 'default':
             raise ValueError('View-tangent densification requires LiDAR/DA3 culling and the default optimizer')
         if opt.absgs or opt.surface_patches:
             raise ValueError('Use view-tangent with native gradient statistics and without static surface patches')
@@ -98,7 +98,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
-    prepare_training_geometry(dataset)
+    prepare_training_geometry(dataset, scene.getTrainCameras())
     configure_pipeline(pipe, dataset)
     training_occluders = None
     if depth_directory:

@@ -127,7 +127,11 @@ def conservative_keep(camera, xyz, scales, rotations, tiles, margin=.05, sigma=3
 
 def visibility_mask(camera, pc, pipe, scaling_modifier=1.):
     if not hasattr(pipe, "_occlusion_provider"):
-        pipe._occlusion_provider = LidarDepthCache(pipe.occlusion_geometry, pipe.occlusion_cache, pipe.occlusion_edge_pixels)
+        if pipe.occlusion_mode == 'mesh':
+            from utils.scene_occlusion import MeshDepthCache
+            pipe._occlusion_provider = MeshDepthCache(pipe.occlusion_geometry, pipe.occlusion_cache, pipe.occlusion_edge_pixels)
+        else:
+            pipe._occlusion_provider = LidarDepthCache(pipe.occlusion_geometry, pipe.occlusion_cache, pipe.occlusion_edge_pixels)
     tiles = pipe._occlusion_provider.tiles(camera, pc.get_xyz.device)
     return conservative_keep(camera, pc.get_xyz.detach(), pc.get_scaling.detach(), pc.get_rotation.detach(), tiles,
         pipe.occlusion_margin, pipe.occlusion_sigma, pipe.occlusion_chunk_size, scaling_modifier)

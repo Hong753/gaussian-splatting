@@ -74,7 +74,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         occlusion_keep = conservative_keep(viewpoint_camera, pc.get_xyz.detach(), pc.get_scaling.detach(),
             pc.get_rotation.detach(), occlusion_tiles, pipe.occlusion_margin, pipe.occlusion_sigma,
             pipe.occlusion_chunk_size, scaling_modifier)
-    elif getattr(pipe, "occlusion_mode", "off") == "lidar":
+    elif getattr(pipe, "occlusion_mode", "off") in ("lidar", "mesh"):
         from utils.occlusion_culling import visibility_mask
         occlusion_keep = visibility_mask(viewpoint_camera, pc, pipe, scaling_modifier)
 

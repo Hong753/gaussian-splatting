@@ -68,9 +68,10 @@ class InspectorBackend:
         self.iteration, self.ply = choose_iteration(self.spec['path'], args.iteration)
         self.depth_dir = self.cfg.get('train_depth_occlusion_dir', '')
         override = getattr(args, 'depth_dir', None)
+        mesh_override = getattr(args, 'scene_geometry', None)
         self.is_da3 = bool(self.depth_dir or override)
-        if not self.is_da3 and self.cfg.get('occlusion_mode', 'off') != 'lidar':
-            raise ValueError('Choose a LiDAR/DA3 run, or pass --depth-dir for diagnostic culling on any native checkpoint')
+        if not self.is_da3 and not mesh_override and self.cfg.get('occlusion_mode', 'off') not in ('lidar', 'mesh'):
+            raise ValueError('Choose an occlusion run, or pass --depth-dir / --scene-geometry for a native checkpoint')
         self.names = sorted(self.spec['splits'][args.split])
         if self.is_da3:
             self.names = [n for n in self.names if n in self.spec['splits']['train']]
@@ -99,7 +100,12 @@ class InspectorBackend:
         configure_pipeline(self.off_pipe, {**self.cfg, 'occlusion_mode': 'off'})
         self.providers, self.source_options = {}, {}
         self.saved_reference = ('LiDAR-calibrated DA3' if self.depth_dir else
-            'LiDAR patches' if self.cfg.get('occlusion_mode') == 'lidar' else 'none')
+            'LiDAR patches' if self.cfg.get('occlusion_mode') == 'lidar' else
+            'Fixed scene mesh' if self.cfg.get('occlusion_mode') == 'mesh' else 'none')
+        def mesh_provider(path):
+            from utils.scene_occlusion import MeshDepthCache
+            return MeshDepthCache(path, edge_pixels=self.pipe.occlusion_edge_pixels,
+                point_cloud=self.spec['path']/'input.ply', source=self.cfg['source_path'])
         if self.depth_dir or override:
             from utils.da3_occlusion import TrainingDepthCache
             def da3_provider(path, partial=False):
@@ -115,17 +121,23 @@ class InspectorBackend:
             self.providers['saved'] = LidarDepthCache(self.pipe.occlusion_geometry, self.pipe.occlusion_cache,
                                                     self.pipe.occlusion_edge_pixels)
             self.source_options['saved'] = 'LiDAR patches used in training'
+        elif self.cfg.get('occlusion_mode') == 'mesh':
+            self.providers['saved'] = mesh_provider(self.cfg['occlusion_geometry'])
+            self.source_options['saved'] = 'Fixed scene mesh used in training'
         if override:
             self.providers['da3'] = da3_provider(override, partial=True)
             self.source_options['da3'] = 'LiDAR-calibrated DA3 (diagnostic override)'
+        if mesh_override:
+            self.providers['mesh'] = mesh_provider(mesh_override)
+            self.source_options['mesh'] = 'Fixed whole-scene mesh (diagnostic override)'
         for provider in self.providers.values():
             if hasattr(provider, 'available_images'):
                 self.names = [n for n in self.names if n in provider.available_images]
         if not self.names or (args.image and args.image not in self.names):
             raise ValueError('No matching prepared DA3 image; prepare --inspect-image for the desired training view')
-        self.source_key = getattr(args, 'reference', None) or ('da3' if override else 'saved')
+        self.source_key = getattr(args, 'reference', None) or ('mesh' if mesh_override else 'da3' if override else 'saved')
         if self.source_key not in self.providers:
-            raise ValueError('Selected reference is unavailable; --reference da3 requires --depth-dir')
+            raise ValueError('Selected reference is unavailable; supply its --depth-dir or --scene-geometry')
         self.background = torch.tensor([1., 1., 1.] if self.cfg.get('white_background') else [0., 0., 0.], device='cuda')
         self.root = args.output or self.spec['path']/'occlusion_diagnostics'/f'iteration_{self.iteration}'
         self.current = None

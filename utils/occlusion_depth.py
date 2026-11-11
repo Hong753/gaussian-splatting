@@ -90,6 +90,12 @@ class LidarDepthCache:
         self.memory, self.renderer = OrderedDict(), None
         self.surface_memory = OrderedDict()
 
+    def make_renderer(self, device):
+        return LidarDepthRenderer(self.geometry, device)
+
+    def tile_depth(self, depth):
+        return depth
+
     def surface(self, camera, device, radius_pixels=3, max_radius=.1):
         """Uninflated first-hit LiDAR depth for local tangent neighborhoods."""
         from utils.view_tangent import camera_intrinsics, surface_frame
@@ -116,7 +122,7 @@ class LidarDepthCache:
                 raise ValueError(f'Invalid raw LiDAR surface depth: {path}')
             return torch.as_tensor(array, device=device, dtype=torch.float32)
         if self.renderer is None:
-            self.renderer = LidarDepthRenderer(self.geometry, device)
+            self.renderer = self.make_renderer(device)
         depth = self.renderer(camera)
         self.directory.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(path.stem + f'.{os.getpid()}.{uuid.uuid4().hex}.tmp.npz')
@@ -149,9 +155,7 @@ class LidarDepthCache:
                 raise ValueError(f"Invalid LiDAR depth cache: {path}")
             tiles = torch.as_tensor(array, dtype=torch.float32, device=device)
         else:
-            if self.renderer is None:
-                self.renderer = LidarDepthRenderer(self.geometry, device)
-            tiles = tile_maxima(self.renderer(camera), self.edge_pixels)
+            tiles = tile_maxima(self.tile_depth(self.raw_depth(camera, device)), self.edge_pixels)
             self.directory.mkdir(parents=True, exist_ok=True)
             temp = path.with_name(path.stem + f".{os.getpid()}.{uuid.uuid4().hex}.tmp.npy")
             try:
