@@ -11,6 +11,44 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
+def require_finite(named_tensors, stage):
+    import torch
+    for name, tensor in named_tensors:
+        bad = int((~torch.isfinite(tensor)).sum().item())
+        if bad:
+            raise AssertionError(f'{stage}: {name} has {bad}/{tensor.numel()} non-finite values')
+
+
+def check_raw_depth_gradient_layouts(camera, pc, bg, names, parameters, aa):
+    """Exercise the CUDA binding directly, without the shared render hook."""
+    import torch
+    from diff_gaussian_rasterization_occlusion import GaussianRasterizationSettings, GaussianRasterizer
+    h, w = camera.image_height, camera.image_width
+    settings = GaussianRasterizationSettings(image_height=h, image_width=w,
+        tanfovx=math.tan(camera.FoVx/2), tanfovy=math.tan(camera.FoVy/2), bg=bg,
+        scale_modifier=1., viewmatrix=camera.world_view_transform,
+        projmatrix=camera.full_proj_transform, sh_degree=pc.active_sh_degree,
+        campos=camera.camera_center, prefiltered=False, debug=True, antialiasing=aa,
+        occlusion_depth=torch.full((h,w),float('inf'),device=bg.device))
+    rasterizer = GaussianRasterizer(settings)
+    def gradients(seed):
+        _, _, depth, _ = rasterizer(means3D=pc.get_xyz, means2D=torch.zeros_like(pc.get_xyz),
+            opacities=pc.get_opacity, shs=pc.get_features, scales=pc.get_scaling, rotations=pc.get_rotation)
+        require_finite([('depth',depth)], f'AA={aa} raw ray output')
+        return torch.autograd.grad(depth, parameters, grad_outputs=seed)
+    seeds = dict(expanded=torch.tensor(.01,device=bg.device).expand(1,h,w),
+        transposed=torch.linspace(.01,.02,h*w,device=bg.device).reshape(1,w,h).transpose(1,2))
+    for layout, seed in seeds.items():
+        assert not seed.is_contiguous()
+        actual, expected = gradients(seed), gradients(seed.contiguous())
+        require_finite(zip(names,actual), f'AA={aa} raw ray {layout} gradient')
+        require_finite(zip(names,expected), f'AA={aa} raw ray contiguous gradient')
+        for name, a, b in zip(names,actual,expected):
+            torch.testing.assert_close(a,b,atol=3e-5,rtol=2e-4,
+                msg=f'AA={aa} raw ray {layout} gradient differs for {name}')
+    return list(seeds)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--gpu', default='5')
@@ -51,22 +89,32 @@ def main(argv=None):
     assert point_labels['in_front_ids'].tolist()==[0]
     tests=[]
     for aa in (False,True):
+        print(f'CUDA smoke: AA={aa}, checking native/ray forward and backward parity',flush=True)
         pipe.antialiasing=aa
         baseline=render(camera,pc,pipe,bg)
         unbounded=render(camera,pc,pipe,bg,occlusion_depth=torch.full_like(wall,float('inf')))
+        for label, result in (('native',baseline),('ray',unbounded)):
+            require_finite([(key,result[key]) for key in ('render','depth')],f'AA={aa} {label} output')
         torch.testing.assert_close(unbounded['render'],baseline['render'],atol=2e-6,rtol=2e-5)
+        torch.testing.assert_close(unbounded['depth'],baseline['depth'],atol=2e-6,rtol=2e-5)
         g0=torch.autograd.grad(baseline['render'].square().sum()+baseline['depth'].sum()*.01,parameters)
+        require_finite(zip(names,g0),f'AA={aa} native gradient')
         g1=torch.autograd.grad(unbounded['render'].square().sum()+unbounded['depth'].sum()*.01,parameters)
-        for a,b in zip(g0,g1):
-            torch.testing.assert_close(a,b,atol=3e-5,rtol=2e-4)
+        require_finite(zip(names,g1),f'AA={aa} ray gradient')
+        for name,a,b in zip(names,g0,g1):
+            torch.testing.assert_close(a,b,atol=3e-5,rtol=2e-4,msg=f'AA={aa} native/ray gradient mismatch: {name}')
+        layouts=check_raw_depth_gradient_layouts(camera,pc,bg,names,parameters,aa)
         blocked=render(camera,pc,pipe,bg,occlusion_depth=wall)
+        require_finite([(key,blocked[key]) for key in ('render','depth')],f'AA={aa} wall output')
         assert blocked['occlusion_fragment_flags'].tolist()==[1,2]
         grads=torch.autograd.grad(blocked['render'].square().sum()+blocked['depth'].sum(),parameters)
+        require_finite(zip(names,grads),f'AA={aa} wall gradient')
         for name,gradient in zip(names,grads):
             assert gradient[1].count_nonzero().item()==0,name
         assert grads[-1][0].count_nonzero().item()>0
         hole=wall.clone();hole[31,32]=float('inf')
         partial=render(camera,pc,pipe,bg,occlusion_depth=hole)
+        require_finite([(key,partial[key]) for key in ('render','depth')],f'AA={aa} hole output')
         assert partial['occlusion_fragment_flags'].tolist()==[1,3]
         difference=(partial['render']-blocked['render']).abs().sum(0)
         assert difference[31,32]>0
@@ -74,8 +122,10 @@ def main(argv=None):
         assert difference.max().item()==0,'A hole changed other rays'
         loss_pixels=torch.ones_like(wall);loss_pixels[31,32]=0
         gradients=torch.autograd.grad((partial['render']*loss_pixels).sum(),parameters)
+        require_finite(zip(names,gradients),f'AA={aa} hole gradient')
         assert all(g[1].count_nonzero().item()==0 for g in gradients),'Blocked-pixel loss leaked to background'
         tests.append(dict(antialiasing=aa,baseline_forward_backward_parity=True,
+            raw_depth_gradient_layouts=layouts,all_outputs_and_gradients_finite=True,
             transparent_foreground_wall=True,hole_changes_only_its_pixel=True,blocked_pixel_gradients_zero=True))
     optimizer=torch.optim.Adam([pc._features_dc],lr=.01)
     pc._features_dc.grad=torch.ones_like(pc._features_dc);optimizer.step()

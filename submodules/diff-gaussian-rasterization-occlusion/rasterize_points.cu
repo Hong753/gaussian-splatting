@@ -184,12 +184,17 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   
   float* dL_dinvdepthsptr = nullptr;
   float* dL_dout_invdepthptr = nullptr;
+  torch::Tensor dL_dout_invdepth_contiguous;
   if(dL_dout_invdepth.size(0) != 0)
   {
 	dL_dinvdepths = torch::zeros({P, 1}, means3D.options());
 	dL_dinvdepths = dL_dinvdepths.contiguous();
 	dL_dinvdepthsptr = dL_dinvdepths.data<float>();
-	dL_dout_invdepthptr = dL_dout_invdepth.data<float>();
+	// sum()/mean() may supply a zero-stride view backed by one scalar.
+	// CUDA indexes this pointer as a dense image, so retain a contiguous
+	// owner through the backward call instead of reading beyond storage.
+	dL_dout_invdepth_contiguous = dL_dout_invdepth.contiguous();
+	dL_dout_invdepthptr = dL_dout_invdepth_contiguous.data_ptr<float>();
   }
 
   if(P != 0)

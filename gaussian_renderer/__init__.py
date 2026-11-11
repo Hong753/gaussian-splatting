@@ -177,6 +177,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         full_radii = torch.zeros(pc.get_xyz.shape[0], dtype=radii.dtype, device=radii.device)
         full_radii[occlusion_keep] = radii
         radii = full_radii
+
+    # The upstream inverse-depth backward reads a flat H*W pointer and ignores
+    # tensor strides. Reductions can supply a zero-stride expanded scalar;
+    # materialize it here for the installed native/AbsGS baseline as well.
+    # The ray extension also guards its binding for direct package callers.
+    if depth_image.requires_grad:
+        depth_image.register_hook(lambda gradient: gradient.contiguous())
         
     # Apply exposure to rendered image (training only)
     if use_trained_exp:

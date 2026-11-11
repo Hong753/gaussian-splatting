@@ -34,6 +34,16 @@ when its raw group cache exists. Surface fusion is CPU preprocessing; mesh depth
 rasterization, point visibility tests, and splat forward/backward clipping are
 CUDA. This workflow does not launch training.
 
+The smoke test includes native/ray RGB and inverse-depth parity with AA off/on,
+finite gradients for every parameter, and direct CUDA binding checks using
+expanded and transposed inverse-depth gradients. A reduction such as
+`depth.sum()` supplies a zero-stride gradient; the binding materializes it before
+CUDA reads a dense pixel array. The shared render wrapper protects the installed
+native baseline the same way. If updating after the original NaN parity failure,
+rerun the wrapper after `git pull --ff-only`; it rebuilds the extension and retains
+the existing DA3 predictions. A new smoke failure names the backend, AA setting,
+and offending parameter instead of only reporting an anonymous tensor mismatch.
+
 Open `http://211.172.247.108:8085`. The point-set selector switches between
 original LiDAR rows and checkpoint Gaussian centers. Toggle:
 

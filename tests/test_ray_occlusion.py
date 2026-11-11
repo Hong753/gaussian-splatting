@@ -19,6 +19,63 @@ from test_occlusion import camera
 
 
 class RayTests(unittest.TestCase):
+    def test_smoke_finiteness_check_identifies_backend_and_parameter(self):
+        from scripts.smoke_ray_occlusion import require_finite
+        require_finite([('_xyz',torch.zeros(2,3))],'AA=False native gradient')
+        for invalid in (float('nan'),float('inf')):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(AssertionError,r'AA=False native gradient: _xyz has 6/6 non-finite values'):
+                    require_finite([('_xyz',torch.full((2,3),invalid))],'AA=False native gradient')
+
+    def test_depth_reduction_materializes_gradients_before_native_backward(self):
+        # Native C++ indexes depth gradients by pixel, without tensor strides.
+        # A sum supplies H*W logical elements backed by just one scalar.
+        seen=[]
+        class RawRaster(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx,means):
+                ctx.shape=means.shape
+                return means.sum().expand(3,8,8).clone(),means.sum().expand(1,8,8).clone()
+            @staticmethod
+            def backward(ctx,rgb_grad,depth_grad):
+                seen.append(depth_grad)
+                if not depth_grad.is_contiguous():
+                    raise AssertionError(f'Raw depth pointer received strides {depth_grad.stride()}')
+                return torch.ones(ctx.shape)*(rgb_grad.sum()+depth_grad.sum())
+        class Rasterizer:
+            def __init__(self,raster_settings):self.ray=hasattr(raster_settings,'occlusion_depth')
+            def __call__(self,**kwargs):
+                rgb,depth=RawRaster.apply(kwargs['means3D'])
+                result=(rgb,torch.ones(2,dtype=torch.int32),depth)
+                return result+(torch.ones(2,dtype=torch.int32),) if self.ray else result
+        stub=SimpleNamespace(GaussianRasterizationSettings=lambda **kw:SimpleNamespace(**kw),GaussianRasterizer=Rasterizer)
+        spec=importlib.util.spec_from_file_location('_depth_stride_renderer',Path(__file__).resolve().parents[1]/'gaussian_renderer/__init__.py')
+        module=importlib.util.module_from_spec(spec)
+        zeros_like=torch.zeros_like
+        def cpu_zeros_like(value,**kwargs):
+            kwargs.pop('device',None)
+            return zeros_like(value,**kwargs)
+        with patch.dict(sys.modules,{'diff_gaussian_rasterization':stub,'diff_gaussian_rasterization_occlusion':stub,
+                                    'scene.gaussian_model':SimpleNamespace(GaussianModel=object)}):
+            spec.loader.exec_module(module)
+            pc=SimpleNamespace(get_xyz=torch.full((2,3),.01,requires_grad=True),get_opacity=torch.ones(2,1),
+                get_scaling=torch.ones(2,3),get_rotation=torch.ones(2,4),get_features=torch.ones(2,1,3),active_sh_degree=0)
+            cam=camera(8);cam.camera_center=torch.zeros(3)
+            pipe=SimpleNamespace(occlusion_backend='ray',occlusion_mode='off',occlusion_margin=0.,debug=False,
+                antialiasing=True,compute_cov3D_python=False,convert_SHs_python=False)
+            for ray in (False,True):
+                for layout in ('sum','transpose'):
+                    with self.subTest(ray=ray,layout=layout),patch.object(module.torch,'zeros_like',side_effect=cpu_zeros_like):
+                        out=module.render(cam,pc,pipe,torch.zeros(3),**({'occlusion_depth':torch.full((8,8),2.)} if ray else {}))
+                        if layout=='sum':
+                            gradient,=torch.autograd.grad(out['depth'].sum()*.01,(pc.get_xyz,))
+                            expected=torch.full_like(out['depth'],.01)
+                        else:
+                            expected=torch.arange(64,dtype=torch.float32).reshape(1,8,8).transpose(1,2)
+                            gradient,=torch.autograd.grad(out['depth'],(pc.get_xyz,),grad_outputs=expected)
+                        torch.testing.assert_close(seen[-1],expected)
+                        torch.testing.assert_close(gradient,torch.ones_like(pc.get_xyz)*expected.sum())
+
     def test_hole_changes_only_its_ray_and_blocked_loss_has_zero_background_gradient(self):
         alpha=torch.full((2,16,16),.2,requires_grad=True)
         colors=torch.tensor([[.8,.1,.1],[.1,.9,.2]],requires_grad=True)
