@@ -182,8 +182,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # tensor strides. Reductions can supply a zero-stride expanded scalar;
     # materialize it here for the installed native/AbsGS baseline as well.
     # The ray extension also guards its binding for direct package callers.
+    # RGB-only losses pass None to this hook before autograd materializes the
+    # unused output's zero gradient for the custom rasterizer backward.
     if depth_image.requires_grad:
-        depth_image.register_hook(lambda gradient: gradient.contiguous())
+        depth_image.register_hook(lambda gradient: gradient.contiguous() if gradient is not None else None)
         
     # Apply exposure to rendered image (training only)
     if use_trained_exp:

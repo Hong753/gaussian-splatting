@@ -64,17 +64,27 @@ class RayTests(unittest.TestCase):
             pipe=SimpleNamespace(occlusion_backend='ray',occlusion_mode='off',occlusion_margin=0.,debug=False,
                 antialiasing=True,compute_cov3D_python=False,convert_SHs_python=False)
             for ray in (False,True):
-                for layout in ('sum','transpose'):
+                for layout in ('sum','transpose','rgb_only','rgb_and_depth'):
                     with self.subTest(ray=ray,layout=layout),patch.object(module.torch,'zeros_like',side_effect=cpu_zeros_like):
                         out=module.render(cam,pc,pipe,torch.zeros(3),**({'occlusion_depth':torch.full((8,8),2.)} if ray else {}))
+                        rgb_gradient=0.
                         if layout=='sum':
                             gradient,=torch.autograd.grad(out['depth'].sum()*.01,(pc.get_xyz,))
                             expected=torch.full_like(out['depth'],.01)
-                        else:
+                        elif layout=='transpose':
                             expected=torch.arange(64,dtype=torch.float32).reshape(1,8,8).transpose(1,2)
                             gradient,=torch.autograd.grad(out['depth'],(pc.get_xyz,),grad_outputs=expected)
+                        else:
+                            pixels=torch.ones(8,8);pixels[3,4]=0
+                            loss=(out['render']*pixels).sum()
+                            expected=torch.zeros_like(out['depth'])
+                            if layout=='rgb_and_depth':
+                                loss=loss+out['depth'].sum()*.01
+                                expected.fill_(.01)
+                            gradient,=torch.autograd.grad(loss,(pc.get_xyz,))
+                            rgb_gradient=3*pixels.sum()
                         torch.testing.assert_close(seen[-1],expected)
-                        torch.testing.assert_close(gradient,torch.ones_like(pc.get_xyz)*expected.sum())
+                        torch.testing.assert_close(gradient,torch.ones_like(pc.get_xyz)*(expected.sum()+rgb_gradient))
 
     def test_hole_changes_only_its_ray_and_blocked_loss_has_zero_background_gradient(self):
         alpha=torch.full((2,16,16),.2,requires_grad=True)
