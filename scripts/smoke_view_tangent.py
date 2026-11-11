@@ -80,7 +80,11 @@ def exercise(backend, directory):
         model.optimizer.zero_grad(set_to_none=True)
     assert model.xyz_gradient_accum[2].item() == 0 and model.denom[:, 0].tolist() == [2, 2, 0]
     original = model.get_xyz.detach().clone()
-    stats = model.densify_and_prune(0., .005, 1., None, result['radii'])
+    # A close camera must not destroy the measured wall merely because its
+    # Gaussians have large projected footprints. Old tangent pruning erased it.
+    model.max_radii2D[:2] = 64
+    stats = model.densify_and_prune(0., .005, 1., 20, result['radii'])
+    assert stats['pruned_screen_size'] == 0 and stats['large_screen_retained'] == 1
     assert (stats['cloned_parents'], stats['split_parents'], stats['points_after']) == (1, 1, 5), stats
     # Retained clone parent, untouched hidden point, then clone and split children.
     torch.testing.assert_close(model.get_xyz[1], original[2])
@@ -112,7 +116,7 @@ def exercise(backend, directory):
     return dict(backend=backend, antialiasing=True, cuda_mesh_first_hit=True,
         raw_surface_without_culling_margin=True, disk_depth_cache=True,
         blocked_gradients_zero=True, hidden_parents_excluded=True,
-        bounded_tangent_clone_split=True, optimizer_after_growth=True,
+        bounded_tangent_clone_split=True, large_projected_surface_survives=True, optimizer_after_growth=True,
         mesh_free_inference=True, growth=stats, passed=True)
 
 

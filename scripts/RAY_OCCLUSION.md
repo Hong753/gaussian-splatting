@@ -165,6 +165,15 @@ parent's signed distance to that plane. Holes, depth discontinuities, unsupporte
 regions, and occluded parents do not seed growth. This changes the growth rule;
 the ordinary reduced-LR position/covariance optimizer remains in place.
 
+Tangent growth no longer deletes or disqualifies a parent solely because its
+projected radius exceeds 20 pixels. A camera approaching a valid wall can cause
+that condition. Earlier versions preserved pre-growth image radii and applied
+this deletion every growth event after the first opacity reset, which could
+remove surface coverage without replacements. Low-opacity and world-size pruning
+remain enabled. New logs separate these deletion causes from split-parent
+replacement and count large-footprint points retained. This fixes that deletion
+path; it does not by itself prove which rule dominated an existing failed run.
+
 The dedicated launcher defaults to this mesh run on **GPU 1**:
 
 ```bash
@@ -239,3 +248,25 @@ Per-frame results are written below `MODEL/ray_inspection/iteration_N/`.
 The viewer shows a fixed saved checkpoint, with its iteration displayed; restart
 to load newer weights. With the default 7k/30k save schedule, the 7k checkpoint
 predates adaptive densification, whereas the 30k checkpoint contains its result.
+
+## Audit missing Gaussians before retraining
+
+The displayed `Gaussians: N loaded` count includes every row in the saved PLY,
+regardless of visibility, culling flags or display sampling. The static mesh and
+initial LiDAR can remain complete even if training has pruned the Gaussian model.
+Audit the input, all saved iterations and the tangent growth log without CUDA or
+loading PLY payloads into memory:
+
+```bash
+conda activate 3dgs
+python scripts/audit_gaussian_population.py --model /path/to/model
+```
+
+This writes `MODEL/population_audit.json`, prints checkpoint populations and the
+largest net drops, and checks growth/pruning accounting. Legacy logs contain only
+total pruning, so they cannot retrospectively separate opacity, size and split
+replacement. Check whether the 7k checkpoint still has the initialization count
+and when subsequent growth events reduce it. Changing viewer toggles, culling
+margins or opacity cannot recover deleted rows; recover from an intact training
+checkpoint or reinitialize after resolving the deletion. A PLY is a geometry and
+appearance snapshot, not a full optimizer checkpoint.

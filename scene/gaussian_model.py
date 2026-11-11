@@ -618,7 +618,9 @@ class GaussianModel:
 
         Every selected parent adds exactly one net Gaussian: one displaced clone
         or two split children replacing the parent. No fallback volumetric growth
-        for unsupported/hidden parents. Pruning and opacity rules remain native.
+        for unsupported/hidden parents. Opacity and world-size pruning remain
+        enabled. Projected size alone never deletes points: a camera approaching
+        a valid wall can make every nearby Gaussian exceed a pixel threshold.
         """
         from utils.view_tangent import eligible_parents, tangent_children
         from utils.occlusion_culling import rotation_matrix
@@ -630,9 +632,11 @@ class GaussianModel:
         supported_parents = int(good.sum().item())
         good &= (gradient >= max_grad) & (self.get_opacity[:, 0] >= min_opacity)
         # Parents that are about to be pruned should not consume the growth budget.
+        # A large image footprint is not a geometric outlier and must neither
+        # reject a growth parent nor remove its existing surface coverage.
         scales = self.get_scaling
         if max_screen_size:
-            good &= (self.max_radii2D <= max_screen_size) & (scales.max(dim=1).values <= .1*extent)
+            good &= scales.max(dim=1).values <= .1*extent
         candidates = good.nonzero().flatten()
         budget = min(cfg['view_tangent_max_parents'], max(0, cfg['view_tangent_max_points']-count))
         selected = candidates
@@ -665,13 +669,23 @@ class GaussianModel:
         # or the budget is full. Unsupported historical gradients must not build up.
         self.xyz_gradient_accum.zero_()
         self.denom.zero_()
-        prune_mask = self.get_opacity[:, 0] < min_opacity
-        prune_mask[split_parents] = True
+        low_opacity = self.get_opacity[:, 0] < min_opacity
+        split_replaced = torch.zeros_like(low_opacity)
+        split_replaced[split_parents] = True
+        world_oversize = torch.zeros_like(low_opacity)
         if max_screen_size:
-            # postfix resets radii; use the pre-growth values for original rows.
-            prune_mask[:count] |= previous_max_radii > max_screen_size
-            prune_mask |= self.get_scaling.amax(dim=1) > .1*extent
+            world_oversize = self.get_scaling.amax(dim=1) > .1*extent
+        prune_mask = low_opacity | split_replaced | world_oversize
         pruned = int(prune_mask.sum().item())
+        # Disjoint causes sum to `pruned`; split replacement is not loss of
+        # coverage. Record the previously destructive screen-size candidates.
+        prune_stats = dict(prune_stats_version=2,
+            replaced_split_parents=len(split_parents),
+            pruned_low_opacity=int((low_opacity & ~split_replaced).sum().item()),
+            pruned_world_size=int((world_oversize & ~low_opacity & ~split_replaced).sum().item()),
+            pruned_screen_size=0,
+            large_screen_retained=int(((previous_max_radii > max_screen_size) & ~prune_mask[:count]).sum().item())
+                if max_screen_size else 0)
         if pruned:
             self.prune_points(prune_mask)
         self.max_radii2D.zero_()
@@ -680,6 +694,7 @@ class GaussianModel:
             surface_supported_parents=supported_parents,
             selected_parents=len(selected), cloned_parents=int((~split).sum().item()),
             split_parents=len(split_parents), added_children=len(parents), pruned=pruned,
+            **prune_stats,
             max_child_normal_displacement=normal_displacement, max_child_tangent_fraction=tangent_fraction,
             points_after=len(self._xyz), point_budget=cfg['view_tangent_max_points'])
         torch.cuda.empty_cache()

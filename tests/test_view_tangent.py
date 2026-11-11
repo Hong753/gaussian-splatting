@@ -150,12 +150,40 @@ class ViewTangentTests(unittest.TestCase):
                 self.assertEqual(stats['selected_parents'], 0)
                 self.assertEqual(len(model.get_xyz), 2)
 
-    def test_pruning_retains_pre_growth_max_radii(self):
+    def test_large_projection_keeps_valid_wall_and_allows_replacement_growth(self):
         model = self.model()
         model.max_radii2D[:] = torch.tensor([50., 1.])
         stats = self.densify(model, max_screen_size=20)
-        self.assertEqual(stats['selected_parents'], 1)
-        self.assertTrue((model.get_xyz[:, 0] > .1).all())
+        self.assertEqual(stats['selected_parents'], 2)
+        self.assertEqual(stats['points_after'], 4)
+        self.assertEqual(stats['large_screen_retained'], 1)
+        self.assertEqual(stats['pruned_screen_size'], 0)
+        torch.testing.assert_close(model.get_xyz[:2], torch.tensor([[0., 0, 2.], [.2, 0, 2.]]))
+
+    def test_close_camera_cannot_erase_wall_when_growth_budget_is_full(self):
+        model = self.model()
+        model.view_tangent_options['view_tangent_max_points'] = 2
+        original = model.get_xyz.detach().clone()
+        for _ in range(3):
+            model.max_radii2D.fill_(100)
+            stats = self.densify(model, max_screen_size=20)
+            self.assertEqual(stats['points_after'], 2)
+            self.assertEqual(stats['pruned'], 0)
+            torch.testing.assert_close(model.get_xyz, original)
+
+    def test_opacity_and_world_size_pruning_have_separate_causes(self):
+        for cause in ('opacity', 'world_size'):
+            with self.subTest(cause=cause):
+                model = self.model()
+                model.max_radii2D[:] = 100
+                if cause == 'opacity':model._opacity.data[0] = -12
+                else:model._scaling.data[0] = math.log(.2)
+                stats = self.densify(model, max_screen_size=20)
+                self.assertEqual(stats['pruned'], 1)
+                self.assertEqual(stats['pruned_low_opacity'], int(cause == 'opacity'))
+                self.assertEqual(stats['pruned_world_size'], int(cause == 'world_size'))
+                self.assertEqual(stats['replaced_split_parents'], 0)
+                self.assertTrue((model.get_xyz[:, 0] > .1).all())
 
     def test_changed_surface_association_resets_previous_statistics(self):
         model = self.model()
