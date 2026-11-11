@@ -91,7 +91,18 @@ class DA3Tests(unittest.TestCase):
                 self.assertEqual(prepare_da3_occlusion.main(copied_args+['--inspect-views', '1']), 0)
                 self.assertEqual(prepare_da3_occlusion.main(args), 0)
                 self.assertEqual(prepare_da3_occlusion.main(args), 0)
-            self.assertEqual(len(calls), 2)  # One preview, one full batch; both reused.
+                self.assertEqual(len(calls), 2)  # Window preview then full batch.
+                trajectory_args = args[:]
+                trajectory_args[trajectory_args.index('--output')+1] = str(root/'trajectory')
+                trajectory_args += ['--view-grouping', 'trajectory']
+                self.assertEqual(prepare_da3_occlusion.main(trajectory_args+['--inspect-views', '1']), 0)
+                self.assertTrue((root/'trajectory/predictions/group_00000.npz').is_file())
+                self.assertEqual(prepare_da3_occlusion.main(trajectory_args), 0)
+                trajectory_meta = json.loads((root/'trajectory/metadata.json').read_text())
+                self.assertTrue(trajectory_meta['complete'])
+                self.assertEqual(trajectory_meta['view_grouping'], 'trajectory_v1')
+                self.assertGreater(trajectory_meta['summary']['mean_reliable_tile_fraction'], .1)
+            self.assertEqual(len(calls), 3)  # Trajectory preview -> full reuses all raw group predictions.
             metadata = json.loads((root/'output/metadata.json').read_text())
             self.assertTrue(metadata['complete'])
             self.assertGreater(metadata['summary']['mean_reliable_tile_fraction'], .1)

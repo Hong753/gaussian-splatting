@@ -95,7 +95,8 @@ def fit_scale(depth, valid, u, v, z, min_anchors=200, max_relative_error=.10, ho
     return scale if accepted else None, report
 
 
-def calibrate_regions(depth, valid, u, v, z, min_anchors=200, max_relative_error=.10):
+def calibrate_regions(depth, valid, u, v, z, min_anchors=200, max_relative_error=.10,
+                      *, scale_override=None, global_fit=None):
     """Fit one scale, then validate bounded regions independently.
 
     A rejected global inlier fraction is not a reason to erase well-supported
@@ -108,9 +109,10 @@ def calibrate_regions(depth, valid, u, v, z, min_anchors=200, max_relative_error
     from scipy.ndimage import distance_transform_edt
     policy = CALIBRATION_POLICY
     h, w = depth.shape
-    _, global_fit = fit_scale(depth, valid, u, v, z, min_anchors, max_relative_error,
-                              holdout_grid=policy['holdout_grid'])
-    scale = global_fit.get('scale')
+    if global_fit is None:
+        _, global_fit = fit_scale(depth, valid, u, v, z, min_anchors, max_relative_error,
+                                  holdout_grid=policy['holdout_grid'])
+    scale = global_fit.get('scale') if scale_override is None else scale_override
     mask = np.zeros_like(valid, dtype=bool)
     report = dict(accepted=False, policy=policy['name'], scale=scale, global_fit=global_fit,
                   accepted_regions=0, tested_regions=0, reason='no supported global scale proposal')

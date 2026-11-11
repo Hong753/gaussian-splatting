@@ -24,12 +24,12 @@ for name in ('input.ply', 'keyframes.json'):
         raise FileNotFoundError(model/name)
 print(spec['cfg']['source_path'])
 print(spec['cfg'].get('resolution', -1))
-print(model.parent/'da3_lidar_depth_stride3_v2')
-print(model.parent/'scene_occlusion_stride3_v1')
+print(model.parent/'da3_lidar_depth_stride3_trajectory40_v1')
+print(model.parent/'scene_occlusion_stride3_trajectory40_v1')
 PY
 )
 mapfile -t scene_settings <<< "$scene_config"
-scene_depth="${DA3_DEPTH_DIR:-${scene_settings[2]}}"
+scene_depth="${DA3_TRAJECTORY_DEPTH_DIR:-${scene_settings[2]}}"
 scene_output="${SCENE_OCCLUSION_DIR:-${scene_settings[3]}}"
 conda activate da3-depth
 python -m pip install -r requirements-da3.txt
@@ -37,8 +37,10 @@ python scripts/check_da3_environment.py --gpu "$scene_gpu"
 python -u scripts/prepare_da3_occlusion.py \
     --source "${scene_settings[0]}" --keyframes "$scene_model/keyframes.json" \
     --point-cloud "$scene_model/input.ply" --output "$scene_depth" \
-    --resolution "${scene_settings[1]}" --process-res 756 --gpu "$scene_gpu"
+    --resolution "${scene_settings[1]}" --view-grouping trajectory --group-size 40 \
+    --shared-views 8 --local-neighbors 2 --process-res 504 --gpu "$scene_gpu"
 conda activate 3dgs
+python -u scripts/audit_da3_occlusion.py --depth-dir "$scene_depth"
 python -m pip install -r requirements-scene-occlusion.txt
 python -m pip install --no-build-isolation -r requirements-occlusion.txt
 python scripts/smoke_occlusion.py --mesh --gpu "$scene_gpu"

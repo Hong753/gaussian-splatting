@@ -1,5 +1,8 @@
 # Training
 
+For trajectory-spanning DA3 groups inspired by PlanarGS geometry priors and
+diagnostics for empty depth references, see [DA3_TRAJECTORY.md](DA3_TRAJECTORY.md).
+
 For fixed whole-scene surfaces, precomputed visible/occluded LiDAR IDs per view,
 and native 3DGS + AA culling at training and novel poses, see
 [SCENE_OCCLUSION.md](SCENE_OCCLUSION.md).

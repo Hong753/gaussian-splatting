@@ -8,7 +8,8 @@ surface coverage: unseen or unsupported surfaces stay unknown and are reported.
 
 ## Construction and visibility
 
-1. Finish the **complete v2 DA3 training cache**, including local LiDAR alignment,
+1. Finish the **complete DA3 trajectory-group training cache** (format v2),
+   including shared group metric alignment, local LiDAR donor checks,
    confidence/boundary checks, and agreement with at least two other views.
    No held-out RGB images enter depth prediction or surface fusion.
 2. Fuse trusted camera-z depths in world coordinates with a scalable TSDF
@@ -64,16 +65,19 @@ bash scripts/prepare_scene_occlusion.sh 5 \
   07519.jpg
 ```
 
+The wrapper uses [trajectory-spanning groups](DA3_TRAJECTORY.md), with a 40-image
+budget, eight shared references, two local companions per target, and processing
+resolution 504. Preview a failing frame using `inspect_da3_trajectory.sh` first.
 The wrapper activates `da3-depth` for complete depth preparation and `3dgs` for
 fusion, visibility, and viewing. Existing matching DA3 frames are reused. It
 runs the new mesh CUDA smoke test before scene fusion. All registered frames are
 preprocessed, then the original-LiDAR viewer opens on port **8083**. This stage
 does not start training. `SCENE_VISIBILITY_PORT`, `SCENE_OCCLUSION_DIR`,
-`DA3_DEPTH_DIR`, and `DA3_CONDA_SH` override defaults. If only the viewer was
+`DA3_TRAJECTORY_DEPTH_DIR`, and `DA3_CONDA_SH` override defaults. If only the viewer was
 stopped, run `scripts/inspect_scene_visibility.py` directly to reopen it.
 
 Default scene output:
-`/data/3dgs_outputs/orange_4F/1_full/scene_occlusion_stride3_v1`
+`/data/3dgs_outputs/orange_4F/1_full/scene_occlusion_stride3_trajectory40_v1`
 
 - `scene.json`, `mesh.npz`, `mesh.ply`: immutable scene input identity and surface.
 - `occlusion_depth_cache/<scene-hash>/`: native-camera first-hit depth and tiles.
@@ -86,12 +90,12 @@ Independent commands for inspection/resuming:
 
 ```bash
 python -u scripts/prepare_scene_occlusion.py fuse \
-  --depth-dir /data/3dgs_outputs/orange_4F/1_full/da3_lidar_depth_stride3_v2 \
+  --depth-dir /data/3dgs_outputs/orange_4F/1_full/da3_lidar_depth_stride3_trajectory40_v1 \
   --point-cloud /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_occlusion/input.ply \
-  --output /data/3dgs_outputs/orange_4F/1_full/scene_occlusion_stride3_v1
+  --output /data/3dgs_outputs/orange_4F/1_full/scene_occlusion_stride3_trajectory40_v1
 
 python -u scripts/prepare_scene_occlusion.py views \
-  --scene /data/3dgs_outputs/orange_4F/1_full/scene_occlusion_stride3_v1/scene.json \
+  --scene /data/3dgs_outputs/orange_4F/1_full/scene_occlusion_stride3_trajectory40_v1/scene.json \
   --point-cloud /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_occlusion/input.ply \
   --gpu 5 --image 07519.jpg
 ```
@@ -108,7 +112,7 @@ conda activate 3dgs
 cd /home/sequor_vfm/gaussian-splatting
 python -u scripts/inspect_occlusion.py \
   --model /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_occlusion \
-  --scene-geometry /data/3dgs_outputs/orange_4F/1_full/scene_occlusion_stride3_v1/scene.json \
+  --scene-geometry /data/3dgs_outputs/orange_4F/1_full/scene_occlusion_stride3_trajectory40_v1/scene.json \
   --image 07519.jpg --gpu 5 --host 0.0.0.0 --port 8082 --check-gradients
 ```
 
@@ -134,7 +138,7 @@ scene_base=$(python -c 'from scripts.render import resolve_models; import sys; p
 python -u scripts/run_occlusion.py \
   --source "$scene_source" --baseline "$scene_base" --keyframes "$scene_base/keyframes.json" \
   --model "$scene_root/3dgs_stride3_aa_scene_occlusion_warm7k_lr50" \
-  --scene-geometry "$scene_root/scene_occlusion_stride3_v1/scene.json" \
+  --scene-geometry "$scene_root/scene_occlusion_stride3_trajectory40_v1/scene.json" \
   --position-warmup-steps 7000 --position-ramp-steps 2000 --position-lr-scale .02 \
   --gpu 5
 ```

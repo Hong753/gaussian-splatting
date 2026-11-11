@@ -1,5 +1,9 @@
 # LiDAR-calibrated Depth Anything 3 occlusion ablation
 
+For the newer trajectory-spanning groups, shared metric calibration and donor
+validation, see [DA3_TRAJECTORY.md](DA3_TRAJECTORY.md). The window-based
+experiment below remains available as a separate configuration.
+
 This experiment uses native 3DGS + AA, initialized from the same registered LiDAR
 cloud and trained on the same sharp stride-3 keyframes. DA3 supplies fixed dense
 depth maps for **training-view occlusion only**. Depth regularization and exposure

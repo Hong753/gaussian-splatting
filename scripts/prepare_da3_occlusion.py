@@ -106,6 +106,10 @@ def parser():
     p.add_argument('--process-res', type=int, default=756)
     p.add_argument('--core-views', type=int, default=4)
     p.add_argument('--context-views', type=int, default=2)
+    p.add_argument('--view-grouping', choices=('window', 'trajectory'), default='window')
+    p.add_argument('--group-size', type=int, default=40, help='Total image budget for a trajectory group')
+    p.add_argument('--shared-views', type=int, default=8, help='Trajectory-spanning references shared across groups')
+    p.add_argument('--local-neighbors', type=int, default=2, help='Adjacent companion frames for each trajectory target')
     p.add_argument('--confidence-percentile', type=float, default=20.)
     p.add_argument('--min-anchors', type=int, default=200)
     p.add_argument('--max-relative-error', type=float, default=.10)
@@ -141,16 +145,28 @@ def main(argv=None):
         raise ValueError('Require at least three unique registered training frames')
     targets = inspection_targets(names, args.inspect_views, args.inspect_image)
     inspect_only = bool(args.inspect_views or args.inspect_image)
+    trajectory = args.view_grouping == 'trajectory'
+    if trajectory:
+        from utils.da3_trajectory import POLICY, trajectory_groups, calibrate_group, validate_from_donors
+        if args.min_support_views < 2 or args.min_support_views > POLICY['max_donors']:
+            raise ValueError('Trajectory validation needs 2..8 independent donor views')
+        groups = list(trajectory_groups(names, args.group_size, args.shared_views, args.local_neighbors))
+    else:
+        groups = list(windows(names, args.core_views, args.context_views))
     cameras = {name: record_camera(records[name], args.resolution, device='cpu') for name in names}
     signatures = {n: camera_signature(c, args.edge_pixels) for n, c in cameras.items()}
     images_identity = [(n, Path(records[n]['image_path']).stat().st_size,
                        Path(records[n]['image_path']).stat().st_mtime_ns) for n in names]
-    config = dict(version=VERSION, calibration_policy=CALIBRATION_POLICY, source=str(source),
+    config = dict(version=VERSION, calibration_policy=POLICY if trajectory else CALIBRATION_POLICY, source=str(source),
         point_cloud=str(cloud), point_cloud_sha256=file_digest(cloud),
         images=names, image_identity_sha256=hashlib.sha256(json.dumps(images_identity).encode()).hexdigest(),
         camera_signatures=signatures, **{k: v for k, v in vars(args).items()
             if k not in ('source', 'output', 'point_cloud', 'keyframes', 'gpu', 'preview_count',
-                         'inspect_views', 'inspect_image')})
+                         'inspect_views', 'inspect_image', 'view_grouping', 'group_size', 'shared_views', 'local_neighbors')})
+    if trajectory:
+        config.update(view_grouping='trajectory_v1', group_size=args.group_size,
+            shared_views=args.shared_views, local_neighbors=args.local_neighbors,
+            reference_strategy='saddle_balanced')
     output.mkdir(parents=True, exist_ok=True)
     metadata_path = output/'metadata.json'
     existing = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
@@ -174,10 +190,9 @@ def main(argv=None):
     metadata = dict(config, resolved_model_revision=revision, complete=False,
                     policy='training images only; evaluation and novel views render without DA3 culling')
     atomic_json(metadata_path, metadata)
-    from depth_anything_3.api import DepthAnything3
     from plyfile import PlyData
     torch.manual_seed(42)
-    model = DepthAnything3.from_pretrained(args.model_id, revision=revision).to('cuda').eval()
+    model = None  # Load only if an inference group is not already cached.
     vertex = PlyData.read(str(cloud))['vertex']
     xyz = np.stack([vertex[k] for k in ('x', 'y', 'z')], axis=-1).astype(np.float32)
     xyz = xyz[np.isfinite(xyz).all(axis=1)]
@@ -190,15 +205,19 @@ def main(argv=None):
         previews = targets
     (output/'previews').mkdir(exist_ok=True)
     rows = {}
-    work = [(batch, [n for n in core if n in targets])
-            for batch, core in windows(names, args.core_views, args.context_views) if targets.intersection(core)]
-    for batch, core in tqdm(work, desc='Aligning DA3 windows'):
+    atomic_json(output/'groups.json', dict(grouping=args.view_grouping, groups=[
+        dict(id=i, images=batch, targets=core) for i, (batch, core) in enumerate(groups)]))
+    work = [(i, batch, [n for n in core if n in targets])
+            for i, (batch, core) in enumerate(groups) if targets.intersection(core)]
+    for group_id, batch, core in tqdm(work, desc='Aligning DA3 trajectory groups' if trajectory else 'Aligning DA3 windows'):
         if all((output/'frames'/frame_filename(n)).exists() for n in core):
             for n in core:
                 with np.load(output/'frames'/frame_filename(n), allow_pickle=False) as data:
                     rows[n] = json.loads(str(data['report']))
             continue
         images, intrinsics, extrinsics = [], [], []
+        prediction_path = output/'predictions'/f'group_{group_id:05d}.npz'
+        cached_prediction = trajectory and prediction_path.exists()
         # Same native training image dimensions across a batch prevents DA3's
         # automatic crop of mixed-size images from changing camera coverage.
         shapes = {(cameras[n].image_width, cameras[n].image_height) for n in batch}
@@ -206,18 +225,35 @@ def main(argv=None):
             raise ValueError('DA3 windows currently require a common training image size')
         for n in batch:
             camera = cameras[n]
-            with Image.open(records[n]['image_path']) as image:
-                images.append(image.convert('RGB').resize((camera.image_width, camera.image_height), Image.Resampling.LANCZOS))
+            if not cached_prediction:
+                with Image.open(records[n]['image_path']) as image:
+                    images.append(image.convert('RGB').resize((camera.image_width, camera.image_height), Image.Resampling.LANCZOS))
             k, e = camera_matrices(records[n], camera.image_width, camera.image_height)
             intrinsics.append(k)
             extrinsics.append(e)
-        with torch.inference_mode():
-            prediction = model.inference(images, extrinsics=np.stack(extrinsics), intrinsics=np.stack(intrinsics),
-                align_to_input_ext_scale=True, infer_gs=False, process_res=args.process_res,
-                process_res_method='upper_bound_resize', ref_view_strategy='middle')
+        if cached_prediction:
+            from types import SimpleNamespace
+            with np.load(prediction_path, allow_pickle=False) as data:
+                if data['images'].tolist() != batch:
+                    raise ValueError('Cached prediction group does not match the planned views')
+                prediction = SimpleNamespace(depth=data['depth'], conf=data['confidence'], intrinsics=data['intrinsics'])
+            print(f'Reusing raw DA3 predictions for group {group_id}', flush=True)
+        else:
+            if model is None:
+                from depth_anything_3.api import DepthAnything3
+                model = DepthAnything3.from_pretrained(args.model_id, revision=revision).to('cuda').eval()
+            print(f'Group {group_id}: {len(batch)} posed images spanning {batch[0]} .. {batch[-1]}', flush=True)
+            with torch.inference_mode():
+                prediction = model.inference(images, extrinsics=np.stack(extrinsics), intrinsics=np.stack(intrinsics),
+                    align_to_input_ext_scale=True, infer_gs=False, process_res=args.process_res,
+                    process_res_method='upper_bound_resize', ref_view_strategy='saddle_balanced' if trajectory else 'middle')
         if prediction.conf is None or prediction.intrinsics is None:
             raise ValueError('Use DA3 main-series weights with confidence and pose conditioning')
+        if trajectory and not cached_prediction:
+            save_npz(prediction_path, images=np.array(batch), depth=prediction.depth,
+                confidence=prediction.conf, intrinsics=prediction.intrinsics, extrinsics=np.stack(extrinsics))
         calibrated = []
+        prepared = []
         for i, n in enumerate(batch):
             raw = np.asarray(prediction.depth[i], np.float32)
             conf = np.asarray(prediction.conf[i], np.float32)
@@ -236,23 +272,46 @@ def main(argv=None):
             pu = np.floor(k[0, 0]*(u-full_k[0, 2])/full_k[0, 0]+k[0, 2]+.5).astype(int)
             pv = np.floor(k[1, 1]*(v-full_k[1, 2])/full_k[1, 1]+k[1, 2]+.5).astype(int)
             confident = reliable_pixels(raw, conf, args.confidence_percentile)
-            scale, valid, report = calibrate_regions(raw, confident, pu, pv, z, args.min_anchors, args.max_relative_error)
-            report.update(projected_lidar_anchors=len(z), confident_pixel_fraction=float(confident.mean()))
-            depth = np.where(np.isfinite(raw), raw*(scale or 1.), 0).astype(np.float32)
-            calibrated.append((depth, valid, k, extrinsics[i], report, confident, raw, conf))
+            if trajectory:
+                prepared.append(dict(image=n, raw=raw, confidence=conf, confident=confident,
+                    anchors=(pu, pv, z), intrinsic=k, extrinsic=extrinsics[i]))
+            else:
+                scale, valid, report = calibrate_regions(raw, confident, pu, pv, z, args.min_anchors, args.max_relative_error)
+                report.update(projected_lidar_anchors=len(z), confident_pixel_fraction=float(confident.mean()))
+                depth = np.where(np.isfinite(raw), raw*(scale or 1.), 0).astype(np.float32)
+                calibrated.append((depth, valid, k, extrinsics[i], report, confident, raw, conf))
+        if trajectory:
+            prepared = calibrate_group(prepared, args.min_anchors, args.max_relative_error)
+            for frame in prepared:
+                frame['report'].update(projected_lidar_anchors=len(frame['anchors'][2]),
+                    confident_pixel_fraction=float(frame['confident'].mean()), group_id=group_id,
+                    input_views=len(batch), input_images=batch)
+                calibrated.append(tuple(frame[key] for key in ('depth', 'local', 'intrinsic', 'extrinsic',
+                                                               'report', 'confident', 'raw', 'confidence')))
         for i, n in enumerate(batch):
             if n not in core:
                 continue
             depth, valid, k, e, report, confident, raw, conf = calibrated[i]
-            neighbors = [entry[:4] for j, entry in enumerate(calibrated) if j != i]
-            support = cross_view_support(depth, valid, k, e, neighbors, args.multiview_tolerance)
-            trusted = valid & (support >= args.min_support_views)
+            if trajectory:
+                neighbors = [entry for j, entry in enumerate(prepared) if j != i]
+                trusted, support, donors = validate_from_donors(prepared[i], neighbors,
+                    args.multiview_tolerance, args.min_support_views, POLICY['max_donors'])
+                report.update(accepted=bool(trusted.any()), donor_images=donors,
+                    borrowed_pixel_fraction=float((trusted & ~valid).mean()),
+                    reason='metric donor validation' if trusted.any() else 'no agreement with two locally validated donor views')
+            else:
+                neighbors = [entry[:4] for j, entry in enumerate(calibrated) if j != i]
+                support = cross_view_support(depth, valid, k, e, neighbors, args.multiview_tolerance)
+                trusted = valid & (support >= args.min_support_views)
             uncertainty = max(args.relative_margin, report.get('p90_inlier_relative_error') or 0.)
+            if trajectory and report['borrowed_pixel_fraction'] > 0:
+                uncertainty = max(uncertainty, args.max_relative_error)
             tiles = training_tiles(depth, trusted, k, cameras[n], uncertainty, args.edge_pixels)
             report = dict(report, image=n, trusted_pixel_fraction=float(trusted.mean()),
                           reliable_tile_fraction=float(np.isfinite(tiles).mean()), relative_margin=uncertainty)
             report['empty_reference_reason'] = (None if np.isfinite(tiles).any() else
-                'no locally validated LiDAR alignment' if not valid.any() else
+                report['reason'] if trajectory and not trusted.any() else
+                'no locally validated LiDAR alignment' if not valid.any() and not trajectory else
                 'no pixels survived multiview validation' if not trusted.any() else
                 'trusted pixels do not cover any complete culling tile')
             save_npz(output/'frames'/frame_filename(n), image=n, depth=depth, valid=trusted,
@@ -264,6 +323,11 @@ def main(argv=None):
                   f"multiview trusted {trusted.mean():.1%}, usable tiles {np.isfinite(tiles).mean():.1%}", flush=True)
             if report['empty_reference_reason']:
                 print(f"EMPTY OCCLUSION REFERENCE: {n}: {report['empty_reference_reason']}", flush=True)
+                print(f"  Global fit: {report.get('global_fit', {}).get('reason')}; "
+                      f"local rejections: {report.get('rejected_regions', {})}", flush=True)
+            if trajectory:
+                print(f"  Group scale: {report['group_scale']}; borrowed coverage: "
+                      f"{report['borrowed_pixel_fraction']:.1%}; donors: {report['donor_images']}", flush=True)
             if n in previews:
                 preview(output/'previews'/(Path(frame_filename(n)).stem+'.jpg'), records[n], depth, trusted, report)
         atomic_json(output/'calibration.json', dict(frames=[rows[n] for n in names if n in rows]))
