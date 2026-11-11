@@ -7,7 +7,10 @@ import numpy as np
 
 from utils.sparse_lidar import frame_filename
 
-VERSION = 1
+VERSION = 2
+CALIBRATION_POLICY = dict(name='local_spatial_holdout_v2', grid=8, holdout_grid=32,
+                          min_region_size=32, min_region_anchors=24,
+                          min_region_holdout=6, min_inlier_fraction=.7)
 
 
 def camera_matrices(record, width, height):
@@ -33,7 +36,21 @@ def reliable_pixels(depth, confidence, percentile=20., edge_relative=.05):
     return confident & binary_erosion(smooth, iterations=1, border_value=0)
 
 
-def fit_scale(depth, valid, u, v, z, min_anchors=200, max_relative_error=.10):
+def calibration_anchors(depth, valid, u, v, z):
+    """One nearest finite LiDAR observation per valid prediction pixel."""
+    height, width = depth.shape
+    u, v, z = np.asarray(u), np.asarray(v), np.asarray(z)
+    inside = (u >= 0) & (u < width) & (v >= 0) & (v < height) & np.isfinite(z) & (z > .2)
+    u, v, z = u[inside].astype(int), v[inside].astype(int), z[inside]
+    good = valid[v, u] & np.isfinite(depth[v, u]) & (depth[v, u] > 0)
+    u, v, z = u[good], v[good], z[good]
+    order = np.argsort(z, kind='stable')
+    _, first = np.unique(v[order]*width+u[order], return_index=True)
+    ids = order[first]
+    return u[ids], v[ids], z[ids]
+
+
+def fit_scale(depth, valid, u, v, z, min_anchors=200, max_relative_error=.10, holdout_grid=16):
     """Fit positive multiplicative camera-z scale with spatially held-out anchors.
 
     DA3 outputs depth, not inverse disparity. No additive shift is fitted.
@@ -41,16 +58,8 @@ def fit_scale(depth, valid, u, v, z, min_anchors=200, max_relative_error=.10):
     cloud; held-out residuals and multiview checks remain necessary.
     """
     height, width = depth.shape
-    u, v, z = np.asarray(u), np.asarray(v), np.asarray(z)
-    inside = (u >= 0) & (u < width) & (v >= 0) & (v < height) & np.isfinite(z) & (z > .2)
-    u, v, z = u[inside].astype(int), v[inside].astype(int), z[inside]
-    good = valid[v, u] & np.isfinite(depth[v, u]) & (depth[v, u] > 0)
-    u, v, z = u[good], v[good], z[good]
-    # One nearest measurement per model pixel; equalize spatial sampling density.
-    order = np.argsort(z, kind='stable')
-    _, first = np.unique(v[order]*width+u[order], return_index=True)
-    ids = order[first]
-    u, v, z = u[ids], v[ids], z[ids]
+    u, v, z = calibration_anchors(depth, valid, u, v, z)
+    # Equalize spatial sampling density for the single shared scale estimate.
     rng = np.random.default_rng(42)
     cell = (v*8//height)*8 + u*8//width
     ids = np.concatenate([rng.permutation(np.flatnonzero(cell == c))[:64] for c in np.unique(cell)]) if len(cell) else np.array([], int)
@@ -60,7 +69,7 @@ def fit_scale(depth, valid, u, v, z, min_anchors=200, max_relative_error=.10):
             len(np.unique(cell//8)) < 3 or len(np.unique(cell % 8)) < 3):
         return None, report
     # Hold out complete small image regions, not random samples of the same ray.
-    holdout = ((u*16//width) + 3*(v*16//height)) % 5 == 0
+    holdout = ((u*holdout_grid//width) + 3*(v*holdout_grid//height)) % 5 == 0
     if holdout.sum() < 30 or (~holdout).sum() < 100:
         return None, {**report, 'reason': 'insufficient spatial holdout'}
     ratios = np.log(z)-np.log(depth[v, u])
@@ -84,6 +93,73 @@ def fit_scale(depth, valid, u, v, z, min_anchors=200, max_relative_error=.10):
                   p90_inlier_relative_error=inlier_p90, inlier_fraction=fraction,
                   reason='ok' if accepted else 'LiDAR alignment residuals too large')
     return scale if accepted else None, report
+
+
+def calibrate_regions(depth, valid, u, v, z, min_anchors=200, max_relative_error=.10):
+    """Fit one scale, then validate bounded regions independently.
+
+    A rejected global inlier fraction is not a reason to erase well-supported
+    regions. Regional checks use spatial holdouts excluded from the global fit,
+    retain the same 70% inlier / 5% median-error criteria, require distributed
+    anchors, and limit extrapolation from inlier anchors. No local scale/shift
+    is fitted and no depth is generated in confidence/depth-boundary holes.
+    Multiview validation still follows this stage in the preparer.
+    """
+    from scipy.ndimage import distance_transform_edt
+    policy = CALIBRATION_POLICY
+    h, w = depth.shape
+    _, global_fit = fit_scale(depth, valid, u, v, z, min_anchors, max_relative_error,
+                              holdout_grid=policy['holdout_grid'])
+    scale = global_fit.get('scale')
+    mask = np.zeros_like(valid, dtype=bool)
+    report = dict(accepted=False, policy=policy['name'], scale=scale, global_fit=global_fit,
+                  accepted_regions=0, tested_regions=0, reason='no supported global scale proposal')
+    if scale is None or not np.isfinite(scale) or scale <= 0:
+        return None, mask, report
+    u, v, z = calibration_anchors(depth, valid, u, v, z)
+    error = np.abs(scale*depth[v, u]/z-1)
+    holdout = ((u*policy['holdout_grid']//w)+3*(v*policy['holdout_grid']//h)) % 5 == 0
+    rh, rw = (max(policy['min_region_size'], int(np.ceil(length/policy['grid']))) for length in (h, w))
+    rh, rw = min(rh, h), min(rw, w)
+    starts = lambda length, size: sorted(set(range(0, length-size+1, max(1, size//2))) | {length-size})
+    rejected, accepted_errors = {}, []
+    for y0 in starts(h, rh):
+        for x0 in starts(w, rw):
+            report['tested_regions'] += 1
+            ids = np.flatnonzero((u >= x0) & (u < x0+rw) & (v >= y0) & (v < y0+rh))
+            train, val = ids[~holdout[ids]], ids[holdout[ids]]
+            reason = None
+            if (len(ids) < policy['min_region_anchors'] or len(train) < 12 or
+                    len(val) < policy['min_region_holdout']):
+                reason = 'insufficient_local_anchors_or_holdout'
+            else:
+                good = ids[error[ids] <= max_relative_error]
+                quadrants = ((v[good]-y0)*2//rh)*2 + (u[good]-x0)*2//rw
+                if len(np.unique(quadrants)) < 3:
+                    reason = 'insufficient_inlier_spatial_support'
+                elif any(np.median(error[part]) > max_relative_error/2 or
+                         np.mean(error[part] <= max_relative_error) < policy['min_inlier_fraction']
+                         for part in (train, val)):
+                    reason = 'local_alignment_residuals'
+            if reason:
+                rejected[reason] = rejected.get(reason, 0)+1
+                continue
+            mask[y0:y0+rh, x0:x0+rw] = True
+            report['accepted_regions'] += 1
+            accepted_errors.extend(error[val][error[val] <= max_relative_error].tolist())
+    inliers = np.zeros_like(mask)
+    good = error <= max_relative_error
+    inliers[v[good], u[good]] = True
+    if inliers.any():
+        mask &= distance_transform_edt(~inliers) <= .5*min(rh, rw)
+    else:
+        mask[:] = False
+    mask &= valid
+    report.update(accepted=bool(mask.any()), rejected_regions=rejected,
+        locally_calibrated_pixel_fraction=float(mask.mean()),
+        p90_inlier_relative_error=float(np.quantile(accepted_errors, .9)) if accepted_errors else None,
+        reason='locally validated regions' if mask.any() else 'no locally validated regions')
+    return scale, mask, report
 
 
 def cross_view_support(depth, valid, intrinsic, extrinsic, neighbors, tolerance=.05):
@@ -132,7 +208,7 @@ class TrainingDepthCache:
                  allow_partial=False):
         self.root = Path(directory).expanduser().resolve()
         report = json.loads((self.root/'metadata.json').read_text())
-        if (report.get('version') != VERSION or (not report.get('complete') and not allow_partial) or
+        if (report.get('version') not in (1, VERSION) or (not report.get('complete') and not allow_partial) or
                 Path(report['source']).resolve() != Path(source).resolve() or
                 report['resolution'] != resolution or report['edge_pixels'] != edge_pixels):
             raise ValueError('DA3 cache is incomplete or has incompatible source/resolution/edge padding')
@@ -163,6 +239,10 @@ class TrainingDepthCache:
         with np.load(self.root/'frames'/frame_filename(camera.image_name), allow_pickle=False) as data:
             result = {key: data[key].copy() for key in ('depth', 'valid', 'intrinsics')}
             result['report'] = json.loads(str(data['report'])) if 'report' in data else {}
+            result['cache_version'] = self.report['version']
+            for key in ('confidence_valid', 'calibration_valid', 'support_views', 'raw_prediction', 'confidence'):
+                if key in data and (key != 'confidence_valid' or self.report['version'] >= 2):
+                    result[key] = data[key].copy()
         path = self.root/'anchors'/frame_filename(camera.image_name)
         if path.is_file():
             with np.load(path, allow_pickle=False) as data:

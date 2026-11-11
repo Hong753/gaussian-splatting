@@ -7,7 +7,7 @@ import numpy as np
 from scripts.view_comparisons import model_info, image_id
 from scripts.eval_all_frames import choose_iteration
 from utils.occlusion_diagnostics import (classify, depth_points, depth_rgb,
-                                         projected_overlay, write_report, reference_panels, reason_counts)
+    projected_overlay, write_report, reference_panels, reason_counts, write_debug_bundle)
 
 PARAMETERS = ('_xyz', '_opacity', '_scaling', '_rotation', '_features_dc', '_features_rest')
 
@@ -196,6 +196,9 @@ class InspectorBackend:
         for view in self.views.values():
             view['summary']['reference_comparison'] = comparison
             write_report(view['directory'], view['summary'], view['images'])
+        bundle = write_debug_bundle(self.views)
+        for view in self.views.values(): view['debug_bundle'] = bundle
+        print(f'Debug bundle (includes numeric depths and LiDAR anchors): {bundle}', flush=True)
         self.current = self.views[source]
         self.torch.cuda.empty_cache()
         return self.current
@@ -251,6 +254,7 @@ class InspectorBackend:
         summary = dict(image=name, iteration=self.iteration, checkpoint=str(self.ply),
             checkpoint_sha256=self.checkpoint_sha256, culling_source=self.source_options[source],
             culling_lookup=CULLING_LOOKUP,
+            depth_cache_version=frame.get('cache_version'),
             saved_training_reference=self.saved_reference, diagnostic_override=source != 'saved',
             reference_path=str(getattr(provider, 'root', getattr(provider, 'geometry', ''))),
             coverage=coverage, candidate_reasons=reasons,
@@ -276,12 +280,18 @@ class InspectorBackend:
         directory.mkdir(parents=True, exist_ok=True)
         np.save(directory/'labels.npy', labels, allow_pickle=False)
         np.save(directory/'occlusion_tiles.npy', tiles.cpu().numpy(), allow_pickle=False)
+        reference = {key: frame[key] for key in ('depth', 'valid', 'intrinsics', 'confidence_valid',
+            'calibration_valid', 'support_views', 'raw_prediction', 'confidence') if key in frame}
+        reference.update(native_intrinsics=k, world_to_camera=w2c)
+        reference.update({'anchor_'+key: value for key, value in frame.get('anchors', {}).items()})
+        np.savez_compressed(directory/'reference.npz', **reference)
         result = dict(name=name, source=source, camera=camera, c2w=c2w, tiles=tiles, labels=labels,
             radii_on=radii_on, radii_off=radii_off, summary=summary, directory=directory,
             images=images, surface=cloud)
         print(f"Active {counts['active']:,}; depth-culled {counts['culled']:,}; other {counts['other']:,}", flush=True)
         print(f"Trusted pixels {coverage['trusted_pixel_fraction']:.1%}; usable tiles {summary['reliable_tile_fraction']:.1%}; "
               f"candidate reasons: {reasons}", flush=True)
+        print(coverage['status'], flush=True)
         if check_gradients:
             print(summary['gradient_probe']['verdict'], flush=True)
         print(f'Diagnostic report: {directory}/index.html', flush=True)

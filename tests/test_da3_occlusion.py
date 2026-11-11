@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from utils.da3_occlusion import (VERSION, camera_matrices, reliable_pixels, fit_scale,
-                                 cross_view_support, training_tiles, TrainingDepthCache)
+                                 cross_view_support, training_tiles, TrainingDepthCache, calibrate_regions)
 from utils.occlusion_depth import camera_signature
 from utils.sparse_lidar import frame_filename
 from scripts.prepare_da3_occlusion import front_points, windows, save_npz
@@ -99,6 +99,16 @@ class DA3Tests(unittest.TestCase):
             cams = [record_camera(records[n], -1, 'cpu') for n in names]
             provider = TrainingDepthCache(root/'output', root, cams, -1, point_cloud=cloud)
             self.assertTrue(torch.isfinite(provider.tiles(cams[0], 'cpu')).any())
+            # Historical caches remain inspectable, but preprocessing must not
+            # silently reuse their rejected frame-wide masks as policy v2.
+            legacy = {**metadata, 'version': 1}
+            legacy.pop('calibration_policy', None)
+            (root/'output/metadata.json').write_text(json.dumps(legacy))
+            historical = TrainingDepthCache(root/'output', root, cams, -1, point_cloud=cloud)
+            self.assertTrue(torch.isfinite(historical.tiles(cams[0], 'cpu')).any())
+            with patch.object(prepare_da3_occlusion, 'read_colmap_records', return_value=records):
+                with self.assertRaisesRegex(ValueError, 'older calibration policy'):
+                    prepare_da3_occlusion.main(args)
 
     def test_explicit_tiles_block_gradients_but_default_render_does_not(self):
         from utils.graphics_utils import getProjectionMatrix
@@ -158,6 +168,56 @@ class DA3Tests(unittest.TestCase):
         y, x = np.indices(depth.shape)
         scale, _ = fit_scale(depth, np.ones_like(depth, bool), x[:16].ravel(), y[:16].ravel(), np.ones(16*128)*2)
         self.assertIsNone(scale)
+
+    def test_global_rejection_does_not_erase_locally_verified_wall(self):
+        """~68% consistent anchors used to invalidate 100% of the reference."""
+        y, x = np.indices((256, 256))
+        raw = np.full((256, 256), 2., np.float32)
+        valid = np.ones_like(raw, bool)
+        u, v = x[::2, ::2].ravel(), y[::2, ::2].ravel()
+        z = np.full(len(u), 5., np.float32)
+        z[u >= 174] = 15.  # An inconsistent region, not a reason to erase the left wall.
+        old_scale, old_report = fit_scale(raw, valid, u, v, z)
+        self.assertIsNone(old_scale)
+        self.assertLess(old_report['inlier_fraction'], .7)
+        scale, local, report = calibrate_regions(raw, valid, u, v, z)
+        self.assertAlmostEqual(scale, 2.5, places=5)
+        self.assertTrue(report['accepted'])
+        self.assertFalse(report['global_fit']['accepted'])
+        self.assertGreater(local[:, :140].mean(), .9)
+        self.assertFalse(local[:, 220:].any())
+        # Local validation is followed by, not substituted for, multiview checks.
+        k = np.array([[128, 0, 127.5], [0, 128, 127.5], [0, 0, 1]], np.float32)
+        e = np.eye(4, dtype=np.float32)
+        d = raw*scale
+        support = cross_view_support(d, local, k, e, [(d, local, k, e)]*2)
+        tiles = training_tiles(d, local & (support >= 2), k, camera(256))
+        self.assertTrue(np.isfinite(tiles[2:12, 2:7]).all())
+        self.assertTrue(np.isinf(tiles[:, 14:]).all())
+        wrong = cross_view_support(d, local, k, e, [(d*2, local, k, e)]*2)
+        self.assertFalse((wrong >= 2).any())
+
+    def test_regional_validation_rejects_unsupported_and_spatially_inconsistent_depth(self):
+        y, x = np.indices((256, 256))
+        raw = np.ones((256, 256), np.float32)
+        u, v = x.ravel(), y.ravel()
+        z = np.where((u+v)%3 == 0, 2., np.where((u+v)%3 == 1, 4., 8.)).astype(np.float32)
+        _, local, report = calibrate_regions(raw, np.ones_like(raw, bool), u, v, z)
+        self.assertFalse(local.any())
+        self.assertFalse(report['accepted'])
+        scale, local, report = calibrate_regions(raw, np.ones_like(raw, bool), u[:20], v[:20], z[:20])
+        self.assertIsNone(scale)
+        self.assertFalse(local.any())
+
+    def test_regional_validation_preserves_confidence_and_depth_boundary_holes(self):
+        y, x = np.indices((256, 256))
+        raw = np.ones((256, 256), np.float32)
+        valid = np.ones_like(raw, bool)
+        valid[80:160, 80:160] = False
+        scale, local, _ = calibrate_regions(raw, valid, x.ravel(), y.ravel(), np.full(x.size, 2.))
+        self.assertAlmostEqual(scale, 2.)
+        self.assertFalse(local[80:160, 80:160].any())
+        self.assertGreater(local.mean(), .5)
 
     def test_confidence_and_depth_boundaries(self):
         depth = np.full((64, 64), 2., np.float32)

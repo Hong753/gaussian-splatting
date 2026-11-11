@@ -14,8 +14,10 @@ fi
 conda activate 3dgs
 inspect_config=$(python - "$inspect_model" <<'PY'
 from pathlib import Path
+import json
 import sys
 from scripts.view_comparisons import model_info
+from utils.da3_occlusion import VERSION
 model = Path(sys.argv[1]).expanduser().resolve()
 spec = model_info(model)
 if spec['type'] != '3dgs':
@@ -25,7 +27,10 @@ for filename in ('keyframes.json', 'input.ply'):
         raise FileNotFoundError(model/filename)
 print(spec['cfg']['source_path'])
 print(spec['cfg'].get('resolution', -1))
-print(spec['cfg'].get('train_depth_occlusion_dir') or model.parent/'da3_lidar_depth_stride3')
+saved = spec['cfg'].get('train_depth_occlusion_dir')
+report = Path(saved)/'metadata.json' if saved else None
+current = report and report.is_file() and json.loads(report.read_text()).get('version') == VERSION
+print(saved if current else model.parent/f'da3_lidar_depth_stride3_v{VERSION}')
 PY
 )
 mapfile -t inspect_settings <<< "$inspect_config"

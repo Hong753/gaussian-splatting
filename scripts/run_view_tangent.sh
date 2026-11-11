@@ -19,10 +19,12 @@ tangent_base="${DA3_BASELINE:-}"
 if [[ -z "$tangent_base" ]]; then
   tangent_base="$(python -c 'from scripts.render import resolve_models; import sys; print(resolve_models(None, sys.argv[1], ["sharp_keyframes_stride3_aa"])[0])' "$tangent_root")"
 fi
-tangent_model="${VIEW_TANGENT_MODEL_DIR:-$tangent_root/3dgs_stride3_aa_${tangent_source_kind}_occlusion_viewtangent_warm7k_lr50}"
+tangent_variant="$tangent_source_kind"
+if [[ "$tangent_source_kind" == da3 ]]; then tangent_variant=da3_v2; fi
+tangent_model="${VIEW_TANGENT_MODEL_DIR:-$tangent_root/3dgs_stride3_aa_${tangent_variant}_occlusion_viewtangent_warm7k_lr50}"
 tangent_command=(scripts/run_occlusion.py)
 if [[ "$tangent_source_kind" == da3 ]]; then
-  tangent_command=(scripts/run_da3_occlusion.py --depth-dir "${DA3_DEPTH_DIR:-$tangent_root/da3_lidar_depth_stride3}")
+  tangent_command=(scripts/run_da3_occlusion.py --depth-dir "${DA3_DEPTH_DIR:-$tangent_root/da3_lidar_depth_stride3_v2}")
 fi
 python -u "${tangent_command[@]}" --source "$tangent_source" --model "$tangent_model" \
   --baseline "$tangent_base" --keyframes "$tangent_base/keyframes.json" --gpu "$tangent_gpu" \

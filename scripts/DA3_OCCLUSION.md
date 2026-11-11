@@ -18,9 +18,15 @@ densification/opacity resets shifted by 7k.
 3. Fit a positive multiplicative depth scale per image using robust log-ratios
    with spatially balanced anchors. DA3 predicts depth, so no inverse-disparity
    shift is fitted. Complete small image regions are held out from fitting.
-4. Require enough spatially distributed anchors and acceptable held-out error.
-   Reports include the median, p90 over all held-out anchors, p90 over held-out
-   inliers, and inlier fraction. The error threshold is relative to camera z.
+4. Validate local image regions independently using spatial holdouts excluded
+   from the shared scale fit. An image-wide inlier fraction below 70% no longer
+   erases every pixel. Each accepted region still needs at least 70% inliers
+   within 10% relative camera-z error and median error at most 5% in both fitting
+   and held-out anchors. Require at least 24 anchors, 6 holdouts, and inliers in
+   at least three of four quadrants. Regions overlap by half their size; depth
+   stays unknown beyond half the shorter region dimension from the nearest inlier. No regional
+   scale or depth shift is fitted. The global fit report remains available for
+   auditing, including rejected global criteria and outlier error percentiles.
 5. Use confident depth interiors that agree after reprojection into at least two
    other calibrated training views. Discontinuities and uncertain pixels remain
    unknown. A relative depth margin (at least 5%, increased by the held-out inlier
@@ -89,7 +95,7 @@ are retained. It does not stop other runs or change the system driver.
 Defaults are the source `/data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full`,
 output root `/data/3dgs_outputs/orange_4F/1_full`, baseline
 `sharp_keyframes_stride3_aa` resolved below that root, depth cache
-`da3_lidar_depth_stride3`, and model `3dgs_stride3_aa_da3_occlusion_warm7k_lr50`.
+`da3_lidar_depth_stride3_v2`, and model `3dgs_stride3_aa_da3_v2_occlusion_warm7k_lr50`.
 Override these with `DA3_SCENE_ROOT`, `DA3_OUTPUT_ROOT`, `DA3_BASELINE`,
 `DA3_DEPTH_DIR`, `DA3_MODEL_DIR`, or `DA3_CONDA_SH`. Arguments after the GPU index
 are forwarded to training, for example `bash scripts/run_da3_ablation.sh 3 --evaluate-only`.
@@ -99,6 +105,29 @@ trusted-coverage overlays, `calibration.json` with per-frame quality and coverag
 and a complete cache. It refuses to mark preparations complete when fewer than
 half of the training frames pass calibration or mean reliable tile coverage is
 at most 1%. Rejected individual frames use no depth culling.
+
+Cache version 2 records the local calibration policy and saves raw predictions,
+confidence, confidence masks, local-calibration masks, multiview support counts,
+and final trusted depth. Old version-1 caches can still be read for historical
+inspection, but cannot be reused as new preparation outputs. The default output
+and model directories are versioned so empty/rejected version-1 masks are not
+silently reused. Each prepared view prints coverage after every stage and an
+`EMPTY OCCLUSION REFERENCE` reason when no usable tiles survive.
+
+Before full preparation or training, inspect one exact failing image:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh
+conda activate 3dgs
+cd /home/sequor_vfm/gaussian-splatting
+bash scripts/inspect_da3_occlusion.sh 5 \
+  /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_occlusion 07519.jpg
+```
+
+This prepares that image and its usual neighboring inference window using the
+v2 cache, then opens the native checkpoint inspector. It does not retrain the
+checkpoint. See [OCCLUSION_INSPECTOR.md](OCCLUSION_INSPECTOR.md) for the reference
+comparison and the numeric debug archive emitted after each inspection.
 
 Training verifies that the calibration point cloud equals the copied
 initialization cloud. An actual CUDA smoke test runs before training and asserts

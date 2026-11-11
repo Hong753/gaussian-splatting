@@ -13,8 +13,8 @@ da3_base="${DA3_BASELINE:-}"
 if [[ -z "$da3_base" ]]; then
     da3_base=$(python -c 'from scripts.render import resolve_models; import sys; print(resolve_models(None, sys.argv[1], ["sharp_keyframes_stride3_aa"])[0])' "$da3_root")
 fi
-da3_depth="${DA3_DEPTH_DIR:-$da3_root/da3_lidar_depth_stride3}"
-da3_model="${DA3_MODEL_DIR:-$da3_root/3dgs_stride3_aa_da3_occlusion_warm7k_lr50}"
+da3_depth="${DA3_DEPTH_DIR:-$da3_root/da3_lidar_depth_stride3_v2}"
+da3_model="${DA3_MODEL_DIR:-$da3_root/3dgs_stride3_aa_da3_v2_occlusion_warm7k_lr50}"
 
 conda activate da3-depth
 python -m pip install -r requirements-da3.txt

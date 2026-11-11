@@ -18,7 +18,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from utils.da3_occlusion import (VERSION, camera_matrices, reliable_pixels, fit_scale,
+from utils.da3_occlusion import (VERSION, CALIBRATION_POLICY, camera_matrices, reliable_pixels, calibrate_regions,
                                  cross_view_support, training_tiles)
 from utils.lidar_occlusion import file_digest
 from utils.sparse_lidar import frame_filename
@@ -145,7 +145,8 @@ def main(argv=None):
     signatures = {n: camera_signature(c, args.edge_pixels) for n, c in cameras.items()}
     images_identity = [(n, Path(records[n]['image_path']).stat().st_size,
                        Path(records[n]['image_path']).stat().st_mtime_ns) for n in names]
-    config = dict(version=VERSION, source=str(source), point_cloud=str(cloud), point_cloud_sha256=file_digest(cloud),
+    config = dict(version=VERSION, calibration_policy=CALIBRATION_POLICY, source=str(source),
+        point_cloud=str(cloud), point_cloud_sha256=file_digest(cloud),
         images=names, image_identity_sha256=hashlib.sha256(json.dumps(images_identity).encode()).hexdigest(),
         camera_signatures=signatures, **{k: v for k, v in vars(args).items()
             if k not in ('source', 'output', 'point_cloud', 'keyframes', 'gpu', 'preview_count',
@@ -156,7 +157,8 @@ def main(argv=None):
     # Scene copies input.ply into each run. Byte-identical copies have the same
     # geometric identity; their filesystem location must not invalidate a cache.
     if existing and any(existing.get(k) != v for k, v in config.items() if k != 'point_cloud'):
-        raise ValueError('Existing DA3 cache has different inputs/settings; use a new output directory')
+        raise ValueError(f'Existing DA3 cache has different inputs/settings or an older calibration policy; '
+                         f'use a new output directory such as {output}_v{VERSION}')
     if existing.get('complete'):
         if not all((output/'frames'/frame_filename(n)).is_file() for n in names):
             raise ValueError('Completed DA3 cache is missing frames')
@@ -233,17 +235,15 @@ def main(argv=None):
                 save_npz(anchor_path, u=u, v=v, z=z)
             pu = np.floor(k[0, 0]*(u-full_k[0, 2])/full_k[0, 0]+k[0, 2]+.5).astype(int)
             pv = np.floor(k[1, 1]*(v-full_k[1, 2])/full_k[1, 1]+k[1, 2]+.5).astype(int)
-            valid = reliable_pixels(raw, conf, args.confidence_percentile)
-            scale, report = fit_scale(raw, valid, pu, pv, z, args.min_anchors, args.max_relative_error)
-            report.update(projected_lidar_anchors=len(z), confident_pixel_fraction=float(valid.mean()))
+            confident = reliable_pixels(raw, conf, args.confidence_percentile)
+            scale, valid, report = calibrate_regions(raw, confident, pu, pv, z, args.min_anchors, args.max_relative_error)
+            report.update(projected_lidar_anchors=len(z), confident_pixel_fraction=float(confident.mean()))
             depth = np.where(np.isfinite(raw), raw*(scale or 1.), 0).astype(np.float32)
-            if scale is None:
-                valid[:] = False
-            calibrated.append((depth, valid, k, extrinsics[i], report))
+            calibrated.append((depth, valid, k, extrinsics[i], report, confident, raw, conf))
         for i, n in enumerate(batch):
             if n not in core:
                 continue
-            depth, valid, k, e, report = calibrated[i]
+            depth, valid, k, e, report, confident, raw, conf = calibrated[i]
             neighbors = [entry[:4] for j, entry in enumerate(calibrated) if j != i]
             support = cross_view_support(depth, valid, k, e, neighbors, args.multiview_tolerance)
             trusted = valid & (support >= args.min_support_views)
@@ -251,10 +251,19 @@ def main(argv=None):
             tiles = training_tiles(depth, trusted, k, cameras[n], uncertainty, args.edge_pixels)
             report = dict(report, image=n, trusted_pixel_fraction=float(trusted.mean()),
                           reliable_tile_fraction=float(np.isfinite(tiles).mean()), relative_margin=uncertainty)
+            report['empty_reference_reason'] = (None if np.isfinite(tiles).any() else
+                'no locally validated LiDAR alignment' if not valid.any() else
+                'no pixels survived multiview validation' if not trusted.any() else
+                'trusted pixels do not cover any complete culling tile')
             save_npz(output/'frames'/frame_filename(n), image=n, depth=depth, valid=trusted,
                      intrinsics=k, extrinsics=e, tiles=tiles, report=json.dumps(report),
-                     confidence_valid=valid, support_views=support)
+                     confidence_valid=confident, calibration_valid=valid, support_views=support,
+                     raw_prediction=raw, confidence=conf)
             rows[n] = report
+            print(f"{n}: confident {confident.mean():.1%}, locally calibrated {valid.mean():.1%}, "
+                  f"multiview trusted {trusted.mean():.1%}, usable tiles {np.isfinite(tiles).mean():.1%}", flush=True)
+            if report['empty_reference_reason']:
+                print(f"EMPTY OCCLUSION REFERENCE: {n}: {report['empty_reference_reason']}", flush=True)
             if n in previews:
                 preview(output/'previews'/(Path(frame_filename(n)).stem+'.jpg'), records[n], depth, trusted, report)
         atomic_json(output/'calibration.json', dict(frames=[rows[n] for n in names if n in rows]))
@@ -267,6 +276,7 @@ def main(argv=None):
                 rows[n] = json.loads(str(data['report']))
     atomic_json(output/'calibration.json', dict(frames=[rows[n] for n in names if n in rows]))
     summary = dict(accepted_frames=sum(r['accepted'] for r in rows.values()), frames=len(rows), expected_frames=len(names),
+                   empty_reference_frames=sum(r['reliable_tile_fraction'] == 0 for r in rows.values()),
                    mean_reliable_tile_fraction=float(np.mean([r['reliable_tile_fraction'] for r in rows.values()])))
     metadata.update(summary=summary)
     # Reject unusable preparations instead of silently training with empty masks.

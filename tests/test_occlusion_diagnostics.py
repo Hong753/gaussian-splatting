@@ -178,10 +178,28 @@ class OcclusionDiagnosticTests(unittest.TestCase):
         self.assertFalse(valid[0, 2]); self.assertTrue(valid[0, 1])
         frame['anchors'] = dict(u=np.array([1, 2, 2]), v=np.array([0, 1, 0]), z=np.array([2, 9, 4.]))
         panels, stats = reference_panels(frame, native, np.full((2, 3, 3), 100, np.uint8), [[np.inf]])
-        self.assertEqual(stats['lidar_anchors'], dict(projected=3, agree=1, disagree=1, untrusted=1))
+        self.assertEqual(stats['lidar_anchors']['agree'], 2)
+        self.assertEqual(stats['lidar_anchors']['disagree'], 1)
+        self.assertEqual(stats['lidar_anchors']['final_mask_rejected'], 1)
         self.assertEqual(stats['trusted_pixel_fraction'], .5)
         self.assertEqual(stats['usable_tile_pixel_fraction'], 0)
         self.assertIn('anchors', panels)
+
+    def test_empty_reference_is_reported_and_anchor_residuals_remain_visible(self):
+        raw = np.full((32, 32), 2., np.float32)
+        frame = dict(depth=raw, valid=np.zeros_like(raw, bool), intrinsics=np.eye(3),
+            confidence_valid=np.ones_like(raw, bool), calibration_valid=np.zeros_like(raw, bool),
+            report={'reason': 'LiDAR alignment residuals too large'},
+            anchors=dict(u=np.array([10, 20]), v=np.array([10, 20]), z=np.array([2., 5.])))
+        panels, summary = reference_panels(frame, np.eye(3), np.zeros((32, 32, 3), np.uint8), np.full((2, 2), np.inf))
+        self.assertEqual(summary['status'], 'EMPTY REFERENCE: LiDAR alignment residuals too large')
+        self.assertEqual(summary['lidar_anchors']['agree'], 1)
+        self.assertEqual(summary['lidar_anchors']['disagree'], 1)
+        self.assertEqual(summary['lidar_anchors']['final_mask_rejected'], 2)
+        self.assertEqual(summary['confidence_valid_pixel_fraction'], 1)
+        self.assertEqual(summary['calibration_valid_pixel_fraction'], 0)
+        np.testing.assert_equal(panels['anchors'][1][10, 10], [40, 220, 120])
+        np.testing.assert_equal(panels['anchors'][1][20, 20], [255, 65, 80])
 
     def test_two_references_use_same_checkpoint_and_do_not_overwrite_reports(self):
         from utils.occlusion_depth import tile_maxima
@@ -237,6 +255,11 @@ class OcclusionDiagnosticTests(unittest.TestCase):
             self.assertTrue(result['summary']['diagnostic_override'])
             self.assertFalse(backend.views['saved']['summary']['diagnostic_override'])
             self.assertEqual(len(list(Path(tmp).rglob('summary.json'))), 2)
+            from zipfile import ZipFile
+            with ZipFile(result['debug_bundle']) as archive:
+                self.assertIn('da3/reference.npz', archive.namelist())
+                self.assertIn('saved/summary.json', archive.namelist())
+                self.assertNotIn('da3/labels.npy', archive.namelist())
             count = len(calls)
             backend.analyze(cam.image_name, False, 'saved')
             self.assertEqual(len(calls), count)  # UI reference changes reuse the same state.

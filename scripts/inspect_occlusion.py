@@ -67,8 +67,10 @@ class InspectorViewer:
                                ('depth', 'Conservative depth bounds; black = unknown'),
                                ('reference_raw', 'Raw reference depth (may include rejected pixels)'),
                                ('reference_trusted', 'Trusted depth coverage over GT'),
+                               ('confidence_valid', 'After confidence / depth-boundary checks'),
+                               ('calibration_valid', 'After local LiDAR calibration'),
                                ('coverage', 'Green usable tiles / blue trusted pixels / black unknown'),
-                               ('anchors', 'LiDAR anchors: green agree / red disagree / gold untrusted')):
+                               ('anchors', 'LiDAR vs prediction: green agree / red disagree / gold missing depth')):
                 self.images[key] = gui.add_image(np.zeros((32, 32, 3), np.uint8), label=label)
         self.load.on_click(lambda _: self.inspect(self.selection.value))
         self.probe.on_click(lambda _: self.inspect(self.backend.current['name'] if self.ready else self.selection.value, True))
@@ -131,6 +133,10 @@ class InspectorViewer:
                 f"Reliable depth tiles: {100*summary['reliable_tile_fraction']:.1f}%.\n\n")
             if summary.get('culling_lookup'):
                 message += f"Depth lookup: `{summary['culling_lookup']}`\n\n"
+            if summary.get('depth_cache_version'):
+                message += f"Depth cache: **v{summary['depth_cache_version']}**\n\n"
+            if summary.get('coverage', {}).get('status'):
+                message += '**'+summary['coverage']['status']+'**\n\n'
             if summary.get('diagnostic_override'):
                 message += f"Diagnostic override; this checkpoint was trained with **{summary['saved_training_reference']}**.\n\n"
             if summary.get('candidate_reasons'):
@@ -143,6 +149,8 @@ class InspectorViewer:
             else:
                 message += 'Gradient check has not been run for this view.\n\n'
             self.status.content = message + f"Report: `{result['directory']}/index.html`"
+            if result.get('debug_bundle'):
+                self.status.content += f"\n\nDebug bundle: `{result['debug_bundle']}`"
             import viser.transforms as vtf
             c2w = result['c2w']
             self.nodes['camera'] = self.server.scene.add_camera_frustum('/reference_camera',

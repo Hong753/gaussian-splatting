@@ -35,6 +35,10 @@ depth-boundary and multiview consistency checks. These checks reduce visibility
 errors in the merged cloud; they do not replace per-frame LiDAR visibility.
 `DA3_DEPTH_DIR` overrides the cache directory. An optional third positional
 argument selects one exact training image instead of three distributed views.
+The current default cache is `da3_lidar_depth_stride3_v2`. It validates LiDAR
+alignment locally instead of erasing the whole frame when one global alignment
+criterion fails. Old rejected caches are not reused by this preparation. For the
+reported wall view, append `07519.jpg` as the third argument to the wrapper.
 
 Open `http://211.172.247.108:8082` from the remote client. The wrapper binds
 `0.0.0.0`; `OCCLUSION_INSPECTOR_PORT` changes the port. It does not start training.
@@ -50,7 +54,7 @@ conda activate 3dgs
 cd /home/sequor_vfm/gaussian-splatting
 python -u scripts/inspect_occlusion.py \
   --model /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_occlusion \
-  --depth-dir /data/3dgs_outputs/orange_4F/1_full/da3_lidar_depth_stride3 \
+  --depth-dir /data/3dgs_outputs/orange_4F/1_full/da3_lidar_depth_stride3_v2 \
   --gpu 5 --host 0.0.0.0 --port 8082 --check-gradients
 ```
 
@@ -67,7 +71,11 @@ the fraction of OFF raster candidates culled. Retained candidates are separated
 into missing depth coverage, overlap with depth/margin, and those outside the
 conservative test. **Show reference surface only** hides Gaussian markers.
 Additional 2D panels show raw depth, trusted coverage over GT, usable tiles, and
-LiDAR anchor agreement. The coverage image uses green for usable tiles, blue for
+LiDAR anchor agreement. Version-2 caches also show the separate confidence and
+local-calibration stages. Anchor agreement is measured against the depth prediction
+before masking, so a failed calibration no longer hides every residual as gold.
+The status explicitly says `EMPTY REFERENCE` when culling has no usable depths.
+The coverage image uses green for usable tiles, blue for
 accepted pixels lost to whole-tile checks, and black for unknown/rejected pixels.
 This panel's colors are separate from the 3D Gaussian legend.
 
@@ -171,6 +179,12 @@ Each inspected view writes into
 - `labels.npy`: one uint8 label per original checkpoint PLY row (0 other,
   1 active, 2 culled); no sampling. `summary.json` records the checkpoint SHA256.
 - `occlusion_tiles.npy`: the actual bounds used for the selected camera.
+- `reference.npz`: numerical prediction, masks, camera matrices and projected
+  LiDAR anchors; v2 also includes raw DA3 prediction and confidence. This supports
+  reproducing calibration failures instead of inferring depth from a PNG.
+- A shared `occlusion_debug.zip` one directory above `saved/` and `da3/` contains
+  both reference reports, PNGs, tile bounds and numeric reference snapshots.
+  The viewer and terminal print its path. Large Gaussian PLY/label files are excluded.
 - **Export all green + red centers to PLY** writes `active_and_culled.ply`,
   including labels and original `gaussian_id` values. It exports every green/red
   center even if a browser display cap is enabled.

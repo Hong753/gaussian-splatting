@@ -96,12 +96,31 @@ def reference_panels(frame, intrinsic, rgb, tiles):
     images = dict(reference_raw=('Raw reference depth; may include rejected predictions', raw_rgb),
         reference_trusted=('Trusted reference over GT; blue accepted, dark rejected/unknown', overlay),
         coverage=('Coverage: green usable tiles, blue trusted pixels lost to tile tests, black unknown', coverage))
+    for key, title in (('confidence_valid', 'After confidence and depth-boundary checks'),
+                       ('calibration_valid', 'After local LiDAR calibration checks')):
+        if key in frame:
+            _, stage = reference_on_image({**frame, 'valid': frame[key]}, intrinsic, h, w)
+            panel = (rgb*.25).astype(np.uint8)
+            panel[stage] = (.45*rgb[stage]+.55*np.array([85, 155, 255])).astype(np.uint8)
+            images[key] = (title+'; blue accepted', panel)
+            summary[key+'_pixel_fraction'] = float(stage.mean())
+    if not finite.any():
+        summary['status'] = 'EMPTY REFERENCE: no finite depth prediction'
+    elif not trusted.any():
+        detail = frame.get('report', {}).get('empty_reference_reason') or frame.get('report', {}).get('reason', 'all pixels rejected')
+        summary['status'] = 'EMPTY REFERENCE: '+detail
+    elif not full_tiles.any():
+        summary['status'] = 'EMPTY REFERENCE: trusted pixels do not cover any complete culling tile'
+    else:
+        summary['status'] = 'Reference depth available; inspect its spatial coverage'
     if 'anchors' in frame:
         anchors = frame['anchors']
         u, v, z = (np.asarray(anchors[key]) for key in ('u', 'v', 'z'))
         inside = (u >= 0) & (v >= 0) & (u < w) & (v < h) & np.isfinite(z) & (z > 0)
         u, v, z = u[inside].astype(int), v[inside].astype(int), z[inside]
-        known = trusted[v, u]
+        # Show alignment disagreements even when every trusted pixel was
+        # rejected. Using the final mask here previously made every dot gold.
+        known = finite[v, u]
         agree = known & (np.abs(raw[v, u]-z) <= .1*z)
         mismatch = known & ~agree
         anchor_rgb = rgb.copy()
@@ -110,9 +129,11 @@ def reference_panels(frame, intrinsic, rgb, tiles):
             dots[v[mask], u[mask]] = 255
             dots = np.asarray(Image.fromarray(dots).filter(ImageFilter.MaxFilter(3))) > 0
             anchor_rgb[dots] = color
-        images['anchors'] = ('Projected nearest LiDAR anchors: green within 10% of trusted depth, red disagree, gold untrusted', anchor_rgb)
+        images['anchors'] = ('LiDAR vs reference prediction before masking: green within 10%, red disagree, gold missing depth', anchor_rgb)
         summary['lidar_anchors'] = dict(projected=len(z), agree=int(agree.sum()), disagree=int(mismatch.sum()),
-                                        untrusted=int((~known).sum()))
+            missing_prediction=int((~known).sum()), final_mask_rejected=int((~trusted[v, u]).sum()),
+            lidar_farther_than_prediction=int((mismatch & (z > raw[v, u])).sum()),
+            lidar_nearer_than_prediction=int((mismatch & (z < raw[v, u])).sum()))
     return images, summary
 
 
@@ -212,3 +233,21 @@ def write_report(directory, summary, images):
         'Center overlay is not z-buffered. Classification and masks cover every Gaussian.</p>'
         '<section>'+''.join(panels)+'</section><pre>'+html.escape(json.dumps(summary, indent=2))+'</pre>')
     (directory/'index.html').write_text(report)
+
+
+def write_debug_bundle(views):
+    """Package this exact view's numeric references and reports, excluding huge PLY/label exports."""
+    from zipfile import ZipFile, ZIP_DEFLATED
+    path = next(iter(views.values()))['directory'].parent/'occlusion_debug.zip'
+    temporary = path.with_suffix('.tmp.zip')
+    try:
+        with ZipFile(temporary, 'w', ZIP_DEFLATED) as archive:
+            for source, view in views.items():
+                for file in view['directory'].iterdir():
+                    if file.is_file() and (file.suffix == '.png' or
+                            file.name in ('summary.json', 'reference.npz', 'occlusion_tiles.npy')):
+                        archive.write(file, source+'/'+file.name)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path
