@@ -1,34 +1,43 @@
 #!/usr/bin/env python3
-"""Exercise real CUDA AA rendering, visibility gradients, and tangent growth."""
+"""Exercise CUDA mesh depth, AA culling, tangent growth and mesh-free inference."""
 import argparse
+import json
 import math
 import os
 from pathlib import Path
 import sys
+import tempfile
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--gpu', default='2')
-    args = parser.parse_args()
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+def exercise(backend, directory):
+    import numpy as np
     import torch
     from arguments import OptimizationParams
     from gaussian_renderer import render
     from scene.gaussian_model import GaussianModel
-    from scripts.occlusion_options import configure_pipeline
+    from scripts.occlusion_options import configure_pipeline, inference_pipeline
     from utils.graphics_utils import getProjectionMatrix
+    from utils.lidar_occlusion import file_digest
+    from utils.occlusion_culling import masked_adam_step
+    from utils.scene_occlusion import FORMAT, MeshDepthCache
     from utils.sh_utils import RGB2SH
-    from utils.view_tangent import camera_intrinsics, surface_frame
 
-    if not torch.cuda.is_available():
-        raise RuntimeError('Activate the native CUDA-enabled 3dgs environment')
+    # Two connected triangles, rendered by the actual CUDA mesh provider used
+    # in training. A safety margin affects clipping, never the tangent plane.
+    mesh = directory/'mesh.npz'
+    np.savez_compressed(mesh,
+        vertices=np.array([[-3,-3,2], [3,-3,2], [3,3,2], [-3,3,2]], np.float32),
+        faces=np.array([[0,1,2], [0,2,3]], np.int32))
+    scene = directory/'scene.json'
+    scene.write_text(json.dumps(dict(format=FORMAT, complete=True, mesh=mesh.name,
+        mesh_sha256=file_digest(mesh), relative_margin=.05)))
+    provider = MeshDepthCache(scene)
     torch.manual_seed(17)
     cam = SimpleNamespace(image_width=128, image_height=128, FoVx=math.pi/2, FoVy=math.pi/2,
-        world_view_transform=torch.eye(4, device='cuda'),
+        znear=.01, zfar=100., world_view_transform=torch.eye(4, device='cuda'),
         full_proj_transform=getProjectionMatrix(.01, 100., math.pi/2, math.pi/2).cuda().T,
         camera_center=torch.zeros(3, device='cuda'))
     model = GaussianModel(0)
@@ -47,15 +56,24 @@ def main():
     opt.surface_mode, opt.percent_dense, opt.view_tangent_max_points = 'view_tangent', .04, 6
     model.training_setup(opt)
     pipe = SimpleNamespace(convert_SHs_python=False, compute_cov3D_python=False, debug=False, antialiasing=True)
-    configure_pipeline(pipe, dict(occlusion_mode='off'))
-    depth = torch.full((128, 128), 2., device='cuda')
-    frame = surface_frame(depth, torch.ones_like(depth, dtype=torch.bool), camera_intrinsics(cam, 'cuda'))
-    tiles, bg = torch.full((8, 8), 2., device='cuda'), torch.zeros(3, device='cuda')
+    configure_pipeline(pipe, dict(occlusion_mode='mesh', occlusion_backend=backend, occlusion_geometry=str(scene)))
+    pipe._occlusion_provider = provider
+    frame = provider.surface(cam, 'cuda')
+    torch.testing.assert_close(frame['depth'][64, 64], torch.tensor(2., device='cuda'), atol=5e-5, rtol=0)
+    assert provider.pixel_depth(cam, 'cuda')[64, 64] > 2.09
+    assert list(provider.directory.glob('*.depth.npz')), 'Mesh depth was not persisted'
+    bg = torch.zeros(3, device='cuda')
     for _ in range(2):
-        result = render(cam, model, pipe, bg, occlusion_tiles=tiles)
+        result = render(cam, model, pipe, bg)
         result['render'].square().sum().backward()
+        assert torch.isfinite(result['render']).all()
         assert result['occlusion_keep'].tolist() == [True, True, False]
-        assert model._features_dc.grad[2].count_nonzero().item() == 0
+        if backend == 'ray':
+            assert result['occlusion_fragment_flags'].tolist() == [1, 1, 2]
+        for group in model.optimizer.param_groups:
+            grad = group['params'][0].grad
+            assert grad is not None and torch.isfinite(grad).all(), group['name']
+            assert grad[2].count_nonzero().item() == 0, group['name']
         indices = model.observe_view_surface(cam, result['visibility_filter'], frame)
         assert indices.tolist() == [0, 1]
         model.add_densification_stats(result['viewspace_points'], indices)
@@ -68,13 +86,56 @@ def main():
     torch.testing.assert_close(model.get_xyz[1], original[2])
     torch.testing.assert_close(model.get_xyz[2:, 2], torch.full((3,), 2., device='cuda'))
     assert (model.get_xyz[2]-original[0]).norm().item() > 0
-    assert len(model.surface_refs['anchor']) == len(model.get_xyz)
+    refs = model.surface_refs
+    delta = model.get_xyz[2:]-refs['anchor'][2:]
+    distance = (delta*refs['normal'][2:]).sum(-1, keepdim=True)
+    assert ((delta-distance*refs['normal'][2:]).norm(dim=1) <= .90001*refs['support'][2:]).all()
+    assert len(refs['anchor']) == len(model.get_xyz)
     assert all(len(group['params'][0]) == len(model.get_xyz) for group in model.optimizer.param_groups)
-    ordinary = render(cam, model, pipe, bg)
-    assert 'occlusion_keep' not in ordinary
+
+    # Population changes must remain compatible with the next ray render and
+    # masked Adam update. The hidden Gaussian is still frozen after growth.
+    hidden = {g['name']: g['params'][0][1].detach().clone() for g in model.optimizer.param_groups}
+    after = render(cam, model, pipe, bg)
+    after['render'].square().sum().backward()
+    assert not after['occlusion_keep'][1]
+    masked_adam_step(model.optimizer, after['occlusion_keep'])
+    model.optimizer.zero_grad(set_to_none=True)
+    for group in model.optimizer.param_groups:
+        assert torch.isfinite(group['params'][0]).all(), group['name']
+        torch.testing.assert_close(group['params'][0][1], hidden[group['name']], atol=0, rtol=0)
+    ordinary_pipe = inference_pipeline(pipe, dict(occlusion_mode='mesh', occlusion_backend=backend,
+                                                 occlusion_inference_mode='off'))
+    ordinary = render(cam, model, ordinary_pipe, bg)
+    assert 'occlusion_keep' not in ordinary and torch.isfinite(ordinary['render']).all()
     torch.cuda.synchronize()
-    print('CUDA view-tangent smoke passed: AA gradients, hidden-row exclusion, bounded clone/split, ordinary novel-view render')
+    return dict(backend=backend, antialiasing=True, cuda_mesh_first_hit=True,
+        raw_surface_without_culling_margin=True, disk_depth_cache=True,
+        blocked_gradients_zero=True, hidden_parents_excluded=True,
+        bounded_tangent_clone_split=True, optimizer_after_growth=True,
+        mesh_free_inference=True, growth=stats, passed=True)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--gpu', default='1')
+    parser.add_argument('--backend', choices=('whole', 'ray'), default='ray')
+    parser.add_argument('--output', type=Path)
+    args = parser.parse_args(argv)
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    import torch
+    if not torch.cuda.is_available():
+        raise RuntimeError('Activate the native CUDA-enabled 3dgs environment')
+    print(f'CUDA view-tangent smoke: mesh + {args.backend} culling + AA', flush=True)
+    with tempfile.TemporaryDirectory(prefix='mesh-tangent-smoke-') as temporary:
+        result = exercise(args.backend, Path(temporary))
+    result.update(cuda_device=torch.cuda.get_device_name(), torch=torch.__version__)
+    if args.output:
+        from scripts.view_comparisons import atomic_json
+        atomic_json(args.output, result)
+    print(json.dumps(result, indent=2), flush=True)
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

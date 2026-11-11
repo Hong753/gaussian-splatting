@@ -154,3 +154,43 @@ from an explicit off override on an older model, which uses `occlusion_off/`.
 `--occlusion on` remains available for a separate diagnostic render; it requires
 the mesh and writes a distinct result variant. `--evaluate-only` recovers the
 saved inference policy and does not require visibility preprocessing when off.
+
+## Tangent densification on the same mesh
+
+The plain training command above uses ordinary adaptive densification. Add
+`--view-tangent` to gate growth with the same mesh's **raw first-hit depths**:
+visible, near-surface parents accumulate image gradients; high-gradient parents
+clone or split inside a locally supported tangent disk. New centers preserve the
+parent's signed distance to that plane. Holes, depth discontinuities, unsupported
+regions, and occluded parents do not seed growth. This changes the growth rule;
+the ordinary reduced-LR position/covariance optimizer remains in place.
+
+The dedicated launcher defaults to this mesh run on **GPU 1**:
+
+```bash
+source /path/to/anaconda3/etc/profile.d/conda.sh
+conda activate 3dgs
+cd /path/to/gaussian-splatting
+DA3_OUTPUT_ROOT=/path/to/model_parent \
+DA3_SCENE_ROOT=/path/to/colmap_scene \
+DA3_BASELINE=/path/to/3dgs_aa_baseline \
+VIEW_TANGENT_SCENE=/path/to/model_parent/lidar_scene_surface_v1/scene.json \
+bash scripts/run_view_tangent.sh 1 mesh
+```
+
+It reuses the existing depth/visibility files, fills missing visibility frames,
+and creates a separate `3dgs_stride3_aa_lidar_mesh_trainonly_viewtangent_warm7k_lr50`
+model. Defaults: 30k iterations, fixed positions for 7k, 2k LR ramp, 50x smaller
+position LR, growth at steps 7,600 through 21,900, at most 50k growing parents per
+event and 12M total Gaussians. AA stays enabled. Validation, all-frame PSNR, GT
+comparisons, and both videos render without external occlusion surfaces.
+
+`view_tangent_cuda_smoke.json` records the actual GPU preflight (mesh rasterization,
+blocked gradients, tangent clone/split, optimizer update after growth, and ordinary
+inference). During training, `view_tangent_densification.jsonl` records supported,
+selected, cloned and split parent counts, plus the measured maximum child normal
+displacement and tangent-radius fraction. The displacement should be near floating
+point zero and the fraction at most 0.9. These check new child placement, not later
+optimizer motion. Disk depth caches persist; depth and derived surface-frame GPU
+caches each retain at most four views. Surface frames are recomputed from disk
+depth when evicted, rather than keeping all scene views in memory.

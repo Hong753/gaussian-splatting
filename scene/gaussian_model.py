@@ -627,6 +627,7 @@ class GaussianModel:
         previous_max_radii = self.max_radii2D
         gradient = (self.xyz_gradient_accum[:, 0]/self.denom[:, 0].clamp_min(1)).nan_to_num()
         good = eligible_parents(self._xyz, refs, self.denom, cfg['view_tangent_min_observations'])
+        supported_parents = int(good.sum().item())
         good &= (gradient >= max_grad) & (self.get_opacity[:, 0] >= min_opacity)
         # Parents that are about to be pruned should not consume the growth budget.
         scales = self.get_scaling
@@ -643,6 +644,7 @@ class GaussianModel:
         parents = torch.cat((selected, split_parents))
         child_split = torch.cat((split, torch.ones_like(split_parents, dtype=torch.bool)))
         self.tmp_radii = radii
+        normal_displacement, tangent_fraction = 0., 0.
         if len(parents):
             # Draw once per parent, then use opposite offsets for its split pair.
             samples = torch.randn_like(self._xyz[selected])*scales[selected]
@@ -650,6 +652,11 @@ class GaussianModel:
             offsets = torch.cat((offsets, -offsets[split]))
             child_refs = {key: value[parents] for key, value in refs.items()}
             new_xyz = tangent_children(self._xyz[parents], offsets, child_refs)
+            # Audit the actual new centers, not just whether the mode was set.
+            normal_displacement = float(((new_xyz-self._xyz[parents])*child_refs['normal']).sum(-1).abs().max().item())
+            delta = new_xyz-child_refs['anchor']
+            tangent = delta-(delta*child_refs['normal']).sum(-1, keepdim=True)*child_refs['normal']
+            tangent_fraction = float((tangent.norm(dim=1)/child_refs['support'].clamp_min(1e-12)).max().item())
             new_scaling = self._scaling[parents].clone()
             new_scaling[child_split] -= np.log(1.6)
             self.densification_postfix(new_xyz, self._features_dc[parents], self._features_rest[parents],
@@ -670,8 +677,10 @@ class GaussianModel:
         self.max_radii2D.zero_()
         self.tmp_radii = None
         self.last_view_tangent_stats = dict(points_before=count, eligible_parents=len(candidates),
+            surface_supported_parents=supported_parents,
             selected_parents=len(selected), cloned_parents=int((~split).sum().item()),
             split_parents=len(split_parents), added_children=len(parents), pruned=pruned,
+            max_child_normal_displacement=normal_displacement, max_child_tangent_fraction=tangent_fraction,
             points_after=len(self._xyz), point_budget=cfg['view_tangent_max_points'])
         torch.cuda.empty_cache()
         return self.last_view_tangent_stats

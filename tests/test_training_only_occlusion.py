@@ -94,6 +94,19 @@ class TrainingOnlyOcclusionTests(unittest.TestCase):
             visibility=prepared['stages'][0]['argv']
             self.assertEqual(visibility[visibility.index('--split')+1],'all')
             self.assertEqual(visibility[visibility.index('--gpu')+1],'0')
+            # Surface growth is a separate run on GPU 1, using the same full
+            # scene depth cache and preserving mesh-free inference everywhere.
+            tangent_args=run_occlusion.parser().parse_args(argv+['--view-tangent','--gpu','1','--prepare-visibility'])
+            tangent=run_occlusion.build_plan(tangent_args)
+            tangent_train=next(s['argv'] for s in tangent['stages'] if s['name']=='train')
+            self.assertEqual(tangent['gpu'],'1')
+            self.assertEqual(tangent_train[tangent_train.index('--surface_mode')+1],'view_tangent')
+            self.assertEqual(tangent_train[tangent_train.index('--occlusion_mode')+1],'mesh')
+            self.assertEqual(tangent_train[tangent_train.index('--occlusion_backend')+1],'ray')
+            self.assertEqual(tangent_train[tangent_train.index('--occlusion_cache')+1],str(root/'occlusion_depth_cache'))
+            self.assertEqual(tangent_train[tangent_train.index('--view_tangent_max_points')+1],'12000000')
+            for stage in tangent['stages'][2:]:
+                self.assertEqual(stage['argv'][stage['argv'].index('--occlusion')+1],'off')
             # Evaluation-only must recover the saved policy without the mesh or
             # its visibility cache. This also covers a model copied off-server.
             checkpoint(model,30000)

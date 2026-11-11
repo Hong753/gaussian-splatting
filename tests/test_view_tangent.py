@@ -1,6 +1,7 @@
 """Physical surface/visibility cases and native Gaussian population mutations."""
 import json
 import argparse
+import importlib.util
 import math
 import os
 from pathlib import Path
@@ -111,6 +112,9 @@ class ViewTangentTests(unittest.TestCase):
         initial = model.get_xyz.detach().clone()
         stats = self.densify(model)
         self.assertEqual((stats['cloned_parents'], stats['split_parents'], stats['points_after']), (1, 1, 4))
+        self.assertEqual(stats['surface_supported_parents'], 2)
+        self.assertLess(stats['max_child_normal_displacement'], 1e-6)
+        self.assertLessEqual(stats['max_child_tangent_fraction'], .90001)
         self.assertEqual(len(model.surface_refs['tolerance']), 4)
         torch.testing.assert_close(model.get_xyz[:, 2], torch.full((4,), 2.))
         self.assertTrue((model.get_xyz[1]-initial[0]).norm().item() > 0)
@@ -226,6 +230,59 @@ class ViewTangentTests(unittest.TestCase):
                 again = cache.surface(camera(64), 'cpu')
             torch.testing.assert_close(again['depth'], frame['depth'])
 
+    @unittest.skipUnless(importlib.util.find_spec('open3d'), 'Real mesh intersection requires open3d')
+    def test_mesh_guides_growth_on_front_tilted_wall_and_reuses_disk_depth(self):
+        from test_scene_occlusion import manifest, quad
+        from utils.scene_occlusion import MeshDepthCache
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            front, faces = quad()
+            front[:, 2] -= .2*front[:, 0]
+            rear = front + np.array([0, 0, .12], np.float32)
+            scene = manifest(root, np.concatenate((front, rear)), np.concatenate((faces, faces+4)))
+            cache = MeshDepthCache(scene)
+            cam = camera(64)
+            frame = cache.surface(cam, 'cpu')
+            self.assertGreater(cache.pixel_depth(cam, 'cpu')[32, 32], frame['depth'][32, 32])
+            xyz = torch.tensor([[0., 0, 2.], [.2, 0, 1.96], [0, 0, 2.12]])
+            idx, _ = match_visible_surface(cam, xyz, torch.arange(3), frame)
+            self.assertEqual(idx.tolist(), [0, 1])
+
+            model = self.model()
+            model.initialize_view_surface()
+            model._xyz.data[:] = xyz[:2]
+            model._scaling.data[1] = math.log(.02)
+            self.assertEqual(model.observe_view_surface(cam, torch.arange(2), frame).tolist(), [0, 1])
+            model.xyz_gradient_accum[:] = 1
+            model.denom[:] = 2
+            stats = self.densify(model)
+            self.assertEqual((stats['cloned_parents'], stats['split_parents']), (1, 1))
+            # Neither the culling tolerance nor the nearby rear wall should
+            # shift new centers off the measured front plane.
+            torch.testing.assert_close(model.get_xyz[:, 2]+.2*model.get_xyz[:, 0],
+                torch.full((4,), 2.), atol=2e-6, rtol=0)
+            fresh = MeshDepthCache(scene)
+            with patch.object(fresh, 'make_renderer', side_effect=AssertionError('Depth should be on disk')):
+                restored = fresh.surface(cam, 'cpu')
+                torch.testing.assert_close(restored['depth'], frame['depth'])
+                torch.testing.assert_close(restored['normal'], frame['normal'])
+
+    @unittest.skipUnless(importlib.util.find_spec('open3d'), 'Real mesh intersection requires open3d')
+    def test_mesh_depth_and_surface_frame_memory_are_bounded(self):
+        from test_scene_occlusion import manifest
+        from utils.scene_occlusion import MeshDepthCache
+        from utils.occlusion_depth import camera_signature
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = MeshDepthCache(manifest(Path(tmp)))
+            for i in range(6):
+                cam = camera(64, translation=(.02*i, 0, 0))
+                cache.pixel_depth(cam, 'cpu')
+                cache.surface(cam, 'cpu')
+                self.assertLessEqual(len(cache.pixel_memory), 4)
+                self.assertLessEqual(len(cache.surface_memory), 4)
+            self.assertEqual(len(list(cache.directory.glob('*.depth.npz'))), 6)
+            self.assertNotIn((camera_signature(camera(64), 1), 'cpu'), cache.pixel_memory)
+
     def test_workflow_enables_mode_and_keeps_all_frame_psnr_and_both_videos(self):
         from scripts import run_occlusion
         with tempfile.TemporaryDirectory() as tmp:
@@ -248,7 +305,7 @@ class ViewTangentTests(unittest.TestCase):
             self.assertEqual([s['name'] for s in plan['stages'][-2:]], ['random_video', 'actual_video'])
             self.assertIn('source', plan['stages'][-1]['argv'])
 
-    def test_shell_launcher_activates_native_environment_and_selects_gpu_2(self):
+    def test_shell_launcher_activates_native_environment_and_preserves_legacy_modes(self):
         script = Path(__file__).resolve().parents[1]/'scripts/run_view_tangent.sh'
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -267,6 +324,25 @@ class ViewTangentTests(unittest.TestCase):
                 self.assertIn('--view-tangent --dry-run', text)
                 self.assertIn('viewtangent_warm7k_lr50', text)
                 if source == 'da3': self.assertIn('--depth-dir', text)
+
+    def test_shell_launcher_defaults_to_mesh_ray_training_on_gpu_1(self):
+        script = Path(__file__).resolve().parents[1]/'scripts/run_view_tangent.sh'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shell, trace = root/'conda.sh', root/'trace'
+            shell.write_text('conda() { export TEST_ACTIVE_ENV="$2"; }\n'
+                'python() { printf "%s|%s\\n" "$TEST_ACTIVE_ENV" "$*" >> "$TEST_TRACE"; return 0; }\n')
+            env = dict(os.environ, DA3_CONDA_SH=str(shell), TEST_TRACE=str(trace),
+                       DA3_BASELINE='/baseline', VIEW_TANGENT_SCENE='/scene/surface.json')
+            for extra in ([], ['1', 'mesh', '--dry-run']):
+                completed = subprocess.run(['bash', str(script), *extra], env=env, capture_output=True, text=True)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                command = trace.read_text().splitlines()[-1]
+                self.assertTrue(command.startswith('3dgs|-u scripts/run_occlusion.py'))
+                for token in ('--gpu 1', '--scene-geometry /scene/surface.json', '--prepare-visibility',
+                              '--occlusion-backend ray', '--inference-occlusion off', '--view-tangent',
+                              'lidar_mesh_trainonly_viewtangent_warm7k_lr50'):
+                    self.assertIn(token, command)
 
 
 if __name__ == '__main__':
