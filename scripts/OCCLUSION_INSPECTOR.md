@@ -71,6 +71,21 @@ LiDAR anchor agreement. The coverage image uses green for usable tiles, blue for
 accepted pixels lost to whole-tile checks, and black for unknown/rejected pixels.
 This panel's colors are separate from the 3D Gaussian legend.
 
+The depth lookup is now `exact_tile_rectangle_v2` (shown in the viewer and JSON).
+The previous strided mip lookup could include unknown tiles outside a Gaussian's
+tested rectangle, incorrectly retaining it even when that rectangle was fully
+covered by wall depth. The replacement returns the exact maximum over that tile
+rectangle. Real holes inside it still retain the Gaussian. Existing depth caches
+are compatible; they do not need rebuilding for this lookup correction. Restart
+the inspector after pulling the fix. A running training process retains its
+loaded code; inspecting an old checkpoint uses the current culling implementation
+and does not reproduce the historical training mask.
+
+The DA3 inspection wrapper runs `scripts/smoke_da3_occlusion.py` in `3dgs` before
+opening the viewer. This tests a local wall surrounded by unknown depth, confirms
+zero hidden gradients in the native CUDA rasterizer, and verifies that a hole
+inside the actual footprint preserves the potentially visible Gaussian.
+
 ## Inspect only the reference saved with a run
 
 ```bash

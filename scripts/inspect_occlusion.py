@@ -129,6 +129,8 @@ class InspectorViewer:
                 f"Depth-culled: {100*summary['culled_fraction_all']:.2f}% of all Gaussians; "
                 f"{100*summary['culled_fraction_raster_candidates']:.2f}% of OFF raster candidates. "
                 f"Reliable depth tiles: {100*summary['reliable_tile_fraction']:.1f}%.\n\n")
+            if summary.get('culling_lookup'):
+                message += f"Depth lookup: `{summary['culling_lookup']}`\n\n"
             if summary.get('diagnostic_override'):
                 message += f"Diagnostic override; this checkpoint was trained with **{summary['saved_training_reference']}**.\n\n"
             if summary.get('candidate_reasons'):

@@ -219,6 +219,7 @@ class InspectorBackend:
         return counts
 
     def analyze_source(self, camera, off, radii_off, source, check_gradients=False):
+        from utils.occlusion_culling import CULLING_LOOKUP
         from utils.view_tangent import camera_intrinsics
         from utils.image_utils import psnr
         torch = self.torch
@@ -249,6 +250,7 @@ class InspectorBackend:
         reasons = self.decision_counts(camera, tiles, keep, radii_off)
         summary = dict(image=name, iteration=self.iteration, checkpoint=str(self.ply),
             checkpoint_sha256=self.checkpoint_sha256, culling_source=self.source_options[source],
+            culling_lookup=CULLING_LOOKUP,
             saved_training_reference=self.saved_reference, diagnostic_override=source != 'saved',
             reference_path=str(getattr(provider, 'root', getattr(provider, 'geometry', ''))),
             coverage=coverage, candidate_reasons=reasons,

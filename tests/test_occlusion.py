@@ -56,7 +56,7 @@ class OcclusionTests(unittest.TestCase):
         keep = conservative_keep(cam, points, scales, rotations, torch.full((16, 16), 2.))
         self.assertEqual(keep.tolist(), [False, True])
 
-    def test_mip_query_never_underestimates_any_covered_depth(self):
+    def test_rectangle_query_matches_actual_covered_depth_exactly(self):
         torch.manual_seed(7)
         tiles = torch.rand(17, 29)*10
         tiles[5, 8] = float("inf")
@@ -67,7 +67,37 @@ class OcclusionTests(unittest.TestCase):
             lo, hi = torch.tensor([[xs[0], ys[0]]]), torch.tensor([[xs[1], ys[1]]])
             bound = rectangle_maximum(atlas, metadata, lo, hi)[0]
             exact = tiles[ys[0]:ys[1]+1, xs[0]:xs[1]+1].max()
-            self.assertGreaterEqual(float(bound), float(exact))
+            self.assertEqual(float(bound), float(exact))
+
+    def test_unknown_outside_wall_footprint_does_not_prevent_culling(self):
+        # The former strided mip lookup enlarged tiles 3..4 to tiles 2..5.
+        # It then returned infinity from outside the tested Gaussian footprint.
+        tiles = torch.full((8, 8), float('inf'))
+        tiles[3:5, 3:5] = 2.
+        points = torch.tensor([[0., 0, 3.], [0., 0, 1.]])
+        scale = torch.full_like(points, .01)
+        rotations = torch.tensor([[1., 0, 0, 0]]).repeat(2, 1)
+        keep, details = conservative_keep(camera(128), points, scale, rotations, tiles, return_details=True)
+        self.assertEqual(keep.tolist(), [False, True])
+        self.assertEqual(details['tile_lo'].tolist(), [[3, 3], [3, 3]])
+        self.assertEqual(details['tile_hi'].tolist(), [[4, 4], [4, 4]])
+        torch.testing.assert_close(details['surface_bound_z'], torch.tensor([2., 2.]))
+        # A real hole inside that footprint must still preserve the background.
+        tiles[3, 4] = float('inf')
+        self.assertTrue(conservative_keep(camera(128), points, scale, rotations, tiles).all())
+
+    def test_rectangle_queries_all_ranges_on_small_odd_and_flat_grids(self):
+        for h, w in ((1, 1), (1, 7), (9, 1), (5, 7)):
+            with self.subTest(height=h, width=w):
+                tiles = torch.arange(h*w, dtype=torch.float32).reshape(h, w)+1
+                tiles[h//2, w//2] = float('inf')
+                rectangles = [(x0, y0, x1, y1) for y0 in range(h) for x0 in range(w)
+                              for y1 in range(y0, h) for x1 in range(x0, w)]
+                bounds = torch.tensor(rectangles)
+                atlas, meta = depth_pyramid(tiles)
+                actual = rectangle_maximum(atlas, meta, bounds[:, :2], bounds[:, 2:])
+                expected = torch.stack([tiles[y0:y1+1, x0:x1+1].max() for x0, y0, x1, y1 in rectangles])
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
     def test_tile_depth_treats_holes_as_unknown_and_erodes_edges(self):
         depth = torch.ones(48, 48)*2

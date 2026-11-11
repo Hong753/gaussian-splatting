@@ -48,6 +48,7 @@ python -u scripts/prepare_da3_occlusion.py \
 
 conda activate 3dgs
 python -m pip install 'viser==1.0.30'
+python scripts/smoke_da3_occlusion.py --gpu "$inspect_gpu"
 exec python -u scripts/inspect_occlusion.py --model "$inspect_model" \
     --depth-dir "$inspect_depth" --gpu "$inspect_gpu" --host 0.0.0.0 \
     --port "${OCCLUSION_INSPECTOR_PORT:-8082}" --check-gradients "${inspect_viewer[@]}"

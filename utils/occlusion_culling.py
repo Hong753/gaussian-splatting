@@ -5,27 +5,52 @@ import torch.nn.functional as F
 
 from utils.occlusion_depth import TILE, LidarDepthCache
 
+CULLING_LOOKUP = 'exact_tile_rectangle_v2'
+
 
 def depth_pyramid(tiles):
-    levels = [tiles]
-    while max(levels[-1].shape) > 1:
-        levels.append(F.max_pool2d(levels[-1][None, None], 2, stride=2, ceil_mode=True)[0, 0])
-    offsets, offset = [], 0
-    for level in levels:
-        offsets.append(offset)
-        offset += level.numel()
-    metadata = torch.tensor([(o, *a.shape) for o, a in zip(offsets, levels)], device=tiles.device, dtype=torch.long)
-    return torch.cat([a.flatten() for a in levels]), metadata
+    """Sliding rectangle maxima for an exact four-lookup 2D range query.
+
+    Entry (ky, kx, y, x) covers [y:y+2**ky, x:x+2**kx]. Unlike strided
+    mip cells, these windows can start at every tile, so unknown depths outside
+    a queried footprint cannot contaminate its maximum. The atlas is small:
+    it indexes the 16x16-tile grid, not full-resolution image pixels.
+    """
+    if tiles.ndim != 2 or min(tiles.shape) < 1:
+        raise ValueError('Expected a nonempty 2D occlusion tile grid')
+    height_levels, width_levels = tiles.shape[0].bit_length(), tiles.shape[1].bit_length()
+    levels, metadata, offset = [], [], 0
+    vertical = tiles
+    for ky in range(height_levels):
+        if ky:
+            step = 1 << (ky-1)
+            vertical = torch.maximum(vertical[:-step], vertical[step:])
+        horizontal = vertical
+        for kx in range(width_levels):
+            if kx:
+                step = 1 << (kx-1)
+                horizontal = torch.maximum(horizontal[:, :-step], horizontal[:, step:])
+            levels.append(horizontal.flatten())
+            metadata.append((offset, *horizontal.shape))
+            offset += horizontal.numel()
+    metadata = torch.tensor(metadata, device=tiles.device, dtype=torch.long).reshape(height_levels, width_levels, 3)
+    return torch.cat(levels), metadata
 
 
 def rectangle_maximum(atlas, metadata, lo, hi):
-    """Max over an enclosing set of <=4 mip cells; never underestimate a rectangle."""
-    size = (hi-lo+1).amax(dim=1).clamp_min(1)
-    level = torch.ceil(torch.log2(size.float())).long().clamp_max(len(metadata)-1)
+    """Exact maximum inside inclusive tile bounds (lo/hi are x,y).
+
+    Four possibly overlapping power-of-two windows cover the rectangle and are
+    contained within it. Unknown tiles inside still force retention; unknown
+    tiles outside do not affect this Gaussian's visibility decision.
+    """
+    size = (hi-lo+1).clamp_min(1)
+    limits = torch.tensor([metadata.shape[1]-1, metadata.shape[0]-1], device=lo.device)
+    level = torch.floor(torch.log2(size.float())).long().minimum(limits)
     cell = torch.bitwise_left_shift(torch.ones_like(level), level)
-    a, b = lo // cell[:, None], hi // cell[:, None]
-    offsets, height, width = metadata[level].unbind(1)
-    result = torch.full_like(size, -float("inf"), dtype=atlas.dtype)
+    a, b = lo, hi-cell+1
+    offsets, height, width = metadata[level[:, 1], level[:, 0]].unbind(1)
+    result = torch.full((len(lo),), -float("inf"), dtype=atlas.dtype, device=atlas.device)
     for x, y in ((a[:, 0], a[:, 1]), (a[:, 0], b[:, 1]), (b[:, 0], a[:, 1]), (b[:, 0], b[:, 1])):
         idx = offsets + y.clamp_min(0).minimum(height-1)*width + x.clamp_min(0).minimum(width-1)
         result = torch.maximum(result, atlas[idx])
