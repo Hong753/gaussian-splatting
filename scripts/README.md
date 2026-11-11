@@ -698,6 +698,12 @@ under `occlusion_on_HASH/`, preserving existing baseline scores. Optional
 expose preparation/caching independently; the normal workflow does not require
 these extra commands.
 
+For per-image 3D inspection of the actual native culling mask, use
+`scripts/inspect_occlusion.py --model MODEL --gpu 5 --check-gradients`.
+It displays complete active/culled Gaussian populations, reference depth and
+camera geometry, ON/OFF renders, and an optional native image-gradient check.
+See [OCCLUSION_INSPECTOR.md](OCCLUSION_INSPECTOR.md) for setup and interpretation.
+
 To stop the two earlier all-frame rendering jobs on their server, the scoped
 helper below checks physical GPU indices, process ownership, script names, and
 exact run names before sending SIGTERM through PID-safe handles. It leaves jobs

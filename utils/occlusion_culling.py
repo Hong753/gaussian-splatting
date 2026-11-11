@@ -42,7 +42,7 @@ def rotation_matrix(q):
 
 @torch.no_grad()
 def conservative_keep(camera, xyz, scales, rotations, tiles, margin=.05, sigma=3., chunk_size=131072,
-                      scaling_modifier=1.):
+                      scaling_modifier=1., return_details=False):
     """Keep partial/uncertain splats; reject only fully covered, definitely hidden support.
 
     Footprints follow dr_aa's covariance +0.3 pixel filter and 3-sigma radius,
@@ -59,6 +59,7 @@ def conservative_keep(camera, xyz, scales, rotations, tiles, margin=.05, sigma=3
     fx, fy = w/(2*tx), h/(2*ty)
     tile_bounds = torch.tensor([(w-1)//TILE, (h-1)//TILE], device=device)
     keep = torch.ones(len(xyz), dtype=torch.bool, device=device)
+    details = [] if return_details else None
     for start in range(0, len(xyz), chunk_size):
         end = start + chunk_size
         points = xyz[start:end]
@@ -88,6 +89,14 @@ def conservative_keep(camera, xyz, scales, rotations, tiles, margin=.05, sigma=3
         nearest = z - sigma*torch.sqrt(cov[:, 2, 2].clamp_min(0))
         reliable = intersects & (nearest > .2) & torch.isfinite(radius) & torch.isfinite(center).all(dim=1)
         keep[start:end] = ~(reliable & torch.isfinite(farthest_surface) & (nearest > farthest_surface + margin))
+        if return_details:
+            details.append(dict(center_uv=center, camera_z=z, nearest_support_z=nearest,
+                radius_pixels=radius, tile_lo=lo, tile_hi=hi, surface_bound_z=farthest_surface,
+                reliable=reliable, intersects=intersects))
+    if return_details:
+        if not details:
+            raise ValueError('Select at least one Gaussian for culling details')
+        return keep, {key: torch.cat([part[key] for part in details]) for key in details[0]}
     return keep
 
 
