@@ -28,7 +28,7 @@ source /path/to/anaconda3/etc/profile.d/conda.sh
 conda activate 3dgs
 cd /path/to/gaussian-splatting
 git pull --ff-only
-bash scripts/inspect_ray_surface.sh 5 \
+bash scripts/inspect_ray_surface.sh 0 \
   /path/to/native_checkpoint \
   FRAME.jpg
 ```
@@ -94,7 +94,7 @@ ray_root=/path/to/model_parent
 python -u scripts/prepare_scene_occlusion.py views \
   --scene "$ray_root/lidar_scene_surface_v1/scene.json" \
   --point-cloud /path/to/native_checkpoint/input.ply \
-  --split all --resolution -1 --device cuda --visibility-backend cuda --gpu 5
+  --split all --resolution -1 --device cuda --visibility-backend cuda --gpu 0
 ```
 
 This saves visibility for all registered frames, including unselected frames,
@@ -114,7 +114,7 @@ is used only on rays where the LiDAR mesh has no hit. This priority is shared by
 CUDA depth, exact CPU point-ray checks, training, and novel views. DA3 candidate
 geometry is an optional orange mesh layer in the viewer, off by default.
 
-## Training after the coverage check
+## Training with mesh-free inference
 
 ```bash
 source /path/to/anaconda3/etc/profile.d/conda.sh
@@ -124,14 +124,33 @@ ray_root=/path/to/model_parent
 ray_base=$(python -c 'from scripts.render import resolve_models; import sys; print(resolve_models(None, sys.argv[1], ["sharp_keyframes_stride3_aa"])[0])' "$ray_root")
 python -u scripts/run_occlusion.py \
   --source /path/to/colmap_scene \
-  --model "$ray_root/3dgs_stride3_aa_lidar_mesh_ray_warm7k_lr50" \
+  --model "$ray_root/3dgs_stride3_aa_lidar_mesh_trainonly_warm7k_lr50" \
   --baseline "$ray_base" --keyframes "$ray_base/keyframes.json" \
   --scene-geometry "$ray_root/lidar_scene_surface_v1/scene.json" \
-  --occlusion-backend ray --position-warmup-steps 7000 --position-ramp-steps 2000 \
-  --position-lr-scale .02 --gpu 5
+  --prepare-visibility --inference-occlusion off --occlusion-backend ray \
+  --position-warmup-steps 7000 --position-ramp-steps 2000 \
+  --position-lr-scale .02 --gpu 0
 ```
 
 The launcher retains train/eval GT comparisons, all-frame PSNR, and actual/novel
 trajectory videos. Current Gaussian fragments are clipped every iteration;
 precomputed LiDAR IDs are not reused as Gaussian IDs after movement/densification.
 Noncontributing Gaussian optimizer rows and momentum remain frozen for that view.
+
+`--prepare-visibility` finishes/resumes the all-frame CUDA visibility cache before
+training; a partial diagnostic cache is not silently treated as complete.
+GPU 0 is the default for the occlusion training and inspection workflow.
+
+`--inference-occlusion off` saves `occlusion_inference_mode=off` in `cfg_args`,
+while `occlusion_mode=mesh` remains enabled during optimization. Checkpoint
+validation, image comparisons, all-frame PSNR, and both videos use native 3DGS
+with AA and no mesh access. Training-only culling does not force learned
+foreground opacity to become opaque; mesh-free results measure whether the
+learned model retains the improvement without the external gate.
+
+The default mesh-free PSNR is written to `psnr_all_frames/iteration_30000/`
+with training mode and inference policy recorded in `summary.json`. This differs
+from an explicit off override on an older model, which uses `occlusion_off/`.
+`--occlusion on` remains available for a separate diagnostic render; it requires
+the mesh and writes a distinct result variant. `--evaluate-only` recovers the
+saved inference policy and does not require visibility preprocessing when off.

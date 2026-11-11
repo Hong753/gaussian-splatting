@@ -43,7 +43,7 @@ except:
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     dataset.antialiasing = pipe.antialiasing
     dataset.optimization_settings = vars(opt).copy()
-    from scripts.occlusion_options import configure_pipeline, prepare_training_geometry
+    from scripts.occlusion_options import configure_pipeline, prepare_training_geometry, inference_pipeline
     depth_directory = getattr(dataset, "train_depth_occlusion_dir", "")
     if (dataset.occlusion_mode != "off" or depth_directory) and opt.optimizer_type != "default":
         raise ValueError("Occlusion culling currently requires the default Adam optimizer")
@@ -102,6 +102,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene = Scene(dataset, gaussians)
     prepare_training_geometry(dataset, scene.getTrainCameras())
     configure_pipeline(pipe, dataset)
+    evaluation_pipe = inference_pipeline(pipe, dataset)
+    if evaluation_pipe.occlusion_mode != pipe.occlusion_mode:
+        print('LiDAR mesh culling enabled for optimization only; validation and saved inference render without it')
     training_occluders = None
     if depth_directory:
         from utils.da3_occlusion import TrainingDepthCache
@@ -270,7 +273,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp and dataset.eval)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (evaluation_pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp and dataset.eval)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)

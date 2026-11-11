@@ -168,6 +168,8 @@ def main():
                "antialiasing": args.antialiasing, "resolution_setting": camera_args.resolution,
                "selection_manifest": str(manifest_path) if manifest_name else None,
                "occlusion": settings(cfg), "render_variant": spec.get("render_variant", ""),
+               "training_occlusion_mode": spec.get("training_occlusion_mode", "off"),
+               "inference_occlusion_policy": cfg.get("occlusion_inference_mode", "saved"),
                "training_depth_occlusion_dir": cfg.get("train_depth_occlusion_dir", ""),
                "mean_occlusion_culled_fraction": culled_sum/culled_views if culled_views else None,
                "counts": counts, "mean_psnr_db": means}

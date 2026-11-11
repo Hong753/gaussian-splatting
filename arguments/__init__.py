@@ -63,6 +63,7 @@ class ModelParams(ParamGroup):
         self.eval = False
         self.occlusion_mode = "off"
         self.occlusion_backend = "whole"
+        self.occlusion_inference_mode = "saved"
         self.train_depth_occlusion_dir = ""
         self.occlusion_geometry = ""
         self.occlusion_points = ""

@@ -195,8 +195,8 @@ def load_renderer(spec, aa):
         gaussians.load_ply(str(spec["ply"]))
     pipe = SimpleNamespace(convert_SHs_python=False, compute_cov3D_python=False,
                            debug=False, antialiasing=aa)
-    from scripts.occlusion_options import configure_pipeline
-    configure_pipeline(pipe, cfg)
+    from scripts.occlusion_options import configure_pipeline, inference_settings
+    configure_pipeline(pipe, cfg if spec.get('inference_occlusion_resolved') else inference_settings(cfg))
     bg_color = [1, 1, 1] if cfg.get("white_background", False) else [0, 0, 0]
     bg = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 

@@ -251,7 +251,7 @@ def parser():
     v.add_argument('--point-cloud', type=Path, required=True)
     v.add_argument('--output', type=Path)
     v.add_argument('--resolution', type=int, default=-1)
-    v.add_argument('--gpu', default='5')
+    v.add_argument('--gpu', default='0')
     v.add_argument('--device', choices=('cpu', 'cuda'), default='cuda')
     v.add_argument('--visibility-backend', choices=('auto', 'cuda', 'exact'), default='auto',
                    help='auto uses CUDA pixel-depth classification on GPU; exact uses CPU triangle BVH rays')

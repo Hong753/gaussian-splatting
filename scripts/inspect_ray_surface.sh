@@ -3,7 +3,7 @@
 set -euo pipefail
 source "${DA3_CONDA_SH:-/opt/anaconda3/etc/profile.d/conda.sh}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-ray_gpu="${1:-5}"
+ray_gpu="${1:-0}"
 ray_model="${2:-/data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_occlusion}"
 ray_image="${3:-06663.jpg}"
 if (( $# > 3 )); then

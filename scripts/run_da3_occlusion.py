@@ -16,7 +16,7 @@ def parser():
     p = run_occlusion.parser(depth_maps=True)
     p.description = __doc__
     p.add_argument('--depth-dir', type=Path, required=True, help='Complete prepare_da3_occlusion.py output')
-    p.set_defaults(gpu='3', position_warmup_steps=7000, position_ramp_steps=2000, position_lr_scale=.02)
+    p.set_defaults(gpu='0', position_warmup_steps=7000, position_ramp_steps=2000, position_lr_scale=.02)
     return p
 
 
@@ -41,7 +41,8 @@ def build_plan(args):
     stages = []
     for stage in plan['stages']:
         name, command = stage['name'], stage['argv'][:]
-        if name.startswith('trained_off') or name.startswith('baseline_on'):
+        if ((name.startswith('trained_off') and plan.get('inference_occlusion') != 'off') or
+                name.startswith('baseline_on')):
             continue
         if name == 'train':
             for flag in ('--occlusion_voxel_size', '--occlusion_max_radius'):

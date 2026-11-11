@@ -21,12 +21,37 @@ def settings(cfg):
     return {k: cfg.get(k, v) for k, v in DEFAULTS.items()}
 
 
+def inference_settings(cfg):
+    """Saved render policy, independent of the occluder used during optimization."""
+    cfg = cfg if isinstance(cfg, dict) else vars(cfg)
+    mode = cfg.get('occlusion_inference_mode', 'saved')
+    if mode not in ('saved', 'off'):
+        raise ValueError('occlusion_inference_mode must be saved or off')
+    values = settings(cfg)
+    if mode == 'off':
+        values['occlusion_mode'] = 'off'
+    return values
+
+
+def inference_pipeline(pipe, cfg):
+    """Do not mutate the training pipeline or reuse its provider in mesh-free validation."""
+    from copy import copy
+    values = inference_settings(cfg)
+    if values['occlusion_mode'] == getattr(pipe, 'occlusion_mode', 'off'):
+        return pipe
+    result = copy(pipe)
+    if hasattr(result, '_occlusion_provider'):
+        del result._occlusion_provider
+    return configure_pipeline(result, values)
+
+
 def apply_overrides(spec, args, mode=None):
-    saved = settings(spec["cfg"])
+    trained = settings(spec["cfg"])
+    saved = inference_settings(spec["cfg"])
     current = dict(saved)
     mode = mode or getattr(args, "occlusion", None) or "saved"
     if mode != "saved":
-        current["occlusion_mode"] = (saved['occlusion_mode'] if saved['occlusion_mode'] != 'off' else 'lidar') if mode == 'on' else 'off'
+        current["occlusion_mode"] = (trained['occlusion_mode'] if trained['occlusion_mode'] != 'off' else 'lidar') if mode == 'on' else 'off'
     for key in ("occlusion_geometry", "occlusion_cache", "occlusion_margin", "occlusion_backend"):
         value = getattr(args, key, None)
         if value is not None:
@@ -37,6 +62,8 @@ def apply_overrides(spec, args, mode=None):
         raise ValueError("External occlusion culling currently supports native 3DGS only")
     validate(current)
     spec["cfg"] = {**spec["cfg"], **current}
+    spec['training_occlusion_mode'] = trained['occlusion_mode']
+    spec['inference_occlusion_resolved'] = True
     # Separate overridden evaluations from the saved model's default protocol.
     comparable = lambda c: {k: v for k, v in c.items() if k != "occlusion_cache"}
     if comparable(current) != comparable(saved):
@@ -92,6 +119,7 @@ def metric_directory(model, iteration, variant=""):
 
 def training_paths(dataset):
     """Set model-local asset paths before cfg_args is written."""
+    inference_settings(dataset)  # Validate the policy before allocating a large scene.
     if dataset.occlusion_mode == 'off':
         return
     if dataset.occlusion_mode not in ('lidar', 'mesh'):

@@ -22,7 +22,7 @@ def parser(*, depth_maps=False):
     p.add_argument('--baseline', type=Path, help=('Optional native 3DGS+AA checkpoint for scores and both comparison videos'
                    if depth_maps else 'Optional native 3DGS+AA checkpoint for four-way scores and both comparison videos'))
     p.add_argument('--video-output', type=Path, help='Comparison video root; defaults to MODEL/comparisons')
-    p.add_argument('--gpu', default='2')
+    p.add_argument('--gpu', default='0')
     p.add_argument('--iterations', type=int, default=30000)
     p.add_argument('--resolution', type=int, default=-1)
     if depth_maps:
@@ -33,6 +33,10 @@ def parser(*, depth_maps=False):
         p.add_argument('--scene-geometry', type=Path, help='Use a fixed whole-scene scene.json instead of LiDAR patches')
     p.add_argument('--margin', type=float, default=.05)
     p.add_argument('--occlusion-backend', choices=('whole', 'ray'), default='whole')
+    p.add_argument('--inference-occlusion', choices=('saved', 'off'), default=None,
+                   help='off trains with culling, but saves mesh-free inference and skips culling-on evaluations')
+    p.add_argument('--prepare-visibility', action='store_true',
+                   help='Finish/resume all-frame CUDA visibility preprocessing before mesh training')
     p.add_argument('--position-warmup-steps', type=int, default=0,
                    help='Freeze xyz and its Adam state for this many initial steps')
     p.add_argument('--position-ramp-steps', type=int, default=0,
@@ -111,19 +115,28 @@ def build_plan(args):
         raise FileNotFoundError('Requested saved iteration is missing')
     schedule = training_schedule(args)
     backend = args.occlusion_backend
+    inference_mode = getattr(args, 'inference_occlusion', None)
     if args.evaluate_only:
         from scripts.eval_all_frames import read_config
-        backend = read_config(model/'cfg_args').get('occlusion_backend', 'whole')
+        saved_cfg = read_config(model/'cfg_args')
+        backend = saved_cfg.get('occlusion_backend', 'whole')
+        if inference_mode is None:
+            inference_mode = saved_cfg.get('occlusion_inference_mode', 'saved')
+    inference_mode = inference_mode or 'saved'
     steps = sorted(set(i for i in (7000, args.iterations) if i <= args.iterations))
     train = ['train.py', '-s', str(source), '-m', str(model), '--iterations', str(args.iterations),
              '--resolution', str(args.resolution), '--data_device', 'cpu', '--disable_viewer', '--antialiasing',
              '--keyframe_manifest', str(model/'keyframes.json'), '--occlusion_mode', 'lidar',
              '--occlusion_voxel_size', str(args.voxel_size), '--occlusion_max_radius', str(args.max_radius),
              '--occlusion_margin', str(args.margin), '--occlusion_backend', backend,
+             '--occlusion_inference_mode', inference_mode,
              '--test_iterations', *map(str, steps),
              '--save_iterations', *map(str, steps)]
     scene_geometry = getattr(args, 'scene_geometry', None)
-    if scene_geometry:
+    preparation_stages = []
+    if args.prepare_visibility and (not scene_geometry or args.evaluate_only):
+        raise ValueError('--prepare-visibility requires --scene-geometry and a new training run')
+    if scene_geometry and (not args.evaluate_only or inference_mode != 'off'):
         from utils.scene_occlusion import load_scene
         report, _ = load_scene(scene_geometry, source=source)
         if report.get('diagnostic_only'):
@@ -133,13 +146,22 @@ def build_plan(args):
         if set(json.loads(args.keyframes.read_text())['selected_images']) != set(report['training_images']):
             raise ValueError('Scene fusion and training keyframes differ')
         visibility_path = scene_geometry.resolve().parent/'visibility/metadata.json'
-        if not visibility_path.is_file() or not json.loads(visibility_path.read_text()).get('complete'):
+        visibility = json.loads(visibility_path.read_text()) if visibility_path.is_file() else {}
+        if not visibility.get('complete') and not args.prepare_visibility:
             raise ValueError('Finish whole-scene per-view visibility preprocessing and inspect its coverage before training')
         from utils.lidar_occlusion import file_digest
-        visibility = json.loads(visibility_path.read_text())
-        if (visibility['scene_sha256'] != file_digest(scene_geometry) or
+        if visibility and (visibility['scene_sha256'] != file_digest(scene_geometry) or
                 not set(report['training_images']).issubset(visibility['images'])):
             raise ValueError('Per-view visibility belongs to a different scene or omits training views')
+        if args.prepare_visibility:
+            if not report.get('point_cloud'):
+                raise ValueError('Scene manifest is missing its initialization point-cloud path')
+            load_scene(scene_geometry, point_cloud=report['point_cloud'], source=source)
+            preparation_stages.append(dict(name='visibility', argv=[
+                'scripts/prepare_scene_occlusion.py', 'views', '--scene', str(scene_geometry.resolve()),
+                '--point-cloud', report['point_cloud'], '--resolution', str(args.resolution),
+                '--margin', str(args.margin), '--split', 'all', '--device', 'cuda',
+                '--visibility-backend', 'cuda', '--gpu', args.gpu]))
         train[train.index('--occlusion_mode')+1] = 'mesh'
         train += ['--occlusion_geometry', str(scene_geometry.resolve()), '--occlusion_cache',
                   str(scene_geometry.resolve().parent/'occlusion_depth_cache')]
@@ -157,7 +179,7 @@ def build_plan(args):
         train += ['--surface_mode', 'view_tangent']
         for key, value in tangent_options.items():
             train += ['--'+key, str(value)]
-    stages = [] if args.evaluate_only else [dict(name='train', argv=train)]
+    stages = [] if args.evaluate_only else preparation_stages + [dict(name='train', argv=train)]
     geometry, cache = str(model/'occlusion_geometry.npz'), str(model/'occlusion_depth_cache')
     if scene_geometry:
         geometry, cache = str(scene_geometry.resolve()), str(scene_geometry.resolve().parent/'occlusion_depth_cache')
@@ -169,8 +191,11 @@ def build_plan(args):
         stages.append(dict(name=name+'_psnr', argv=['scripts/eval_all_frames.py', '--source', str(source), *options]))
         stages.append(dict(name=name+'_images', argv=['scripts/render.py', '--split', 'both', '--max-views',
             str(args.report_max_views), '--gpu', args.gpu, '--in-process', *options]))
-    evaluation(model, 'saved', 'trained_on')
-    evaluation(model, 'off', 'trained_off')
+    if inference_mode == 'off':
+        evaluation(model, 'off', 'trained_off')
+    else:
+        evaluation(model, 'saved', 'trained_on')
+        evaluation(model, 'off', 'trained_off')
     if args.baseline:
         baseline = args.baseline.expanduser().resolve()
         if baseline == model or not (baseline/f'point_cloud/iteration_{args.iterations}/point_cloud.ply').is_file():
@@ -181,12 +206,13 @@ def build_plan(args):
                 cfg.get('train_test_exp', False) or cfg.get('occlusion_mode', 'off') != 'off'):
             raise ValueError('Baseline must be native 3DGS without exposure compensation or culling')
         evaluation(baseline, 'off', 'baseline_off')
-        evaluation(baseline, 'on', 'baseline_on')
+        if inference_mode != 'off':
+            evaluation(baseline, 'on', 'baseline_on')
         video_root = args.video_output.expanduser().resolve() if args.video_output else model/'comparisons'
         for video in ('random', 'actual'):
             command = ['scripts/render.py', '--video', video, '--source', str(source), '--models', str(baseline), str(model),
-                '--labels', '3DGS + AA', schedule_label(schedule).replace('LiDAR culling', 'fixed scene mesh culling' if scene_geometry else 'LiDAR culling') + (' + view-tangent growth' if args.view_tangent else ''),
-                '--aa', 'on', 'on', '--occlusion', 'off', 'saved',
+                '--labels', '3DGS + AA', schedule_label(schedule).replace('LiDAR culling', 'fixed scene mesh culling' if scene_geometry else 'LiDAR culling') + (' + view-tangent growth' if args.view_tangent else '') + (' | culling during training only' if inference_mode == 'off' else ''),
+                '--aa', 'on', 'on', '--occlusion', 'off', 'off' if inference_mode == 'off' else 'saved',
                 '--iteration', str(args.iterations), '--gpu', args.gpu, '--in-process', '--width', '1280', '--fps', '30',
                 '--output', str(video_root/video)]
             if video == 'random':
@@ -195,7 +221,7 @@ def build_plan(args):
                 command += ['--actual-poses', 'source']
             stages.append(dict(name=video+'_video', argv=command))
     return dict(source=str(source), model=str(model), gpu=args.gpu, training_schedule=schedule,
-                view_tangent_options=tangent_options, stages=stages)
+                view_tangent_options=tangent_options, inference_occlusion=inference_mode, stages=stages)
 
 
 def invoke(command):
@@ -230,10 +256,11 @@ def main(argv=None):
     import torch
     if not torch.cuda.is_available():
         raise RuntimeError('Run this workflow in the CUDA-enabled native 3dgs environment')
-    try:
-        import nvdiffrast.torch
-    except ImportError as exc:
-        raise RuntimeError('Install requirements-occlusion.txt in the native 3dgs environment first') from exc
+    if not args.evaluate_only or plan['inference_occlusion'] != 'off':
+        try:
+            import nvdiffrast.torch
+        except ImportError as exc:
+            raise RuntimeError('Install requirements-occlusion.txt in the native 3dgs environment first') from exc
     if not args.evaluate_only:
         # Compile/check CUDA before spending time fitting a large cloud.
         if args.occlusion_backend == 'ray':

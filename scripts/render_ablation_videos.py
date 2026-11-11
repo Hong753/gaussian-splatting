@@ -156,6 +156,7 @@ def build_plan(args):
             if args.actual_poses == "model":
                 selected_cameras = core.trajectory_record([camera(own[c.image_name]) for c in cameras])
         models.append(dict(path=str(spec["path"]), cfg=spec["cfg"], metadata=metadata,
+            inference_occlusion_resolved=True, training_occlusion_mode=spec['training_occlusion_mode'],
             type=kind, iteration=iteration, ply=str(ply), label=label, antialiasing=bool(antialiasing),
             python=metadata.get("python", sys.executable), train_count=len(spec["splits"]["train"]),
             cameras=selected_cameras, trajectory_sha256=camera_hash(selected_cameras),
@@ -209,7 +210,7 @@ def execute_model(plan_path, index, chain=True):
                                   plan["width"], plan["height"], model["antialiasing"])
     label = f"{model['label']} | {model['iteration']} steps | AA {'on' if model['antialiasing'] else 'off'}"
     if model["type"] == "3dgs":
-        label += " | culling " + ("on" if model["cfg"].get("occlusion_mode") == "lidar" else "off")
+        label += " | culling " + ("on" if model["cfg"].get("occlusion_mode") in ('lidar','mesh') else "off")
     output = Path(plan["output"])
     core.write_video(output / model["video"], labeled_frames(frames, label, plan["width"], plan["height"]),
                      plan["width"], plan["height"] + plan["label_height"], plan["fps"], plan["crf"])

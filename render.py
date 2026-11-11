@@ -46,8 +46,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, separate_sh: bool):
-    from scripts.occlusion_options import configure_pipeline
-    configure_pipeline(pipeline, dataset)
+    from scripts.occlusion_options import configure_pipeline, inference_settings
+    configure_pipeline(pipeline, inference_settings(dataset))
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)

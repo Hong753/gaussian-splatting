@@ -33,7 +33,7 @@ def main(argv=None):
     p.add_argument('--model',type=Path,help='Native checkpoint for actual ON/OFF render and fragment flags')
     p.add_argument('--iteration',type=int,default=-1)
     p.add_argument('--image',required=True)
-    p.add_argument('--gpu',default='5')
+    p.add_argument('--gpu',default='0')
     p.add_argument('--margin',type=float,default=.05)
     p.add_argument('--surface-band',type=float,default=.03,help='Yellow proximity band, independent of culling tolerance')
     p.add_argument('--output',type=Path)
