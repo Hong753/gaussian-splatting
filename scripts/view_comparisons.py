@@ -144,6 +144,11 @@ def write_all_frame_metrics(spec, rows, iteration, antialiasing=None):
         coverage="all original registered COLMAP frames",
         occlusion=settings(cfg), render_variant=spec.get("render_variant", ""),
         counts={group: len(names) for group, names in groups.items()}, mean_psnr_db=means)
+    from scripts import pose_options
+    summary['camera_poses']=spec.get('camera_poses','original')
+    summary['pose_protocol']=pose_options.protocol(spec)
+    cache=pose_options.load_cache(spec,iteration)
+    if cache is not None: summary['pose_cache']=dict(path=cache['_path'],sha256=cache['_sha256'])
     output = metric_directory(spec["path"], iteration, spec.get("render_variant", ""))
     output.mkdir(parents=True, exist_ok=True)
     temporary = output / f"per_frame.csv.{uuid.uuid4().hex}.tmp"

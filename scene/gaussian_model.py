@@ -67,6 +67,8 @@ class GaussianModel:
         self.surface_refs = None
         self.fixed_lidar_state = None
         self.local_scale_audit = None
+        self.pose_refinement_state = None
+        self.pose_refiner = None
         self.discrete_lidar_state = None
         self.discrete_lidar_pool = None
         self.spatial_lr_scale = 0
@@ -90,6 +92,7 @@ class GaussianModel:
             self.surface_mode,
             self.fixed_lidar_state,
             self.discrete_lidar_state,
+            self.pose_refiner.capture() if self.pose_refiner is not None else self.pose_refinement_state,
         )
     
     def restore(self, model_args, training_args):
@@ -103,6 +106,9 @@ class GaussianModel:
         if (saved_discrete is not None) != bool(getattr(training_args, 'discrete_lidar', False)):
             raise ValueError('Checkpoint discrete LiDAR mode differs from requested mode')
         self.discrete_lidar_state = saved_discrete
+        self.pose_refinement_state = model_args[16] if len(model_args)>16 else None
+        if (self.pose_refinement_state is not None) != bool(getattr(training_args,'pose_refinement','')):
+            raise ValueError('Checkpoint pose-refinement mode differs from requested mode')
         model_args = model_args[:12]
         if saved_surface_refs is not None and saved_surface_mode != training_args.surface_mode:
             raise ValueError("Checkpoint surface mode differs from requested mode")
@@ -293,6 +299,8 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         fixed = bool(getattr(training_args, 'fixed_lidar', False))
+        if getattr(training_args,'pose_refinement','') and (not fixed or getattr(training_args,'scale_control','')!='hybrid'):
+            raise ValueError('Pose refinement requires fixed LiDAR local-scale training')
         if getattr(training_args, 'local_scale_schedule', '') and not fixed:
             raise ValueError('Local-scale schedules require fixed LiDAR training')
         discrete = bool(getattr(training_args, 'discrete_lidar', False))

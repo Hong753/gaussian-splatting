@@ -22,6 +22,16 @@ def schedule_arguments(parser):
     for name, value in GROUP_LRS.items():
         parser.add_argument('--lr-'+name.replace('_','-'),type=float,default=value)
         parser.add_argument('--lr-'+name.replace('_','-')+'-final',type=float,default=value*.1)
+    parser.add_argument('--pose-refinement',action='store_true')
+    parser.add_argument('--pose-start',type=int,default=7000)
+    parser.add_argument('--pose-end',type=int,default=20000)
+    parser.add_argument('--pose-every',type=int,default=1)
+    parser.add_argument('--pose-max-translation',type=float,default=.03)
+    parser.add_argument('--pose-max-rotation-degrees',type=float,default=.5)
+    parser.add_argument('--pose-translation-lr',type=float,default=.001)
+    parser.add_argument('--pose-rotation-lr',type=float,default=.0002)
+    parser.add_argument('--pose-prior-weight',type=float,default=.001)
+    parser.add_argument('--pose-max-width',type=int,default=960)
 
 
 def requested_schedule(args):
@@ -97,6 +107,11 @@ def prepare(argv):
     args.ceiling_multiplier=request.ceiling_multiplier
     args.target_multiplier=request.target_multiplier
     args.training_schedule=schedule
+    args.pose_policy=None
+    if request.pose_refinement:
+        from utils.pose_refinement import DEFAULTS, validate as validate_pose
+        args.pose_policy=validate_pose({**DEFAULTS,**{key:getattr(request,'pose_'+key) for key in
+            ('start','end','every','max_translation','max_rotation_degrees','translation_lr','rotation_lr','prior_weight','max_width')}},request.iterations)
     args.reuse_cache=Path(old['plan']['local_scale_cache'])
     args.local_scale_cache=request.model/'local_scale_cache'
     for name in ('source','model','baseline','keyframes','point_cloud','reuse_cache','local_scale_cache'):
@@ -106,6 +121,9 @@ def prepare(argv):
         if digest(path) != expected:
             raise ValueError(f'Reference experiment input changed: {path}')
     inputs=[args.keyframes,args.point_cloud,reference/'periodic_evaluation/plan.json']
+    if args.pose_policy is not None:
+        from utils.pose_refinement import source_fingerprints
+        inputs.extend(Path(path) for path in source_fingerprints(args.source))
     plan=run_local_scale.build_plan(args)
     folder=periodic.directory(args.model)
     if not args.dry_run and (folder/'plan.json').is_file():
@@ -114,6 +132,7 @@ def prepare(argv):
             serialized={key:str(value) if isinstance(value,Path) else value for key,value in vars(args).items()}
             prior_args=dict(existing['training_args'])
             prior_args.setdefault('training_schedule',None)
+            prior_args.setdefault('pose_policy',None)
             if existing['plan'] != plan or prior_args != serialized:
                 raise ValueError('Prepared tuning run differs; use a fresh model directory')
             print(f'Reusing identical prepared tuning run: {folder/"plan.json"}',flush=True)

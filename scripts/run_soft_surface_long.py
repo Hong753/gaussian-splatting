@@ -209,6 +209,28 @@ def evaluate(data, snapshot, start):
         metrics=str(metric/'summary.json'), per_frame=str(metric/'per_frame.csv'), previews=str(previews/'index.html'),
         metrics_sha256=digest(metric/'summary.json'), per_frame_sha256=digest(metric/'per_frame.csv'),
         diagnostics=experiment_diagnostics(data, start, iteration))
+    if 'pose_cache' in snapshot:
+        refined=metric/'poses_refined'
+        refined_previews=previews/'poses_refined'
+        run_occlusion.invoke(['scripts/eval_all_frames.py','--source',data['source'],'--model',str(model),
+            '--iteration',str(iteration),'--antialiasing','--occlusion','off','--camera-poses','refined',
+            '--expected-frames',str(data['expected_frames'])])
+        cached=json.loads((refined/'summary.json').read_text())
+        verify_metrics(data,iteration,cached,refined/'per_frame.csv')
+        if (summary.get('camera_poses')!='original' or cached.get('camera_poses')!='refined' or
+                cached.get('pose_cache',{}).get('sha256')!=snapshot['files'][snapshot['pose_cache']]['sha256']):
+            raise ValueError('Pose evaluation used the wrong original/refined checkpoint protocol')
+        if summary['counts']['unselected'] and abs(float(summary['mean_psnr_db']['unselected'])-float(cached['mean_psnr_db']['unselected']))>1e-5:
+            raise ValueError('Unselected camera evaluation changed when applying train-only pose offsets')
+        run_occlusion.invoke(['scripts/render.py','--model',str(model),'--iteration',str(iteration),
+            '--split','both','--eval-set','unselected','--max-views',str(data['report_max_views']),
+            '--antialiasing','--occlusion','off','--camera-poses','refined','--gpu',data['gpu'],
+            '--in-process','--output',str(refined_previews)])
+        if not (refined_previews/'index.html').is_file() or read_snapshot(model,iteration)!=snapshot:
+            raise ValueError('Missing pose comparisons or changed checkpoint during evaluation')
+        result['refined_poses']=dict(metrics=str(refined/'summary.json'),per_frame=str(refined/'per_frame.csv'),
+            previews=str(refined_previews/'index.html'),metrics_sha256=digest(refined/'summary.json'),
+            per_frame_sha256=digest(refined/'per_frame.csv'),mean_psnr_db=cached['mean_psnr_db'],counts=cached['counts'])
     atomic_json(directory(model)/f'iteration_{iteration}.json', result)
     return result
 
@@ -308,6 +330,12 @@ def completed_result(model, iteration, snapshot):
     for key in ('metrics', 'per_frame'):
         if not Path(result[key]).is_file() or digest(result[key]) != result[key+'_sha256']:
             return None
+    if 'pose_cache' in snapshot:
+        cached=result.get('refined_poses',{})
+        for key in ('metrics','per_frame'):
+            if key not in cached or not Path(cached[key]).is_file() or digest(cached[key])!=cached.get(key+'_sha256'):
+                return None
+        if not Path(cached.get('previews','')).is_file(): return None
     return result if Path(result['previews']).is_file() else None
 
 
@@ -316,12 +344,17 @@ def write_history(data, results):
     rows = [dict(iteration=r['iteration'], gaussians=r['gaussians'],
                  **{k+'_psnr_db': r['mean_psnr_db'][k] for k in ('all', 'selected', 'unselected')},
                  frames=r['counts']['all'], snapshot_id=r['snapshot_id']) for r in results]
+    poses=bool(data['plan'].get('pose_refinement'))
+    if poses:
+        for row,result in zip(rows,results):
+            row['refined_all_psnr_db']=result['refined_poses']['mean_psnr_db']['all']
+            row['refined_selected_psnr_db']=result['refined_poses']['mean_psnr_db']['selected']
     atomic_json(folder/'history.json', dict(expected_iterations=data['iterations'], completed=rows,
-        complete=len(rows)==len(data['iterations']), render_protocol='3DGS + AA; no mesh/culling; no exposure'))
+        complete=len(rows)==len(data['iterations']), render_protocol='3DGS + AA; no mesh/culling; no exposure; primary metrics use original poses'))
     def save_csv(temp):
         with temp.open('w', newline='') as stream:
             writer = csv.DictWriter(stream, fieldnames=['iteration', 'gaussians', 'all_psnr_db', 'selected_psnr_db',
-                                                       'unselected_psnr_db', 'frames', 'snapshot_id'])
+                'unselected_psnr_db', 'frames', 'snapshot_id']+(['refined_all_psnr_db','refined_selected_psnr_db'] if poses else []))
             writer.writeheader(); writer.writerows(rows)
     atomic_write(folder/'history.csv', save_csv)
     body = []
@@ -330,16 +363,24 @@ def write_history(data, results):
                          for k, label in [('metrics', 'PSNR'), ('per_frame', 'all frames'), ('previews', 'GT / render / error')])
         links += f' <a href="iteration_{row["iteration"]}.json">Diagnostics</a>'
         cells = [row[k] for k in ('iteration', 'gaussians', 'frames', 'all_psnr_db', 'selected_psnr_db', 'unselected_psnr_db')]
+        if poses:
+            refined=result['refined_poses']
+            links+=f' <a href="{html.escape(os.path.relpath(refined["previews"],folder))}">Cached-pose GT / render</a>'
+            cells += [row['refined_all_psnr_db'],row['refined_selected_psnr_db']]
         body.append('<tr>'+''.join(f'<td>{html.escape(str(v))}</td>' for v in cells)+f'<td>{links}</td></tr>')
     title = {'local_scale':'Local KNN scale checkpoints', 'fixed_lidar':'Fixed LiDAR checkpoints',
              'discrete_lidar':'Discrete LiDAR checkpoints',
              'distance_weighted':'Distance-weighted LiDAR checkpoints'}.get(data.get('experiment'), 'Soft surface checkpoints')
+    if poses: title='Bounded pose refinement checkpoints'
     page = ('<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="30">'
         f'<title>{title}</title><style>body{{font:16px sans-serif;margin:2em}}td,th{{padding:.6em;text-align:left}}</style>'
         f'<h1>{title}</h1><p>All registered frames; AA on; mesh-free inference. '
         'Selected = training keyframes. Unselected = all remaining frames. Image galleries are sampled.</p>'
         '<table><tr><th>Step</th><th>Gaussians</th><th>Frames</th><th>All PSNR</th><th>Selected PSNR</th>'
-        '<th>Unselected PSNR</th><th>Reports</th></tr>'+''.join(body)+'</table>')
+        '<th>Unselected PSNR</th>'+('<th>Cached-pose all PSNR</th><th>Cached-pose train PSNR</th>' if poses else '')+
+        '<th>Reports</th></tr>'+''.join(body)+'</table>'+
+        ('<p>Primary PSNR uses original poses for all frames. Cached-pose metrics correct only training views; '
+         'unselected poses are unchanged. Corrected training PSNR is not held-out pose accuracy.</p>' if poses else ''))
     atomic_write(folder/'index.html', lambda temp: temp.write_text(page))
 
 

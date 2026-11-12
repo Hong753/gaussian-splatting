@@ -141,7 +141,7 @@ def storePly(path, xyz, rgb):
     ply_data.write(path)
 
 def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8,
-                        keyframe_manifest=""):
+                        keyframe_manifest="", initial_point_cloud=""):
     model_dir = colmap_model_dir(path)
     try:
         cameras_extrinsic_file = os.path.join(model_dir, "images.bin")
@@ -225,20 +225,26 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8,
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(model_dir, "points3D.ply")
-    bin_path = os.path.join(model_dir, "points3D.bin")
-    txt_path = os.path.join(model_dir, "points3D.txt")
-    if not os.path.exists(ply_path):
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+    if initial_point_cloud:
+        # Explicit LiDAR input must not trigger an unrelated conversion/write
+        # inside the source COLMAP directory before Scene replaces the cloud.
+        ply_path=os.path.abspath(os.path.expanduser(initial_point_cloud))
+        pcd=fetchPly(ply_path)
+    else:
+        ply_path = os.path.join(model_dir, "points3D.ply")
+        bin_path = os.path.join(model_dir, "points3D.bin")
+        txt_path = os.path.join(model_dir, "points3D.txt")
+        if not os.path.exists(ply_path):
+            print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+            try:
+                xyz, rgb, _ = read_points3D_binary(bin_path)
+            except:
+                xyz, rgb, _ = read_points3D_text(txt_path)
+            storePly(ply_path, xyz, rgb)
         try:
-            xyz, rgb, _ = read_points3D_binary(bin_path)
+            pcd = fetchPly(ply_path)
         except:
-            xyz, rgb, _ = read_points3D_text(txt_path)
-        storePly(ply_path, xyz, rgb)
-    try:
-        pcd = fetchPly(ply_path)
-    except:
-        pcd = None
+            pcd = None
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,

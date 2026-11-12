@@ -27,6 +27,7 @@ def parser():
     p.add_argument('--target-multiplier',type=float,default=1.)
     p.add_argument('--reuse-cache',type=Path,help='Reuse original 1x KNN bounds; rebuild overlap audit at the new ceilings')
     p.add_argument('--training-schedule',type=json.loads,help='Explicit JSON cap/LR policy; tune_local_scale.py constructs it')
+    p.add_argument('--pose-policy',type=json.loads,help='Optional bounded train-camera refinement policy')
     return p
 
 
@@ -63,6 +64,11 @@ def build_plan(args):
         policy = validate_schedule(args.training_schedule, ceiling, args.iterations)
         plan['training_schedule'] = policy
         plan['stages'][0]['argv'] += ['--local_scale_schedule',json.dumps(policy,sort_keys=True)]
+    if getattr(args,'pose_policy',None) is not None:
+        from utils.pose_refinement import validate as validate_pose
+        policy=validate_pose(args.pose_policy,args.iterations)
+        plan['pose_refinement']=policy
+        plan['stages'][0]['argv'] += ['--pose_refinement',json.dumps(policy,sort_keys=True)]
     return plan
 
 
@@ -81,6 +87,9 @@ def execute_plan(args, plan):
         raise RuntimeError('Activate the CUDA-enabled 3dgs environment')
     model = Path(plan['model'])
     model.mkdir(parents=True, exist_ok=True)
+    if getattr(args,'pose_policy',None) is not None:
+        invoke(['scripts/smoke_pose_refinement.py','--gpu',args.gpu,
+                '--output',str(model/'pose_refinement_cuda_smoke.json')])
     smoke = ['scripts/smoke_local_scale.py', '--gpu', args.gpu,
             '--ceiling-multiplier',str(getattr(args,'ceiling_multiplier',1.)),
             '--target-multiplier',str(getattr(args,'target_multiplier',1.)),

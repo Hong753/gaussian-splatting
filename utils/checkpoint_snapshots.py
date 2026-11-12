@@ -50,6 +50,11 @@ def publish_snapshot(scene, iteration):
         files[str(path.relative_to(model))] = dict(size=path.stat().st_size, sha256=digest(path))
     result = dict(schema=1, snapshot_id=uuid.uuid4().hex, model=str(model), iteration=iteration,
                   state_timing='after_optimizer_step', gaussians=len(scene.gaussians.get_xyz), files=files)
+    if getattr(scene.gaussians,'pose_refiner',None) is not None:
+        path=folder/'poses.json'
+        relative=str(path.relative_to(model))
+        files[relative]=dict(size=path.stat().st_size,sha256=digest(path))
+        result['pose_cache']=relative
     atomic_json(marker, result)
     return result
 
@@ -62,6 +67,11 @@ def read_snapshot(model, iteration, *, verify=True):
     result = json.loads(marker.read_text())
     required = {f'point_cloud/iteration_{iteration}/point_cloud.ply', 'cfg_args',
                 'keyframes.json', f'chkpnt{iteration}.pth'}
+    if 'pose_cache' in result:
+        relative=f'point_cloud/iteration_{iteration}/poses.json'
+        if result['pose_cache']!=relative:
+            raise ValueError('Pose cache must belong to this exact checkpoint')
+        required.add(relative)
     if (result.get('schema') != 1 or result.get('iteration') != iteration or result.get('model') != str(model)
             or result.get('state_timing') != 'after_optimizer_step' or not result.get('snapshot_id')
             or set(result.get('files', {})) != required):

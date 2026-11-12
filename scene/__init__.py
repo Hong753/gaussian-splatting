@@ -48,7 +48,8 @@ class Scene:
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](
                 args.source_path, args.images, args.depths, args.eval, args.train_test_exp,
-                keyframe_manifest=getattr(args, "keyframe_manifest", ""))
+                keyframe_manifest=getattr(args, "keyframe_manifest", ""),
+                initial_point_cloud=getattr(args,'initial_point_cloud',''))
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.depths, args.eval)
@@ -59,7 +60,8 @@ class Scene:
             if getattr(args, 'initial_point_cloud', ''):
                 from scene.dataset_readers import fetchPly
                 initial_path = os.path.abspath(os.path.expanduser(args.initial_point_cloud))
-                scene_info = scene_info._replace(point_cloud=fetchPly(initial_path), ply_path=initial_path)
+                if os.path.realpath(scene_info.ply_path)!=os.path.realpath(initial_path):
+                    scene_info = scene_info._replace(point_cloud=fetchPly(initial_path), ply_path=initial_path)
             destination = os.path.join(self.model_path, 'input.ply')
             if os.path.realpath(scene_info.ply_path) != os.path.realpath(destination):
                 shutil.copyfile(scene_info.ply_path, destination)
@@ -107,6 +109,8 @@ class Scene:
         }
 
         atomic_json(os.path.join(self.model_path, "exposure.json"), exposure_dict)
+        if getattr(self.gaussians,'pose_refiner',None) is not None:
+            self.gaussians.pose_refiner.export(point_cloud_path,iteration)
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]

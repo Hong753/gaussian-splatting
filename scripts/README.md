@@ -1761,3 +1761,102 @@ projected sizes. `fixed_lidar_training.jsonl` reports the current absolute cap,
 not just the eventual 2x cap. The inspection command above summarizes these
 fields. Use held-out quality, floor/texture crops, and these diagnostics to choose
 the next LR trial; reaching a cap alone is not evidence that an LR is too high.
+
+### Alternating bounded camera-pose refinement
+
+Start an additional fixed-LiDAR run with the joint scale/LR recipe above and
+per-training-image camera corrections:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_pose_refinement.sh 0
+```
+
+The GPU argument selects the physical device. This launcher requires that device
+to be free before starting; it does not stop an existing experiment. Training
+and the independent checkpoint evaluator then share that device. The fresh model
+directory is
+`/data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_fixed_lidar_local_cap2_target1_joint_poses_30000_v1`.
+It reuses the original fourth run's input and KNN bounds, not its trained Gaussian
+checkpoint. `LOCAL_SCALE_TUNE_MODEL` can name another fresh directory.
+
+This is alternating block optimization, similar in spirit to EM. There is no
+latent-variable expectation step:
+
+| Gaussian steps | Camera update | Gaussian update |
+| --- | --- | --- |
+| 1–7,000 | Original poses, no update | Fixed XYZ; learn appearance, opacity, scale and rotation |
+| 7,001–20,000 | One pose-only proposal for the sampled training view, with Gaussians detached | One ordinary update using that view's detached corrected pose |
+| 20,001–30,000 | Freeze learned pose corrections | Continue Gaussian refinement |
+
+Pose proposals are extra work; 30k still means 30k Gaussian optimizer steps.
+LiDAR centers never move. There is no densification, pruning, opacity reset,
+mesh culling, exposure optimization, or distance weighting in this run. Its scale
+allowance ramps from 1x to 2x over 7k–20k, and the parameter LR schedule is the
+joint preset above. Compare with the joint run without pose updates to isolate
+the effect of pose refinement.
+
+Each camera has an axis-angle rotation offset and a translation offset expressed
+in the original camera axes. **Total displacement from the original camera** is
+bounded by a 0.03 scene-unit translation norm (3 cm for metric LiDAR) and a 0.5°
+rotation norm. These are vector-norm bounds, not independent per-axis allowances.
+The fixed world-space LiDAR anchors the reconstruction. Intrinsics are unchanged.
+
+The pose-only loss is a masked smooth absolute RGB residual plus a zero-offset
+prior of `0.001 * (||translation/0.03||² + ||rotation/radians(0.5)||²)`.
+Translation/rotation LRs start at 0.001 / 0.0002 and decay to 0.1x during the pose
+window. Pose images are resized to at most 960 pixels wide; Gaussian training
+retains the configured full resolution. Adam state is separate per view. A
+proposal must have a finite, nonworsening photometric-plus-prior objective with
+the Gaussians fixed; otherwise both the offsets and their Adam state are restored.
+Projection onto either offset bound clears that vector's momentum.
+
+The native rasterizer does not differentiate its camera-settings object. During
+the pose-only pass, the implementation instead differentiably transforms the
+frozen Gaussian means and orientations into the camera frame and evaluates SH
+colors using the corresponding world-space directions. The launcher first runs
+`smoke_pose_refinement.py`: native-render parity, finite differences for all six
+pose coordinates, frozen Gaussian parameters, bounded accepted updates, and
+cache/resume checks on CUDA. A failed check stops the experiment before training.
+
+Original COLMAP poses, intrinsics, images and LiDAR input are never rewritten.
+The source calibration is fingerprinted. With an explicit input PLY, loading also
+skips point-cloud conversion inside the source directory. Each saved snapshot has
+`point_cloud/iteration_N/poses.json`, containing original and corrected world-to-
+camera matrices, offsets, bounds and proposal counts. Optimizer checkpoints
+include the pose optimizer states. Resume rejects a different policy or source
+calibration. The ready marker fingerprints the exact iteration's pose cache.
+
+Every 10k, the separate evaluator processes **all 5,009 frames**, with two explicit
+protocols:
+
+- `psnr_all_frames/iteration_N/`: original poses for every frame; primary PSNR for
+  comparison against earlier runs.
+- `psnr_all_frames/iteration_N/poses_refined/`: corrected poses for training
+  keyframes, original poses for every unselected image. Held-out poses are never
+  optimized or interpolated; their PSNR must agree between these protocols.
+
+Both protocols include sampled actual/render/error galleries under the matching
+`view_comparisons/iteration_N/` directories. Full per-frame PSNR is separate from
+the sampled galleries. `periodic_evaluation/index.html` links both and keeps their
+scores separate. Better corrected training PSNR alone is not held-out pose
+accuracy. Rendering defaults to original poses; explicitly use the cached poses:
+
+```bash
+python -u scripts/render.py \
+  --model "$MODEL" --iteration 30000 \
+  --split both --eval-set unselected --antialiasing \
+  --camera-poses refined --gpu 0 --in-process
+```
+
+`pose_refinement_training.jsonl` logs each attempted view, accepted/rejected status,
+objective before/after, translation/rotation gradient norms, current LRs and total
+offset norms. Inspect accepted updates and these norms as well as matched image
+crops. Defaults can be changed for a fresh trial with `POSE_REFINE_START`,
+`POSE_REFINE_END`, `POSE_REFINE_EVERY`, `POSE_REFINE_MAX_TRANSLATION`,
+`POSE_REFINE_MAX_ROTATION_DEGREES`, `POSE_REFINE_TRANSLATION_LR`,
+`POSE_REFINE_ROTATION_LR`, `POSE_REFINE_PRIOR_WEIGHT`, and `POSE_REFINE_MAX_WIDTH`.
+The existing `LOCAL_SCALE_TUNE_*` schedule controls remain available.

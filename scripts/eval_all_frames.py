@@ -17,6 +17,7 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from scripts.occlusion_options import add_arguments, apply_overrides, configure_pipeline, metric_directory, settings
+from scripts import pose_options
 
 
 def read_config(path):
@@ -52,13 +53,15 @@ def main():
     parser.add_argument('--expected-frames', type=int, default=0,
                         help='Fail unless this many registered images are evaluated (0: no explicit count)')
     add_arguments(parser)
+    pose_options.add_arguments(parser)
     args = parser.parse_args()
     model, source = args.model.resolve(), args.source.resolve()
     cfg = read_config(model / "cfg_args")
     model_type = cfg.get("model_type", "3dgs")
-    spec = apply_overrides(dict(path=model, cfg=cfg, type=model_type), args)
+    spec = pose_options.apply_overrides(apply_overrides(dict(path=model, cfg=cfg, type=model_type), args),args)
     cfg = spec["cfg"]
     iteration, ply = choose_iteration(model, args.iteration, model_type)
+    pose_cache=pose_options.load_cache(spec,iteration)
     manifest_path = model / "keyframes.json"
     manifest_name = cfg.get("keyframe_manifest", "")
     if manifest_name and not manifest_path.is_file():
@@ -140,7 +143,7 @@ def main():
         writer.writerow(["image_name", "selected_for_training", "psnr_db", "occlusion_culled_fraction"])
         for idx, info in enumerate(tqdm(cameras, desc="Evaluating all frames", unit="frame")):
             culled_fraction = None
-            camera = loadCam(camera_args, idx, info, 1.0, False, False)
+            camera = pose_options.apply_camera(loadCam(camera_args, idx, info, 1.0, False, False),pose_cache)
             if model_type == "scaffold":
                 visible = prefilter_voxel(camera, gaussians, pipeline, background)
                 pred = render_scaffold(camera, gaussians, pipeline, background, visible_mask=visible)["render"].clamp(0, 1)
@@ -179,6 +182,10 @@ def main():
                "counts": counts, "mean_psnr_db": means}
     summary['metric'] = 'mean per-channel PSNR, then arithmetic mean over images'
     summary['coverage'] = 'all original registered COLMAP frames'
+    summary['camera_poses']=spec['camera_poses']
+    summary['pose_protocol']=pose_options.protocol(spec)
+    if pose_cache is not None:
+        summary['pose_cache']=dict(path=pose_cache['_path'],sha256=pose_cache['_sha256'])
     json_tmp.write_text(json.dumps(summary, indent=2, allow_nan=False) + "\n")
     os.replace(csv_tmp, output / "per_frame.csv")
     os.replace(json_tmp, output / "summary.json")

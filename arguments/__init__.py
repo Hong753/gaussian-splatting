@@ -111,6 +111,7 @@ class OptimizationParams(ParamGroup):
         self.local_scale_ceiling_multiplier = 1.0
         self.local_scale_target_multiplier = 1.0
         self.local_scale_schedule = ""
+        self.pose_refinement = ""
         self.distance_weighting = False
         self.distance_reference = 2.0
         self.distance_power = 2.0

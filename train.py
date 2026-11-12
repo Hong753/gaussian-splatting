@@ -46,6 +46,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         raise ValueError('Published snapshots require matching PLY and optimizer checkpoint iterations')
     from utils.fixed_lidar import configure_training, project_scales, audit as audit_fixed_lidar
     configure_training(opt, dataset)
+    pose_policy=None
+    if getattr(opt,'pose_refinement',''):
+        import json
+        from utils.pose_refinement import validate as validate_pose
+        pose_policy=validate_pose(json.loads(opt.pose_refinement),opt.iterations)
+        if not opt.fixed_lidar or opt.scale_control!='hybrid' or not pipe.antialiasing:
+            raise ValueError('Pose refinement requires fixed LiDAR local scales and native AA')
+        dataset.pose_refinement=pose_policy
     from utils.discrete_lidar import configure_training as configure_discrete_lidar
     configure_discrete_lidar(opt, dataset)
     from utils.distance_updates import policy as distance_policy
@@ -151,6 +159,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+    pose_refiner=None
+    if pose_policy is not None:
+        from utils.pose_refinement import PoseRefiner
+        pose_refiner=PoseRefiner(scene.getTrainCameras(),pose_policy,dataset.source_path,opt.iterations,
+                                saved=gaussians.pose_refinement_state)
+        gaussians.pose_refiner=pose_refiner
+        print(f'Alternating bounded pose refinement: {len(pose_refiner.names)} training cameras; '
+              'original camera data is read-only; checkpoint poses are cached in poses.json.')
     if opt.fixed_lidar:
         audit_fixed_lidar(gaussians, first_iter)
         print(f'Fixed LiDAR: {len(gaussians.get_xyz):,} immutable centers; no cloning, splitting, pruning or opacity resets.')
@@ -242,6 +258,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pipe.debug = True
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
+
+        if pose_refiner is not None:
+            # The pose substep detaches all Gaussian parameters. The ordinary
+            # Gaussian substep below uses the corrected, detached camera.
+            pose_stats=pose_refiner.update(viewpoint_cam,gaussians,pipe,bg,iteration)
+            if pose_stats is not None:
+                import json
+                with open(os.path.join(scene.model_path,'pose_refinement_training.jsonl'),'a') as stream:
+                    stream.write(json.dumps(pose_stats,allow_nan=False)+'\n')
+            viewpoint_cam=pose_refiner.camera(viewpoint_cam)
 
         ray_depth = None
         training_tiles = None

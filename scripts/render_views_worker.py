@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts.view_comparisons import atomic_json, image_id, model_info, save_panel
 from scripts.occlusion_options import add_arguments, apply_overrides
+from scripts import pose_options
 
 
 def render_views(spec, names, iteration, output, antialiasing=None):
@@ -20,6 +21,7 @@ def render_views(spec, names, iteration, output, antialiasing=None):
     from PIL import Image
     from tqdm import tqdm
     cfg = spec["cfg"]
+    pose_cache=pose_options.load_cache(spec,iteration)
     if spec["type"] == "proxygs":
         if antialiasing:
             raise ValueError("Proxy-GS does not support Graphdeco AA; use --no-antialiasing")
@@ -49,7 +51,7 @@ def render_views(spec, names, iteration, output, antialiasing=None):
     records = {}
     with torch.no_grad():
         for index, name in enumerate(tqdm(names, desc=f"Rendering {spec['path'].name}")):
-            camera = make_camera(spec["records"][name], index)
+            camera = pose_options.apply_camera(make_camera(spec["records"][name], index),pose_cache)
             pred = render(camera).clamp(0, 1)
             target = camera.original_image[:3].to(pred.device).clamp(0, 1)
             if pred.shape != target.shape or not torch.isfinite(pred).all():
@@ -64,10 +66,12 @@ def render_views(spec, names, iteration, output, antialiasing=None):
             gt.save(output / "gt" / f"{key}.png")
             rendered.save(output / "renders" / f"{key}.png")
             Image.fromarray(rgb((pred-target).abs().mul(4).clamp(0, 1))).save(output / "errors" / f"{key}.png")
-            save_panel(gt, rendered, output / "comparisons" / f"{key}.jpg", spec["path"].name, psnr)
+            label=spec['path'].name+(' | cached train pose' if pose_cache is not None and name in pose_cache['frames'] else ' | original pose')
+            save_panel(gt, rendered, output / "comparisons" / f"{key}.jpg", label, psnr)
             records[name] = dict(gt=f"gt/{key}.png", image=f"renders/{key}.png",
                                  error=f"errors/{key}.png", comparison=f"comparisons/{key}.jpg",
                                  psnr_db=psnr if math.isfinite(psnr) else "inf",
+                                 camera_pose='refined' if pose_cache is not None and name in pose_cache['frames'] else 'original',
                                  target_sha256=hashlib.sha256(str(gt_array.shape).encode() + gt_array.tobytes()).hexdigest())
             del camera, pred, target
     atomic_json(output / "frames.json", records)
@@ -81,8 +85,9 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--antialiasing", action=argparse.BooleanOptionalAction, default=None)
     add_arguments(parser)
+    pose_options.add_arguments(parser)
     args = parser.parse_args()
-    render_views(apply_overrides(model_info(args.model), args), json.loads(args.selection.read_text())["names"],
+    render_views(pose_options.apply_overrides(apply_overrides(model_info(args.model), args),args), json.loads(args.selection.read_text())["names"],
                  args.iteration, args.output, args.antialiasing)
 
 

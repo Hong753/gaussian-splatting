@@ -24,6 +24,28 @@ sys.modules['simple_knn._C'] = extension
 
 
 class CameraImportTests(unittest.TestCase):
+    def test_explicit_lidar_input_does_not_create_or_change_source_files(self):
+        self.run_fresh("""
+            import tempfile
+            from pathlib import Path
+            import numpy as np
+            from test_view_comparisons import dataset
+            from test_discrete_lidar import write_cloud
+            from scene.dataset_readers import readColmapSceneInfo
+            with tempfile.TemporaryDirectory() as directory:
+                root=Path(directory)
+                source,manifest,names,selected=dataset(root)
+                cloud=root/'input.ply'
+                write_cloud(cloud,np.array([[i*.01,0,2] for i in range(16)],np.float32))
+                before={str(p.relative_to(source)):p.read_bytes() for p in source.rglob('*') if p.is_file()}
+                info=readColmapSceneInfo(str(source),'images','',False,False,
+                    keyframe_manifest=str(manifest),initial_point_cloud=str(cloud))
+                after={str(p.relative_to(source)):p.read_bytes() for p in source.rglob('*') if p.is_file()}
+                assert before==after
+                assert len(info.point_cloud.points)==16
+                assert info.ply_path==str(cloud)
+        """)
+
     def run_fresh(self, script):
         env = dict(os.environ)
         env['PYTHONPATH'] = os.pathsep.join([str(ROOT), str(ROOT/'tests'), env.get('PYTHONPATH', '')])

@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT))
 from scripts.view_comparisons import (atomic_json, image_id, model_info,
                                       shared_iteration, write_all_frame_metrics, write_gallery)
 from scripts.occlusion_options import add_arguments, apply_overrides, worker_arguments, settings
+from scripts import pose_options
 
 
 def resolve_models(models, model_root, runs, allow_duplicates=False):
@@ -58,6 +59,7 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--in-process", action="store_true", help="Render one model directly, without a Python worker process")
     add_arguments(parser)
+    pose_options.add_arguments(parser)
     args = parser.parse_args(argv)
     if args.max_views < 0 or args.iteration == 0 or args.iteration < -1:
         parser.error("max-views must be nonnegative; iteration must be positive or -1")
@@ -68,7 +70,7 @@ def main(argv=None):
         paths = resolve_models(args.models, args.model_root, args.runs)
         if args.in_process and len(paths) != 1:
             raise ValueError("--in-process requires exactly one model")
-        specs = [apply_overrides(model_info(p), args) for p in paths]
+        specs = [pose_options.apply_overrides(apply_overrides(model_info(p), args),args) for p in paths]
         if args.eval_set == 'unselected':
             for spec in specs:
                 spec['splits']['eval'] = spec['splits']['all'] - spec['splits']['train']
@@ -119,6 +121,7 @@ def main(argv=None):
                 if args.antialiasing is not None:
                     cmd.append("--antialiasing" if args.antialiasing else "--no-antialiasing")
                 cmd.extend(worker_arguments(args))
+                cmd.extend(pose_options.worker_arguments(args))
                 if args.in_process:
                     from scripts.render_views_worker import render_views
                     render_views(spec, names, iteration, destination, args.antialiasing)
@@ -146,6 +149,7 @@ def main(argv=None):
             for model, spec in zip(models, specs):
                 model["occlusion"] = settings(spec["cfg"])
                 model["render_variant"] = spec.get("render_variant", "")
+                model['pose_protocol']=pose_options.protocol(spec)
             if split_name == "all":
                 for spec, records in zip(specs, model_rows):
                     summary = write_all_frame_metrics(spec, records, iteration, args.antialiasing)
@@ -157,7 +161,7 @@ def main(argv=None):
                           dict(split=split_name, total_shared_views=total, rendered_views=len(names),
                                eval_set=args.eval_set,
                                excluded_nonshared_views=[len(s)-total for s in sets],
-                               pose_protocol="each model's saved source calibration",
+                               pose_protocol=[pose_options.protocol(s) for s in specs],
                                exposure_protocol="base appearance, no per-image exposure",
                                metric="mean per-channel PSNR, matching scripts/eval_all_frames.py"))
             completed.append(folder / "index.html")

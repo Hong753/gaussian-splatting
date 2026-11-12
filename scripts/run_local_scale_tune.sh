@@ -18,6 +18,7 @@ tune_iterations="${LOCAL_SCALE_TUNE_ITERATIONS:-30000}"
 tune_schedule="${LOCAL_SCALE_TUNE_SCHEDULE:-off}"
 tune_suffix=''
 if [[ "$tune_schedule" != off ]]; then tune_suffix="_${tune_schedule}"; fi
+if [[ "${LOCAL_SCALE_TUNE_POSES:-0}" == 1 ]]; then tune_suffix+='_poses'; fi
 tune_model="${LOCAL_SCALE_TUNE_MODEL:-$tune_root/3dgs_stride3_aa_fixed_lidar_local_cap${tune_ceiling}_target${tune_target}${tune_suffix}_${tune_iterations}_v1}"
 tune_schedule_args=(--schedule-mode "$tune_schedule"
   --scale-start-multiplier "${LOCAL_SCALE_TUNE_START_CEILING:-1}"
@@ -35,12 +36,29 @@ tune_schedule_args=(--schedule-mode "$tune_schedule"
   --lr-f-dc-final "${LOCAL_SCALE_TUNE_LR_DC_FINAL:-0.00025}"
   --lr-f-rest "${LOCAL_SCALE_TUNE_LR_REST:-0.000125}"
   --lr-f-rest-final "${LOCAL_SCALE_TUNE_LR_REST_FINAL:-0.0000125}")
+if [[ "${LOCAL_SCALE_TUNE_POSES:-0}" == 1 ]]; then
+  # A new pose experiment must not stop or share a device with an existing run.
+  tune_device_pids="$(nvidia-smi -i "$tune_gpu" --query-compute-apps=pid --format=csv,noheader)"
+  if [[ -n "$tune_device_pids" ]]; then
+    echo "GPU $tune_gpu already has a compute process; choose a free GPU for this additional run." >&2
+    exit 1
+  fi
+  tune_schedule_args+=(--pose-refinement
+    --pose-start "${POSE_REFINE_START:-7000}" --pose-end "${POSE_REFINE_END:-20000}"
+    --pose-every "${POSE_REFINE_EVERY:-1}" --pose-max-translation "${POSE_REFINE_MAX_TRANSLATION:-0.03}"
+    --pose-max-rotation-degrees "${POSE_REFINE_MAX_ROTATION_DEGREES:-0.5}"
+    --pose-translation-lr "${POSE_REFINE_TRANSLATION_LR:-0.001}"
+    --pose-rotation-lr "${POSE_REFINE_ROTATION_LR:-0.0002}"
+    --pose-prior-weight "${POSE_REFINE_PRIOR_WEIGHT:-0.001}" --pose-max-width "${POSE_REFINE_MAX_WIDTH:-960}")
+fi
 python -u scripts/tune_local_scale.py --model "$tune_reference"
 python -u scripts/tune_local_scale.py prepare \
   --reference-model "$tune_reference" --model "$tune_model" --gpu "$tune_gpu" \
   --ceiling-multiplier "$tune_ceiling" --target-multiplier "$tune_target" --iterations "$tune_iterations" \
   "${tune_schedule_args[@]}"
-python -u scripts/stop_reconstruction_run.py --model "$tune_previous" --gpu "$tune_gpu" --stop
+if [[ "${LOCAL_SCALE_TUNE_POSES:-0}" != 1 ]]; then
+  python -u scripts/stop_reconstruction_run.py --model "$tune_previous" --gpu "$tune_gpu" --stop
+fi
 tune_eval_pid=''
 tune_train_pid=''
 tune_cleanup() {
