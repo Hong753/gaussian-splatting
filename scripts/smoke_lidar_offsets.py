@@ -17,8 +17,12 @@ def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--gpu',default='2');p.add_argument('--output',type=Path)
     p.add_argument('--ceiling-multiplier',type=float,default=5.)
+    p.add_argument('--target-multiplier',type=float,default=1.)
     p.add_argument('--pose-culling',action='store_true')
+    p.add_argument('--lidar-activation',action='store_true')
     args=p.parse_args(argv)
+    if args.lidar_activation and not args.pose_culling:
+        raise ValueError('Activation smoke requires --pose-culling')
     os.environ['CUDA_VISIBLE_DEVICES']=args.gpu
     import numpy as np
     import torch
@@ -43,11 +47,12 @@ def main(argv=None):
         for i,k in enumerate(('x','y','z')):vertex[k]=xyz[:,i]
         PlyData([PlyElement.describe(vertex,'vertex')]).write(root/'input.ply')
         prepare(root/'input.ply',root/'cache',samples=25,workers=1,
-                ceiling_multiplier=args.ceiling_multiplier,position_padding=.005)
+                ceiling_multiplier=args.ceiling_multiplier,target_multiplier=args.target_multiplier,position_padding=.005)
         parser=argparse.ArgumentParser();params=OptimizationParams(parser)
         opt=params.extract(parser.parse_args(['--fixed_lidar','--scale_control','hybrid',
             '--max_scale_ratio','1','--max_scale_world','.015','--local_scale_cache',str(root/'cache'),
             '--local_scale_ceiling_multiplier',str(args.ceiling_multiplier),'--position_lr_init','0','--position_lr_final','0',
+            '--local_scale_target_multiplier',str(args.target_multiplier),
             '--densify_until_iter','0','--iterations','6']))
         policy={**DEFAULTS,'warmup':1,'ramp':1,'end':6}
         pose_policy={**POSES,'start':1,'end':4,'max_width':64}
@@ -55,6 +60,13 @@ def main(argv=None):
         if args.pose_culling:
             from utils.pose_culling import DEFAULTS as CULLING
             opt.pose_culling=json.dumps(CULLING)
+        if args.lidar_activation:
+            from utils.discrete_lidar_cache import prepare as prepare_pool
+            from utils.lidar_activation import DEFAULTS as ACTIVATION,active_mask,adapt
+            activation={**ACTIVATION,'start':1,'end':4,'interval':1,'min_observations':1,'gradient_threshold':1e-12,'max_new':2}
+            prepare_pool(root/'input.ply',root/'pool',workers=1,
+                         **{k:activation[k] for k in ('fraction','voxel','neighbors','seed')})
+            opt.lidar_activation=json.dumps(activation);opt.lidar_activation_cache=str(root/'pool')
         opt.local_scale_schedule=json.dumps(dict(schema=1,
             cap=dict(initial_multiplier=1.,final_multiplier=args.ceiling_multiplier,start=1,end=4),
             learning_rates=dict(start=1,end=6,groups={k:[v,v*.1] for k,v in GROUP_LRS.items()})))
@@ -63,6 +75,7 @@ def main(argv=None):
                           [SimpleNamespace(image_name='smoke.jpg')],1000.)
         initial_sigma=m._scaling[:,:1].detach().exp().clone()
         m.oneupSHdegree();m.training_setup(opt)
+        initial_active=int(active_mask(m).sum()) if args.lidar_activation else len(xyz)
         torch.testing.assert_close(state(m)['radius'],(initial_sigma*.25).clamp_max(.005),rtol=0,atol=0)
         projection=getProjectionMatrix(.01,100.,math.pi/2,math.pi/2).cuda().T.contiguous()
         cam=SimpleNamespace(image_name='smoke.jpg',image_height=64,image_width=64,FoVx=math.pi/2,FoVy=math.pi/2,
@@ -92,6 +105,8 @@ def main(argv=None):
             loss=(image-cam.original_image.cuda()).square().mean()+scale_regularization(model)+regularization(model)
             assert torch.isfinite(loss)
             loss.backward()
+            if args.lidar_activation and 1<i<=4:
+                model.add_densification_stats(package['viewspace_points'],package['visibility_filter'])
             assert all(p.grad is None or torch.isfinite(p.grad).all() for g in model.optimizer.param_groups for p in g['params'])
             if lr:
                 assert model._xyz.grad is not None and model._xyz.grad.abs().sum()>0
@@ -103,6 +118,16 @@ def main(argv=None):
             else:
                 model.optimizer.step()
             project_scales(model);model.optimizer.zero_grad(set_to_none=True)
+            if args.lidar_activation:
+                before_active=active_mask(model).clone()
+                adapt(model,model.pose_refiner.camera(cam),pipe,i,package['occlusion_keep'])
+                new=active_mask(model)&~before_active
+                assert torch.equal(model._xyz[new],state(model)['anchors'][new])
+                for group in model.optimizer.param_groups:
+                    for parameter in group['params']:
+                        for key in ('exp_avg','exp_avg_sq'):
+                            momentum=model.optimizer.state.get(parameter,{})
+                            if key in momentum:assert not bool(momentum[key][new].any())
             for a,b in zip(poses,model.pose_refiner.params[cam.image_name]):assert torch.equal(a,b)
             audit(model,i)
             return row
@@ -111,16 +136,20 @@ def main(argv=None):
         for i in range(1,4):rows.append(step(m,i))
         assert not torch.equal(m._xyz,state(m)['anchors'])
         assert m.optimizer.param_groups[0]['lr']<=1e-5 # scene extent=1000 must not amplify LR
-        with torch.no_grad():m._xyz[0].add_(1.)
+        chosen=int(active_mask(m).nonzero()[0]) if args.lidar_activation else 0
+        other_rows=torch.arange(len(xyz),device='cuda')!=chosen
+        with torch.no_grad():m._xyz[chosen].add_(1.)
         moments=m.optimizer.state[m._xyz]
-        others={k:moments[k][1:].clone() for k in ('exp_avg','exp_avg_sq')}
+        others={k:moments[k][other_rows].clone() for k in ('exp_avg','exp_avg_sq')}
         project_scales(m)
         for k,value in others.items():
-            assert (moments[k][0]==0).all() and torch.equal(moments[k][1:],value)
+            assert (moments[k][chosen]==0).all() and torch.equal(moments[k][other_rows],value)
         audit(m,3)
         buffer=io.BytesIO();torch.save(m.capture(),buffer);buffer.seek(0)
         restored=GaussianModel(1);restored._exposure=torch.nn.Parameter(m._exposure.detach().clone())
         restored.restore(torch.load(buffer,weights_only=True),opt)
+        if args.lidar_activation:
+            assert torch.equal(active_mask(m),active_mask(restored))
         restored.pose_refiner=PoseRefiner([cam],pose_policy,root/'source',6,saved=restored.pose_refinement_state)
         for k in ('exp_avg','exp_avg_sq'):assert torch.equal(restored.optimizer.state[restored._xyz][k],moments[k])
         for i in range(4,7):rows.append(step(restored,i))
@@ -128,13 +157,19 @@ def main(argv=None):
         distance=torch.cdist(restored._xyz[ids],restored._xyz,compute_mode='donot_use_mm_for_euclid_dist')
         radius=3*(restored.get_scaling[ids].amax(1)[:,None]+restored.get_scaling.amax(1)[None])
         hit=distance<=radius;hit[torch.arange(len(ids),device='cuda'),ids]=False
+        selected=slice(None)
+        if args.lidar_activation:
+            selected=active_mask(restored)
+            assert int(selected.sum())>initial_active
+            hit &= selected[ids,None]&selected[None,:]
         assert torch.equal(support_counts(restored)[0],hit.sum(1))
         restored.save_ply(str(root/'point_cloud.ply'))
         vertex=PlyData.read(root/'point_cloud.ply')['vertex']
-        np.testing.assert_array_equal(np.column_stack([vertex[k] for k in ('x','y','z')]),restored._xyz.detach().cpu().numpy())
+        np.testing.assert_array_equal(np.column_stack([vertex[k] for k in ('x','y','z')]),restored._xyz.detach()[selected].cpu().numpy())
         assert source_fingerprints(root/'source')==fingerprints
         report=dict(passed=True,cuda_device=torch.cuda.get_device_name(),torch=torch.__version__,
             pose_aware_culling=args.pose_culling,
+            adaptive_lidar_activation=args.lidar_activation,initial_active_gaussians=initial_active,
             native_aa_alternating_updates=True,gaussians_frozen_during_pose_step=True,poses_frozen_during_gaussian_step=True,
             warmup_has_no_xyz_moments=True,absolute_xyz_lr=True,selective_xyz_moment_projection=True,
             original_anchors_and_xyz_optimizer_resume=True,overlap_counts_match_all_pairs=True,

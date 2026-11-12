@@ -34,6 +34,7 @@ def schedule_arguments(parser):
     parser.add_argument('--pose-max-width',type=int,default=960)
     parser.add_argument('--lidar-offsets',action='store_true')
     parser.add_argument('--pose-culling',action='store_true')
+    parser.add_argument('--lidar-activation',action='store_true')
     parser.add_argument('--scene-geometry',type=Path)
     parser.add_argument('--offset-max-world',type=float,default=.005)
     parser.add_argument('--offset-sigma-ratio',type=float,default=.25)
@@ -121,6 +122,8 @@ def prepare(argv):
     args.lidar_offset_policy=None
     args.pose_culling_policy=None
     args.scene_geometry=None
+    args.lidar_activation_policy=None
+    args.lidar_activation_cache=None
     if request.pose_refinement:
         from utils.pose_refinement import DEFAULTS, validate as validate_pose
         args.pose_policy=validate_pose({**DEFAULTS,**{key:getattr(request,'pose_'+key) for key in
@@ -136,6 +139,10 @@ def prepare(argv):
         args.pose_culling_policy=dict(CULLING_DEFAULTS)
         args.scene_geometry=request.scene_geometry
     args.local_scale_cache=request.model/'local_scale_cache'
+    if request.lidar_activation:
+        from utils.lidar_activation import DEFAULTS as ACTIVATION,validate as validate_activation
+        args.lidar_activation_policy=validate_activation(dict(ACTIVATION),request.iterations)
+        args.lidar_activation_cache=request.model/'lidar_activation_cache'
     for name in ('source','model','baseline','keyframes','point_cloud','reuse_cache','local_scale_cache'):
         if getattr(args,name,None) is not None:
             setattr(args,name,Path(getattr(args,name)))
@@ -163,6 +170,8 @@ def prepare(argv):
             prior_args.setdefault('lidar_offset_policy',None)
             prior_args.setdefault('pose_culling_policy',None)
             prior_args.setdefault('scene_geometry',None)
+            prior_args.setdefault('lidar_activation_policy',None)
+            prior_args.setdefault('lidar_activation_cache',None)
             if existing['plan'] != plan or prior_args != serialized:
                 raise ValueError('Prepared tuning run differs; use a fresh model directory')
             state_path=folder/'training.json'

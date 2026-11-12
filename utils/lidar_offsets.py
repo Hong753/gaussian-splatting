@@ -116,6 +116,10 @@ def regularization(model):
     saved=state(model)
     if saved is None or not model._xyz.requires_grad: return model._xyz.new_zeros(())
     relative=(model._xyz-saved['anchors'])/saved['radius']
+    from utils.lidar_activation import active_mask
+    active=active_mask(model)
+    if active is not None:
+        return saved['policy']['prior_weight']*(relative.square().sum(1)*active).sum()/active.sum()
     return saved['policy']['prior_weight']*relative.square().sum(1).mean()
 
 

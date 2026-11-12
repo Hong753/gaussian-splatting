@@ -31,6 +31,8 @@ def parser():
     p.add_argument('--lidar-offset-policy',type=json.loads,help='Bounded displacement from each original LiDAR row')
     p.add_argument('--pose-culling-policy',type=json.loads,help='Pose-aware primary LiDAR mesh cutoffs')
     p.add_argument('--scene-geometry',type=Path)
+    p.add_argument('--lidar-activation-policy',type=json.loads)
+    p.add_argument('--lidar-activation-cache',type=Path)
     return p
 
 
@@ -94,6 +96,16 @@ def build_plan(args):
         plan.update(hard_culling=True,pose_culling=policy,scene_geometry=str(args.scene_geometry.resolve()),
             culling_protocol='primary measured mesh; corrected camera; per-pixel CUDA clipping; no-contribution Adam rows frozen',
             inference_protocol='culling off; original/refined poses; additional matched culling-on previews')
+    if getattr(args,'lidar_activation_policy',None) is not None:
+        from utils.lidar_activation import validate as validate_activation
+        if not plan.get('pose_culling') or not getattr(args,'lidar_activation_cache',None):
+            raise ValueError('Adaptive LiDAR activation requires pose-aware culling and a candidate cache')
+        policy=validate_activation(args.lidar_activation_policy,args.iterations)
+        plan.update(lidar_activation=policy,lidar_activation_cache=str(args.lidar_activation_cache.resolve()),
+            positions='unique discrete original LiDAR anchors with bounded offsets; reserved rows activate adaptively; no pruning',
+            population='fixed-size optimizer arrays; inactive rows frozen; only active Gaussians exported')
+        plan['stages'][0]['argv'] += ['--lidar_activation',json.dumps(policy,sort_keys=True),
+                                    '--lidar_activation_cache',plan['lidar_activation_cache']]
     return plan
 
 
@@ -129,8 +141,10 @@ def execute_plan(args, plan):
     if getattr(args,'lidar_offset_policy',None) is not None:
         invoke(['scripts/smoke_lidar_offsets.py','--gpu',args.gpu,
                 '--ceiling-multiplier',str(getattr(args,'ceiling_multiplier',1.)),
+                '--target-multiplier',str(getattr(args,'target_multiplier',1.)),
                 '--output',str(model/'lidar_offsets_cuda_smoke.json')]+
-                (['--pose-culling'] if getattr(args,'pose_culling_policy',None) is not None else []))
+                (['--pose-culling'] if getattr(args,'pose_culling_policy',None) is not None else [])+
+                (['--lidar-activation'] if getattr(args,'lidar_activation_policy',None) is not None else []))
     if getattr(args,'pose_culling_policy',None) is not None:
         invoke(['scripts/smoke_ray_occlusion.py','--gpu',args.gpu,
                 '--output',str(model/'ray_occlusion_cuda_smoke.json')])
@@ -146,6 +160,12 @@ def execute_plan(args, plan):
         position_padding=(getattr(args,'lidar_offset_policy',None) or {}).get('max_world',0.))
     from utils.checkpoint_snapshots import atomic_json
     atomic_json(model/'local_scale_initialization.json', data)
+    if getattr(args,'lidar_activation_policy',None) is not None:
+        from utils.discrete_lidar_cache import prepare as prepare_candidates
+        cfg=args.lidar_activation_policy
+        data=prepare_candidates(args.point_cloud,plan['lidar_activation_cache'],workers=args.cache_workers,
+            **{k:cfg[k] for k in ('fraction','voxel','neighbors','seed')})
+        atomic_json(model/'lidar_activation_initialization.json',data)
     return run_fixed_lidar.execute_plan(args, plan, smoke=False)
 
 

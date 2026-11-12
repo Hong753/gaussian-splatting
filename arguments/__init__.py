@@ -126,6 +126,8 @@ class OptimizationParams(ParamGroup):
         self.discrete_lidar_radius = 0.10
         self.discrete_lidar_max_new = 50000
         self.discrete_lidar_min_observations = 1
+        self.lidar_activation = ""
+        self.lidar_activation_cache = ""
         self.lidar_depth_dir = ""
         self.lidar_depth_weight = 0.0
         self.lidar_depth_start = 0

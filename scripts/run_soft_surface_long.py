@@ -104,7 +104,7 @@ def train(model):
                 if digest(path) != expected:
                     raise ValueError(f'Input changed after preparation: {path}')
             args = SimpleNamespace(**data['training_args'])
-            for name in ('source', 'model', 'keyframes', 'baseline', 'video_output', 'scene_geometry', 'point_cloud', 'cache', 'local_scale_cache'):
+            for name in ('source', 'model', 'keyframes', 'baseline', 'video_output', 'scene_geometry', 'point_cloud', 'cache', 'local_scale_cache', 'lidar_activation_cache'):
                 if getattr(args, name, None) is not None:
                     setattr(args, name, Path(getattr(args, name)))
             launcher = run_occlusion
@@ -302,6 +302,21 @@ def experiment_diagnostics(data, start, end):
         if values:
             regularizer[key] = dict(min=min(values), median=statistics.median(values), max=max(values))
     warnings = [] if good else ['Missing or failed fixed LiDAR invariant checks']
+    activation={}
+    if data['plan'].get('lidar_activation'):
+        from scripts.tune_local_scale import read_rows
+        policy=data['plan']['lidar_activation']
+        updates=[r for r in read_rows(Path(data['model'])/'lidar_activation_growth.jsonl') if start < r['iteration'] <= end]
+        activation=dict(logged_events=len(updates),added=sum(r['added'] for r in updates),
+                        latest=updates[-1] if updates else None)
+        if not rows or not all(r.get('unique_anchors') and r.get('inactive_positions_unchanged') and
+                r.get('activation_policy')==policy for r in rows):
+            good=False;warnings.append('Missing or failed adaptive LiDAR anchor checks')
+        expected=any(policy['start']<i<=policy['end'] and i%policy['interval']==0 for i in range(start+1,end+1))
+        if expected and not updates:
+            good=False;warnings.append('Missing LiDAR activation growth events')
+        elif expected and not activation['added']:
+            warnings.append('No LiDAR anchors activated; inspect eligible parents, gradient thresholds and depth coverage')
     if (regularize or hybrid) and not loss_rows:
         warnings.append('No scale regularization diagnostics in this interval')
     elif (regularize or hybrid) and not any(r.get('scale_regularization_loss', 0) > 0 for r in loss_rows):
@@ -338,6 +353,7 @@ def experiment_diagnostics(data, start, end):
                 scale_control=data['plan'].get('scale_control', 'clamp'), regularizer=regularizer,
                 **(dict(distance_updates=distance) if distance_policy is not None else {}),
                 **(dict(pose_culling=culling) if culling else {}),
+                **(dict(lidar_activation=activation) if activation else {}),
                 latest=rows[-1] if rows else None,
                 warnings=warnings)
 

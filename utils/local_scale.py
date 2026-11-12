@@ -226,6 +226,8 @@ def support_counts(model, chunk=131072):
         q = rt['metadata']['config']['support_sigma']
         sphere = torch.zeros(len(samples), device=samples.device, dtype=torch.long)
         centers = torch.zeros_like(sphere)
+        from utils.lidar_activation import active_mask
+        active=active_mask(model)
         for start in range(0, len(rt['pair_slots']), chunk):
             slot = rt['pair_slots'][start:start+chunk]
             other = rt['pair_neighbors'][start:start+chunk]
@@ -234,13 +236,15 @@ def support_counts(model, chunk=131072):
             scale = model._scaling[query].exp()
             radius = q*(scale.amax(1)+model._scaling[other].exp().amax(1))
             hit = delta.square().sum(1) <= radius.square()
+            allowed=True if active is None else active[query]&active[other]
+            hit &= allowed
             sphere.scatter_add_(0, slot, hit.long())
             # Inverse unit-quaternion rotation, without constructing a matrix for every pair.
             quat = F.normalize(model._rotation[query], dim=1)
             cross = torch.cross(quat[:, 1:], delta, dim=1)
             local = delta - 2*quat[:, :1]*cross + 2*torch.cross(quat[:, 1:], cross, dim=1)
             mahalanobis = (local/scale.clamp_min(torch.finfo(scale.dtype).tiny)).square().sum(1)
-            centers.scatter_add_(0, slot, (mahalanobis <= q*q).long())
+            centers.scatter_add_(0, slot, ((mahalanobis <= q*q)&allowed).long())
         return sphere, centers
 
 
@@ -249,13 +253,19 @@ def audit(model):
     with torch.no_grad():
         rt = model.local_scale_audit
         spheres, centers = support_counts(model)
+        from utils.lidar_activation import active_mask
+        active=active_mask(model)
+        selected=slice(None) if active is None else active[rt['sample_ids']]
+        spheres,centers=spheres[selected],centers[selected]
         result = dict(local_scale_audit_samples=len(spheres),
                       local_scale_audit_samples_omitted=rt['metadata']['audit_samples_omitted'])
         for name, value in (('support_sphere_overlaps', spheres), ('support_centers_inside', centers),
-                            ('sample_largest_sigma', model._scaling[rt['sample_ids']].exp().amax(1))):
+                            ('sample_largest_sigma', model._scaling[rt['sample_ids'][selected]].exp().amax(1))):
+            if not len(value):
+                continue
             quantiles = torch.quantile(value.float(), value.new_tensor([.5, .9, .99, 1.], dtype=torch.float32))
             result.update({name+'_'+label: float(v) for label, v in zip(('median', 'p90', 'p99', 'max'), quantiles)})
-        result['support_sphere_fraction_over_k'] = float((spheres > rt['metadata']['config']['neighbors']).float().mean())
+        result['support_sphere_fraction_over_k'] = float((spheres > rt['metadata']['config']['neighbors']).float().mean()) if len(spheres) else None
         return result
 
 

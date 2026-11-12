@@ -2040,3 +2040,91 @@ pose-interior coverage, image-footprint candidates, fully/partially blocked and
 contributing Gaussians, and the depth signature. `blocked/candidates` uses the
 number of Gaussians whose projected bounding footprints intersect the image,
 not the total scene population and not the fraction of pixels blocked.
+
+### GPU 0: cap15 + target3 + adaptive LiDAR anchors + alternating poses
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_pose_lidar_adaptive.sh 0
+```
+
+This fresh 30k experiment extends the GPU 3 culling framework. It requires a
+free GPU 0 and launches training and the independent evaluator there. It does
+not stop other jobs. The default output is
+`/data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_offsets_cap15_target3_poses_culling_adaptive_30000_v1`.
+
+| Setting | GPU 0 experiment |
+| --- | --- |
+| Maximum principal sigma | `15 * min(sigma_init, d10/3, .015)` at the end of the cap ramp |
+| Scale curriculum | Original 1x ceiling through 7k, smoothly increased to 15x at 20k |
+| Soft scale target | `min(current_ceiling, 3 * original_target)` |
+| LiDAR displacement | `||xyz - original_anchor|| <= min(.005, .25*sigma_init)` |
+| Position LR | Zero through 7k; 2k-step ramp to `1e-5`, decay to `1e-6` at 30k, without scene-extent scaling |
+| Pose updates | One sampled-camera attempt each iteration 7,001–20,000; then frozen |
+| Adaptive activation | Every 100 steps, 7,100–22,000; up to 20,000 new measured anchors per event |
+| Pruning / opacity reset | Disabled |
+| Checkpoints and evaluation | Every 10k; all 5,009 frames, original and cached-refined poses |
+
+**15x is relative to the original local-scale run**, hence three times GPU 3's
+cap5 allowance. The global maximum is sigma `.225` scene units (22.5 cm with
+metric LiDAR), with tighter local limits where points are closer. Sigma is a
+standard deviation, not an ellipsoid diameter: a 3-sigma diameter can be six
+times larger. Scales are not forcibly inflated; initialization is unchanged.
+The soft target also increases threefold relative to GPU 3, so its old target
+does not keep penalizing expansion at the same sizes. Appearance/scale/opacity/
+rotation use the existing joint LR decay schedule.
+
+The candidate cache deduplicates exact LiDAR coordinates, keeps one measured
+anchor per `.05`-unit voxel, and fills deterministically to at least 50% of the
+unique pool. Coverage can require more than 50%. The remaining anchors are
+reserved for growth. If coverage consumes the whole pool, preparation/training
+fails with an explicit error rather than silently claiming densification.
+This is a combined scale/population experiment, not a scale-only ablation.
+
+At a growth event, currently contributing Gaussians with at least two observed
+screen-space gradients and mean gradient norm at least `.0002` propose up to
+two unused anchors from their cached 16 nearest neighbors, within `.08` scene
+units. Proposed original coordinates must be in the corrected camera frustum
+and in front of a **known** mesh cutoff. Proposals are deduplicated and ranked
+by parent gradient. Unknown depth does not authorize growth. Candidates use
+their own original color, scale initialization and bounded-offset anchor;
+existing Gaussians are not duplicated, relocated or pruned. New Gaussians are
+subject to the same CUDA fragment culling on every subsequent render.
+
+The discrete set constrains **anchor selection**; active positions can still
+learn the small bounded offsets above. All parameter/Adam arrays retain their
+original allocated size. Reserved rows have zero rendered opacity and frozen
+parameters/momenta, with fresh zero moments on activation. The existing shared
+Adam step counter advances. This design does **not** reduce training VRAM.
+The candidate arrays are saved on disk and loaded once; the 16-neighbor table
+and index maps also reside on the training device. Depth caching remains
+bounded as described for GPU 3.
+
+Optimizer checkpoints include the complete reserve, active mask and growth
+state; resumes validate the candidate cache and policy. Ordinary PLY exports
+contain **only active Gaussians**, with current bounded positions and clamped
+scales. Evaluation requires no reserve cache. Counts and overlap/culling
+diagnostics exclude inactive reserves and separately report allocated rows.
+`lidar_activation_growth.jsonl` records eligible parents, proposals and actual
+additions; zero growth raises a diagnostic warning. Checkpoint reports retain
+matched **GT | culling OFF | culling ON** galleries. Main all-frame PSNR uses
+culling OFF, separately with original and cached-refined training poses.
+
+Pose fitting is alternating optimization (EM-like, without a latent-variable
+E-step): detach Gaussians, attempt one bounded photometric pose update for the
+sampled camera, accept only a non-increasing objective, then detach the updated
+camera and optimize Gaussians. With 1,670 training cameras, the 13,000 eligible
+iterations average about 7.8 attempts per camera; insufficient mesh support
+and rejected proposals reduce accepted updates. Original camera files remain
+read-only. `POSE_REFINE_EVERY`, `POSE_REFINE_START`, and `POSE_REFINE_END` can
+change the schedule for a fresh output directory.
+
+The launcher runs the existing native CUDA checks and extends
+`smoke_lidar_offsets.py` with `--lidar-activation --pose-culling`, using the
+actual cap15/target3 settings. It checks activation from native screen-space
+gradients, zero reserve moments, active-only PLY export, overlap counts, and
+optimizer/pose/growth resume before loading the large scene. CPU tests cover
+the optimizer/cache invariants; the native checks still require the CUDA host.

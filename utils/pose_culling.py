@@ -133,9 +133,15 @@ def provider(pipe):
 def statistics(package, camera, pc, pipe, iteration):
     import torch
     flags = package['occlusion_fragment_flags']
-    candidates = int((package['raster_radii'] > 0).sum())
+    from utils.lidar_activation import active_mask
+    active=active_mask(pc)
+    selected=slice(None) if active is None else active
+    allocated=len(flags)
+    flags=flags[selected]
+    candidates = int((package['raster_radii'][selected] > 0).sum())
     frame = provider(pipe).frame(camera, pc.get_xyz.device)
     return dict(iteration=iteration, image=camera.image_name, gaussians=len(flags),
+        allocated_gaussians=allocated,
         image_footprint_candidates=candidates, contributing=int(((flags & 1) != 0).sum()),
         fully_blocked=int((flags == 2).sum()), partially_blocked=int((flags == 3).sum()),
         fully_blocked_candidate_fraction=int((flags == 2).sum())/max(candidates, 1),

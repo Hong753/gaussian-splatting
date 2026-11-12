@@ -174,7 +174,9 @@ class GaussianModel:
     
     @property
     def get_opacity(self):
-        return self.opacity_activation(self._opacity)
+        value = self.opacity_activation(self._opacity)
+        saved = (self.fixed_lidar_state or {}).get('lidar_activation')
+        return value if saved is None else value * saved['active'][:, None]
     
     @property
     def get_exposure(self):
@@ -347,6 +349,8 @@ class GaussianModel:
             bind_culling(self, training_args, fresh=fresh_fixed)
             from utils.lidar_offsets import bind as bind_offsets, state as offset_state
             bind_offsets(self,training_args)
+            from utils.lidar_activation import bind as bind_activation
+            bind_activation(self, training_args, fresh=fresh_fixed)
             offsets=offset_state(self)
             self._xyz.requires_grad_(offsets is not None and offsets['iteration']>offsets['policy']['warmup'])
             self._xyz.grad = None
@@ -440,14 +444,18 @@ class GaussianModel:
 
     def save_ply(self, path):
         mkdir_p(os.path.dirname(path))
-
-        xyz = self._xyz.detach().cpu().numpy()
+        # Reserved anchors are optimizer/checkpoint state, not rendered Gaussians.
+        from utils.lidar_activation import active_mask
+        selection = active_mask(self)
+        if selection is None:
+            selection = slice(None)
+        xyz = self._xyz.detach()[selection].cpu().numpy()
         normals = np.zeros_like(xyz)
-        f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        opacities = self._opacity.detach().cpu().numpy()
-        scale = self._scaling.detach().cpu().numpy()
-        rotation = self._rotation.detach().cpu().numpy()
+        f_dc = self._features_dc.detach()[selection].transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        f_rest = self._features_rest.detach()[selection].transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        opacities = self._opacity.detach()[selection].cpu().numpy()
+        scale = self._scaling.detach()[selection].cpu().numpy()
+        rotation = self._rotation.detach()[selection].cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 

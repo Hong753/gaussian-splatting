@@ -50,6 +50,10 @@ def publish_snapshot(scene, iteration):
         files[str(path.relative_to(model))] = dict(size=path.stat().st_size, sha256=digest(path))
     result = dict(schema=1, snapshot_id=uuid.uuid4().hex, model=str(model), iteration=iteration,
                   state_timing='after_optimizer_step', gaussians=len(scene.gaussians.get_xyz), files=files)
+    activation=(getattr(scene.gaussians,'fixed_lidar_state',None) or {}).get('lidar_activation')
+    if activation is not None:
+        result['allocated_gaussians']=result['gaussians']
+        result['gaussians']=int(activation['active'].sum())
     if getattr(scene.gaussians,'pose_refiner',None) is not None:
         path=folder/'poses.json'
         relative=str(path.relative_to(model))

@@ -29,6 +29,10 @@ def configure_training(opt, dataset):
     offset_policy=requested(opt)
     from utils.pose_culling import requested as requested_culling
     culling_policy=requested_culling(opt)
+    from utils.lidar_activation import requested as requested_activation
+    activation_policy=requested_activation(opt)
+    if activation_policy is not None:
+        dataset.lidar_activation=activation_policy
     if culling_policy is not None:
         if (not getattr(opt, 'fixed_lidar', False) or offset_policy is None or
                 not getattr(opt, 'pose_refinement', '') or dataset.occlusion_mode != 'mesh' or
@@ -141,6 +145,9 @@ def scale_regularization(model):
     if state is None or state.get('scale_control', 'clamp') not in ('regularize', 'hybrid'):
         return model._scaling.new_zeros(())
     excess = torch.relu(model._scaling - state.get('log_scale_target', state['log_scale_cap']))
+    if state.get('lidar_activation') is not None:
+        active=state['lidar_activation']['active']
+        return state['scale_regularization_weight'] * (excess.square()*active[:,None]).sum()/(3*active.sum())
     return state['scale_regularization_weight'] * excess.square().mean()
 
 
@@ -186,6 +193,14 @@ def audit(model, iteration):
                 at_cap_fraction=float((model._scaling >= state['log_scale_cap']-1e-6).any(1).float().mean()),
                 largest_sigma=float(model.get_scaling.max()))
     result.update(offsets)
+    from utils.lidar_activation import audit as activation_audit
+    result.update(activation_audit(model,iteration))
+    if state.get('lidar_activation') is not None:
+        selected=state['lidar_activation']['active']
+        result.update(gaussians=int(selected.sum()),
+            above_target_fraction=float((model._scaling[selected] > state['log_scale_target'][selected]).any(1).float().mean()),
+            at_cap_fraction=float((model._scaling[selected] >= state['log_scale_cap'][selected]-1e-6).any(1).float().mean()),
+            largest_sigma=float(model._scaling[selected].exp().max()))
     if mode == 'hybrid':
         from utils.local_scale import audit as local_audit
         result.update(local_audit(model))
