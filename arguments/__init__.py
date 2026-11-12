@@ -108,6 +108,8 @@ class OptimizationParams(ParamGroup):
         self.scale_control = "clamp"
         self.scale_regularization_weight = 0.01
         self.local_scale_cache = ""
+        self.local_scale_ceiling_multiplier = 1.0
+        self.local_scale_target_multiplier = 1.0
         self.distance_weighting = False
         self.distance_reference = 2.0
         self.distance_power = 2.0

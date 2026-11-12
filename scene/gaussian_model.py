@@ -310,7 +310,9 @@ class GaussianModel:
                 raise ValueError('Fixed LiDAR requires default Adam and no other surface mode')
             if self.fixed_lidar_state is None:
                 self.fixed_lidar_state = initialize(self, training_args.max_scale_ratio, training_args.max_scale_world,
-                                                   mode, weight, getattr(training_args, 'local_scale_cache', ''))
+                                                   mode, weight, getattr(training_args, 'local_scale_cache', ''),
+                                                   getattr(training_args,'local_scale_ceiling_multiplier',1.),
+                                                   getattr(training_args,'local_scale_target_multiplier',1.))
             elif (self.fixed_lidar_state['ratio'], self.fixed_lidar_state['world']) != (
                     training_args.max_scale_ratio, training_args.max_scale_world):
                 raise ValueError('Checkpoint scale limits differ from requested limits')
@@ -320,6 +322,9 @@ class GaussianModel:
                 raise ValueError('Checkpoint regularization weight differs from requested weight')
             if mode == 'hybrid':
                 from utils.local_scale import attach_audit
+                for name in ('local_scale_ceiling_multiplier','local_scale_target_multiplier'):
+                    if self.fixed_lidar_state.get(name,1.) != getattr(training_args,name,1.):
+                        raise ValueError('Checkpoint local-scale multiplier differs from requested multiplier')
                 attach_audit(self, training_args.local_scale_cache)
             from utils.distance_updates import bind_policy
             bind_policy(self, training_args, fresh=fresh_fixed)

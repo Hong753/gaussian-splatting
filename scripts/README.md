@@ -1574,3 +1574,103 @@ without stopping or launching anything, use:
 python scripts/run_distance_weighted.py prepare \
   --previous-model "$OLD_MODEL" --model "$NEW_MODEL" --gpu 0 --dry-run
 ```
+
+### Tune the successful fourth run: relax the cap, keep the smaller target
+
+Start with **2x the hard ceiling and 1x the soft target**, using GPU 0 while
+leaving GPU 3's original 1x run as the reference:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_local_scale_tune.sh 0
+```
+
+This command prints the reference's available scale statistics, prepares a fresh
+matched **30k-step** trial, and stops only the old first-run trainer/evaluator
+(`3dgs_stride3_aa_fixed_lidar_scale2_noprune_100k_v1`) using the exact-run helper.
+It then starts the local-scale experiment and a separate all-frame evaluator on
+GPU 0. **It does not enable distance weighting.** The original GPU 3 model,
+weights, cache and running processes are left untouched.
+
+For the original local bounds `b_i` and preferred scale `t_i`, the new limits are:
+
+`b_new = ceiling_multiplier * b_i`
+
+`t_new = min(b_new, target_multiplier * t_i)`
+
+| Trial | Hard ceiling | Preferred scale | Maximum sigma for metric input |
+| --- | --- | --- | --- |
+| Original fourth run | `b_i` | `t_i` | 1.5 cm |
+| First tuning trial | `2 * b_i` | `t_i` | 3 cm |
+| Optional next trial | `2.5 * b_i` | `t_i` | 3.75 cm |
+
+The multiplier applies to **all local ceiling terms**, not just the absolute
+guard. Increasing only `max_scale_world` could do nothing if the KNN term is
+already tighter. Relaxing the ceiling does not multiply every learned Gaussian's
+size: the soft penalty still favors the original smaller scales, while RGB can
+grow individual axes when the coverage/detail tradeoff supports it. Initialization
+also retains the original 1x ceiling, up to floating-point roundoff. XYZ remains
+fixed, with no pruning, densification or opacity resets.
+
+The reference's source, original LiDAR cloud, keyframes, resolution, regularizer
+weight and other local-scale settings are inherited. Only the cap/target
+multipliers, output/cache location and shorter training horizon change. Compare
+the reference and trials at the **same 10k, 20k or 30k snapshot**, not the reference
+at 100k against a trial at 30k. Fixed-position schedules mean there is no position
+LR decay or density schedule being shortened by this tuning horizon.
+
+Every 10k (inherited checkpoint interval), the existing worker computes PSNR
+over **all 5,009 frames** and writes train/unselected GT/render/error galleries.
+Use the unselected PSNR together with matched floor/texture crops to choose the
+cap; a higher average PSNR alone does not establish sharper fine texture.
+
+Original KNN distances and bounds are reused from the fourth run's cache. The
+new cache is separate. Its **overlap candidate lists are rebuilt for the larger
+ceilings**, since reusing the old candidate lists would undercount intersections.
+This needs a temporary CPU spatial tree, but skips the full-cloud KNN queries.
+Training-time regularization, projection and audit remain on CUDA. The native
+CUDA smoke tests the selected multipliers before preprocessing/training.
+
+To understand whether the ceiling is actually restrictive:
+
+```bash
+python scripts/tune_local_scale.py --model "$MODEL"
+```
+
+The new `scale_regularization_training.jsonl` fields measure, on a sampled set
+of visible Gaussians with **nonzero RGB gradients**:
+
+- `active_at_cap_fraction`: at least one principal axis touches its ceiling.
+- `active_growth_at_cap_fraction`: an axis touches its ceiling and its RGB
+  gradient requests growth (negative log-scale gradient).
+- `active_net_growth_at_cap_fraction`: growth is still requested after the
+  scale regularizer is added, a stronger indication that the hard cap intervenes.
+- `active_above_target_fraction`: an axis exceeds its soft target.
+
+These are directional RGB diagnostics, not a proof that larger scales improve
+quality. Repeated growth pressure at the cap supports testing a larger ceiling.
+If little active geometry reaches the cap, relaxing it further is unlikely to
+address the bottleneck; examine `active_regularizer_to_rgb_scale_grad_ratio` and test the
+preferred-scale multiplier separately. Existing runs started before these fields
+were added only have global cap statistics. **Global at-cap fraction can include
+untouched initialization points and must not be mistaken for growth pressure.**
+
+After the 2x trial has finished, the 2.5x trial uses distinct output/cache paths:
+
+```bash
+LOCAL_SCALE_TUNE_CEILING=2.5 bash scripts/run_local_scale_tune.sh 0
+```
+
+Defaults: reference `3dgs_stride3_aa_fixed_lidar_local_knn10_100k_v1`; trial
+`3dgs_stride3_aa_fixed_lidar_local_cap2_target1_30000_v1`. Both are under
+`/data/3dgs_outputs/orange_4F/1_full`; each trial's derived cache is stored inside
+its own `local_scale_cache` directory. Do not launch two tuning trials on GPU 0
+at once. Overrides: `LOCAL_SCALE_TUNE_REFERENCE`, `LOCAL_SCALE_TUNE_STOP_MODEL`,
+`LOCAL_SCALE_TUNE_MODEL`, `LOCAL_SCALE_TUNE_CEILING`, `LOCAL_SCALE_TUNE_TARGET`,
+`LOCAL_SCALE_TUNE_ITERATIONS`, `LOCAL_SCALE_TUNE_OUTPUT_ROOT`.
+`LOCAL_SCALE_TUNE_TARGET=1.5`, for example, is a separate relaxation of the soft
+preference; keep it at 1 for the first cap-only test. Changing a multiplier requires
+a fresh trial; optimizer checkpoints reject mismatched multipliers on restore.

@@ -156,11 +156,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print(f'Fixed LiDAR: {len(gaussians.get_xyz):,} immutable centers; no cloning, splitting, pruning or opacity resets.')
         if opt.scale_control == 'hybrid':
             cfg = gaussians.local_scale_audit['metadata']['config']
-            print(f'Local scale: hard sigma ceiling = min({opt.max_scale_ratio:g} * initial KNN sigma, '
+            print(f'Local scale: base sigma ceiling = min({opt.max_scale_ratio:g} * initial KNN sigma, '
                   f'd{cfg["neighbors"]}/{cfg["support_sigma"]:g}'
                   + (f', {opt.max_scale_world:g}' if opt.max_scale_world else '') + '); '
                   f'soft target = min(ceiling, d{cfg["neighbors"]}/{cfg["support_sigma"]*cfg["overlap_factor"]:g}). '
                   f'Regularizer weight: {opt.scale_regularization_weight:g}. Distances are in scene units.')
+            print(f'Ceiling multiplier: {cfg.get("ceiling_multiplier",1.):g}; '
+                  f'target multiplier: {cfg.get("target_multiplier",1.):g}. '
+                  'Relaxed caps keep the original 1x initialization. Targets are limited by the new ceiling.')
         else:
             print(f'Scale {"cap" if opt.scale_control == "clamp" else "penalty target"} = '
                   f'{opt.max_scale_ratio:g} x initialization spacing'
@@ -303,8 +306,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scale_stats.update(rgb_loss=float(loss.detach()), scale_regularization_loss=float(scale_loss.detach()),
                                    scale_regularization_weight=opt.scale_regularization_weight)
                 if opt.scale_control == 'hybrid':
-                    from utils.local_scale import projected_stats
+                    from utils.local_scale import projected_stats, pressure_stats
                     scale_stats.update(projected_stats(radii))
+                    scale_stats.update(pressure_stats(gaussians,scale_sample))
             loss = loss.detach() + scale_loss.detach()
             del scale_loss
         soft_stats = None

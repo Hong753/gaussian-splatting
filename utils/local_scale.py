@@ -23,7 +23,8 @@ def validate(neighbors, support_sigma, overlap_factor, ratio, world, samples, pa
         raise ValueError('Invalid local-scale KNN, support, bounds or audit settings')
 
 
-def bounds(distances, *, support_sigma=3., overlap_factor=2., ratio=1., world=.015):
+def bounds(distances, *, support_sigma=3., overlap_factor=2., ratio=1., world=.015,
+           ceiling_multiplier=1., target_multiplier=1.):
     """distances excludes self; last column is the requested K-th neighbor."""
     reference = np.sqrt(np.maximum(np.mean(distances[:, :3]**2, axis=1), 1e-7))
     kth = distances[:, -1]
@@ -33,6 +34,8 @@ def bounds(distances, *, support_sigma=3., overlap_factor=2., ratio=1., world=.0
     if world > 0:
         ceiling = np.minimum(ceiling, world)
     target = np.minimum(ceiling, kth/(overlap_factor*support_sigma))
+    ceiling = ceiling*ceiling_multiplier
+    target = np.minimum(ceiling, target*target_multiplier)
     return ceiling.astype(np.float32), target.astype(np.float32)
 
 
@@ -59,11 +62,14 @@ def metadata(directory, verify=True):
 
 
 def prepare(point_cloud, directory, *, neighbors=10, support_sigma=3., overlap_factor=2.,
-            ratio=1., world=.015, samples=2048, pair_budget=2000000, workers=8, chunk=65536):
+            ratio=1., world=.015, samples=2048, pair_budget=2000000, workers=8, chunk=65536,
+            ceiling_multiplier=1., target_multiplier=1., reuse_cache=None):
     import fcntl
     from plyfile import PlyData
     from scipy.spatial import cKDTree
     validate(neighbors, support_sigma, overlap_factor, ratio, world, samples, pair_budget, workers)
+    if not all(math.isfinite(v) and v > 0 for v in (ceiling_multiplier,target_multiplier)):
+        raise ValueError('Local scale multipliers must be positive and finite')
     if chunk < 1:
         raise ValueError('Local-scale query chunk must be positive')
     point_cloud, directory = Path(point_cloud).expanduser().resolve(), Path(directory).expanduser().resolve()
@@ -72,6 +78,9 @@ def prepare(point_cloud, directory, *, neighbors=10, support_sigma=3., overlap_f
         fcntl.flock(lock, fcntl.LOCK_EX)
         config = dict(source_sha256=digest(point_cloud), neighbors=neighbors, support_sigma=support_sigma,
                       overlap_factor=overlap_factor, ratio=ratio, world=world, samples=samples, pair_budget=pair_budget)
+        # Omit identity defaults to keep existing 1x caches/plans compatible.
+        if ceiling_multiplier != 1. or target_multiplier != 1.:
+            config.update(ceiling_multiplier=ceiling_multiplier,target_multiplier=target_multiplier)
         if (directory/'metadata.json').is_file():
             old = metadata(directory)
             if old['config'] != config:
@@ -89,14 +98,33 @@ def prepare(point_cloud, directory, *, neighbors=10, support_sigma=3., overlap_f
         cap = np.lib.format.open_memmap(directory/'ceiling.npy', mode='w+', dtype=np.float32, shape=(count,))
         target = np.lib.format.open_memmap(directory/'target.npy', mode='w+', dtype=np.float32, shape=(count,))
         kth = np.lib.format.open_memmap(directory/'neighbor_distance.npy', mode='w+', dtype=np.float32, shape=(count,))
+        reused = None
+        if reuse_cache is not None:
+            reuse_cache = Path(reuse_cache).expanduser().resolve()
+            base = metadata(reuse_cache)
+            required = ('source_sha256','neighbors','support_sigma','overlap_factor','ratio','world')
+            if (base['xyz_sha256'] != xyz_hash or base['points'] != count or
+                    any(base['config'][k] != config[k] for k in required) or
+                    base['config'].get('ceiling_multiplier',1.) != 1. or
+                    base['config'].get('target_multiplier',1.) != 1.):
+                raise ValueError('Reuse the matching original 1x local-scale cache')
+            reused = [np.load(reuse_cache/(name+'.npy'),mmap_mode='r',allow_pickle=False)
+                      for name in ('ceiling','target','neighbor_distance')]
+            print(f'Reusing original KNN distances/bounds: {reuse_cache}; rebuilding complete overlap audit for new ceilings.',flush=True)
         for start in range(0, count, chunk):
             stop = min(count, start+chunk)
             # There is always one self-distance of zero. With duplicate rows the
             # zero entries are interchangeable; discarding one still excludes self.
-            distance = tree.query(xyz[start:stop], k=neighbors+1, workers=workers)[0][:, 1:]
-            cap[start:stop], target[start:stop] = bounds(distance, support_sigma=support_sigma,
-                overlap_factor=overlap_factor, ratio=ratio, world=world)
-            kth[start:stop] = distance[:, -1]
+            if reused is None:
+                distance = tree.query(xyz[start:stop], k=neighbors+1, workers=workers)[0][:, 1:]
+                cap[start:stop], target[start:stop] = bounds(distance, support_sigma=support_sigma,
+                    overlap_factor=overlap_factor, ratio=ratio, world=world,
+                    ceiling_multiplier=ceiling_multiplier,target_multiplier=target_multiplier)
+                kth[start:stop] = distance[:, -1]
+            else:
+                cap[start:stop] = reused[0][start:stop]*ceiling_multiplier
+                target[start:stop] = np.minimum(cap[start:stop],reused[1][start:stop]*target_multiplier)
+                kth[start:stop] = reused[2][start:stop]
             if start == 0 or stop == count or (start//chunk) % 40 == 0:
                 print(f'Local scale bounds: {stop:,}/{count:,}', flush=True)
         for value in (cap, target, kth):
@@ -150,12 +178,14 @@ def prepare(point_cloud, directory, *, neighbors=10, support_sigma=3., overlap_f
         return data
 
 
-def load_bounds(directory, device, xyz_sha256, count, ratio, world):
+def load_bounds(directory, device, xyz_sha256, count, ratio, world, ceiling_multiplier=1., target_multiplier=1.):
     import torch
     directory = Path(directory).expanduser().resolve()
     data = metadata(directory)
     if (data['xyz_sha256'] != xyz_sha256 or data['points'] != count or
-            data['config']['ratio'] != ratio or data['config']['world'] != world):
+            data['config']['ratio'] != ratio or data['config']['world'] != world or
+            data['config'].get('ceiling_multiplier',1.) != ceiling_multiplier or
+            data['config'].get('target_multiplier',1.) != target_multiplier):
         raise ValueError('Local-scale cache does not match ordered initialization points or scale settings')
     tensors = [torch.tensor(np.load(directory/(name+'.npy'), mmap_mode='r', allow_pickle=False), device=device)[:, None]
                for name in ('ceiling', 'target')]
@@ -235,3 +265,27 @@ def projected_stats(radii, limit=20000):
         q = torch.quantile(visible.float(), visible.new_tensor([.5,.9,.99,1.], dtype=torch.float32))
         return dict(sampled_visible_radius_px_count=len(visible),
                     **{'visible_radius_px_'+k: float(v) for k, v in zip(('median','p90','p99','max'), q)})
+
+
+def pressure_stats(model, sample):
+    """Is the cap resisting RGB-requested growth on actually supervised rows?"""
+    import torch
+    with torch.no_grad():
+        indices, rgb_gradient = sample
+        active = rgb_gradient.ne(0).any(1)
+        indices, rgb_gradient = indices[active], rgb_gradient[active]
+        result = dict(sampled_rgb_active_gaussians=len(indices))
+        if not len(indices):
+            return result
+        state = model.fixed_lidar_state
+        scale = model._scaling[indices]
+        at_cap = scale >= state['log_scale_cap'][indices]-1e-5
+        result.update(active_at_cap_fraction=float(at_cap.any(1).float().mean()),
+            active_growth_at_cap_fraction=float((at_cap & (rgb_gradient < 0)).any(1).float().mean()),
+            active_above_target_fraction=float((scale > state['log_scale_target'][indices]).any(1).float().mean()))
+        if model._scaling.grad is not None:
+            combined=model._scaling.grad[indices]
+            rgb_norm=float(rgb_gradient.norm())
+            result.update(active_net_growth_at_cap_fraction=float((at_cap & (combined < 0)).any(1).float().mean()),
+                active_regularizer_to_rgb_scale_grad_ratio=float((combined-rgb_gradient).norm())/rgb_norm if rgb_norm else None)
+        return result

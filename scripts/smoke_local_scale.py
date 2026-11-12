@@ -16,6 +16,8 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--gpu', default='3')
     p.add_argument('--output', type=Path)
+    p.add_argument('--ceiling-multiplier',type=float,default=1.)
+    p.add_argument('--target-multiplier',type=float,default=1.)
     args = p.parse_args(argv)
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     import numpy as np
@@ -36,11 +38,15 @@ def main(argv=None):
         for i, key in enumerate(('x','y','z')):
             values[key] = xyz[:,i]
         PlyData([PlyElement.describe(values, 'vertex')]).write(folder/'input.ply')
-        prepare(folder/'input.ply', folder/'cache', samples=16, workers=1)
+        prepare(folder/'input.ply', folder/'base_cache', samples=16, workers=1)
+        prepare(folder/'input.ply', folder/'cache', samples=16, workers=1,
+                ceiling_multiplier=args.ceiling_multiplier,target_multiplier=args.target_multiplier,reuse_cache=folder/'base_cache')
         opt_parser = argparse.ArgumentParser()
         params = OptimizationParams(opt_parser)
         opt = params.extract(opt_parser.parse_args(['--fixed_lidar', '--scale_control', 'hybrid',
             '--max_scale_ratio', '1', '--max_scale_world', '.015', '--local_scale_cache', str(folder/'cache'),
+            '--local_scale_ceiling_multiplier',str(args.ceiling_multiplier),
+            '--local_scale_target_multiplier',str(args.target_multiplier),
             '--position_lr_init', '0', '--position_lr_final', '0', '--densify_until_iter', '0']))
         model = GaussianModel(0)
         model.create_from_pcd(BasicPointCloud(points=xyz, colors=np.tile([.7,.3,.2], (len(xyz),1)),
@@ -49,6 +55,10 @@ def main(argv=None):
         original = model._xyz.detach().clone()
         original_color = model._features_dc.detach().clone()
         state = model.fixed_lidar_state
+        base_cap = torch.tensor(np.load(folder/'base_cache/ceiling.npy'),device='cuda')[:,None]
+        assert (model.get_scaling <= base_cap*(1+1e-6)).all(), 'Relaxing the ceiling must not enlarge initialization'
+        with torch.no_grad():
+            model._scaling[0,0] = state['log_scale_cap'][0,0]+.1
         grad = torch.autograd.grad(scale_regularization(model), model._scaling)[0]
         assert torch.isfinite(grad).all() and (grad > 0).any() and (grad >= 0).all()
         # A value between the target and ceiling is penalized but not projected.
@@ -103,6 +113,7 @@ def main(argv=None):
             native_aa_forward_backward=True, local_penalty_gradient=True, hard_projection_and_moments=True,
             sampled_counts_match_all_pairs=True, fixed_xyz_no_adam_state=True,
             checkpoint_round_trip=True, exported_scales_match=True,
+            relaxed_cap_keeps_initialization=True,
             **projected_stats(result['radii']), **audit(model, 4))
         if args.output:
             from utils.checkpoint_snapshots import atomic_json

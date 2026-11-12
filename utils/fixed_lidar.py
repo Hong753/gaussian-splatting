@@ -49,7 +49,7 @@ def xyz_digest(xyz, chunk=1048576):
 
 
 @torch.no_grad()
-def initialize(model, ratio, world, mode='clamp', weight=.01, cache=''):
+def initialize(model, ratio, world, mode='clamp', weight=.01, cache='', ceiling_multiplier=1., target_multiplier=1.):
     validate_limits(ratio, world)
     validate_control(mode, weight)
     if (not len(model._xyz) or not torch.isfinite(model._xyz).all() or
@@ -70,8 +70,14 @@ def initialize(model, ratio, world, mode='clamp', weight=.01, cache=''):
         if not cache:
             raise ValueError('Hybrid scale control requires a local-scale cache')
         from utils.local_scale import load_bounds
-        data, cap, target = load_bounds(cache, model._xyz.device, state['xyz_sha256'], state['count'], ratio, world)
+        data, cap, target = load_bounds(cache, model._xyz.device, state['xyz_sha256'], state['count'], ratio, world,
+                                       ceiling_multiplier,target_multiplier)
         state.update(log_scale_cap=cap, log_scale_target=target, local_cache_id=data['cache_id'])
+        if ceiling_multiplier != 1. or target_multiplier != 1.:
+            state.update(local_scale_ceiling_multiplier=ceiling_multiplier,local_scale_target_multiplier=target_multiplier)
+            # Keep the 1x initialization when relaxing the cap, so the ablation
+            # changes allowed learning rather than pre-enlarging every Gaussian.
+            model._scaling.copy_(torch.minimum(model._scaling,cap-math.log(max(ceiling_multiplier,1.))))
     return state
 
 
@@ -151,6 +157,9 @@ def audit(model, iteration):
     if mode == 'hybrid':
         from utils.local_scale import audit as local_audit
         result.update(local_audit(model))
+        result.update(ceiling_multiplier=state.get('local_scale_ceiling_multiplier',1.),
+                      target_multiplier=state.get('local_scale_target_multiplier',1.),
+                      effective_max_scale_world=state['world']*state.get('local_scale_ceiling_multiplier',1.))
     if state.get('distance_update_policy') is not None:
         result['distance_update_policy'] = state['distance_update_policy']
     return result
