@@ -119,6 +119,13 @@ class OptimizationParams(ParamGroup):
         self.distance_power = 2.0
         self.distance_min_weight = 0.05
         self.distance_chunk_size = 131072
+        self.distance_metric = "range"
+        self.distance_decay = "inverse_power"
+        self.distance_half_life = 2.0
+        self.distance_normalization = "absolute"
+        self.distance_near_quantile = 0.05
+        self.distance_far_quantile = 0.95
+        self.distance_rank_samples = 8192
         self.discrete_lidar = False
         self.discrete_lidar_cache = ""
         self.discrete_lidar_prune_sigma = 0.05

@@ -2128,3 +2128,90 @@ actual cap15/target3 settings. It checks activation from native screen-space
 gradients, zero reserve moments, active-only PLY export, overlap counts, and
 optimizer/pose/growth resume before loading the large scene. CPU tests cover
 the optimizer/cache invariants; the native checks still require the CUDA host.
+
+### Depth-weighted Gaussian updates: relative depth and normalized rank
+
+Run a separate counterpart to the cap15/target3 adaptive-anchor experiment:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd ~/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_pose_lidar_depth_decay.sh 0
+```
+
+The GPU argument must select a free device. The launcher refuses a busy GPU
+and does not stop the existing baseline. It inherits the same 30k cap/LR,
+bounded-offset, alternating-pose, adaptive-anchor and CUDA culling settings.
+Its output name adds `_depth_relative_ref2_q0.05_half2_floor0.05` before the
+iteration suffix. Checkpoints, all-5,009-frame PSNR and matched GT/render/error
+galleries retain the original every-10k schedule and pose protocols. Main PSNR
+is mesh-free; additional previews compare culling ON/OFF.
+
+**Default: per-view relative depth.** Let `z_i` be the Gaussian center's
+camera-z in the current corrected camera. Only active Gaussians with accepted
+rendering contributions are used to estimate `z0`, their 5th depth percentile.
+Then:
+
+`w_i = max(0.05, 2 ** (-max(z_i - z0, 0) / 2))`
+
+For `z0=12 m`, weights at depths 12/14/16/18 m are 1/.5/.25/.125, exactly as
+for a view with `z0=2 m` at depths 2/4/6/8 m. The estimate uses a deterministic
+sample of at most 8,192 contributing rows on the GPU; it does not change the
+training RNG. It is a **per-view near-depth reference**, not the first mesh hit
+on every individual pixel ray. It may still downweight a legitimate distant
+surface when a different part of that image contains a nearby surface. The
+existing per-pixel CUDA culling remains responsible for occlusion.
+
+**Optional normalized rank:**
+
+```bash
+DEPTH_UPDATE_MODE=rank bash scripts/run_pose_lidar_depth_decay.sh 0
+```
+
+For the empirical depth percentile `r_i` among contributing centers, use
+`u_i = clamp((r_i - .05)/(.95 - .05), 0, 1)` and `w_i = .05 ** u_i`.
+This geometric decay depends on normalized percentile, not the raw Gaussian
+index or count. Equal depths get equal rank; an all-equal-depth view gets
+weight 1 everywhere. The same bounded reference sample estimates the CDF.
+Rank is invariant to depth spacing, but depends on visible point density:
+many Gaussians on one nearby surface can suppress a farther visible surface.
+Relative depth retains a physical distance interpretation and is the first
+ablation; rank is an empirical alternative, not an occlusion model. Different
+modes get different model folders. Do not compare them at different saved
+iterations or silently mix original and refined camera poses.
+
+The forward rendered image, opacity compositing, photometric loss and
+pose-only optimization are unchanged by the weighting. All Gaussian parameter
+groups (SH/color, opacity, scale, rotation and enabled bounded XYZ) feed `w*g`
+into Adam and also multiply the resulting displacement by `w`. This explicit
+step scaling avoids Adam largely cancelling a constant gradient multiplier.
+The factor is detached: it is not a new depth/position loss. Scale and anchor
+prior gradients receive the same factor after accumulation. The ordinary
+screen-space densification score remains unweighted for this ablation.
+
+Fully blocked, out-of-view and inactive-reserve rows retain their parameters
+and both Adam moments. Their weights cannot override the contribution mask;
+the global Adam step counter still advances. New activations are reweighted
+from the current corrected camera each iteration. Optimizer checkpoints bind
+the entire weighting policy; changing modes/half-life on resume is rejected.
+Inference uses ordinary exported Gaussians without a depth weighting wrapper.
+
+`distance_updates_training.jsonl` logs sampled depth/weight quantiles, actual
+reference depth, fraction at the weight floor, weighted gradient norms and
+measured Adam displacement attenuation. The fixed-LiDAR audit records the
+policy, and the periodic evaluator requires matching diagnostics. CUDA
+preflight checks include distant-view relative invariance, equal-depth ranks,
+native AA gradients, masked momentum freezing and the combined
+pose/culling/adaptive-anchor update and checkpoint round trip.
+
+Overrides for fresh runs: `DEPTH_UPDATE_HALF_LIFE` (default 2 scene units),
+`DEPTH_UPDATE_MIN_WEIGHT` (.05), `DEPTH_UPDATE_NEAR_QUANTILE` (.05),
+`DEPTH_UPDATE_FAR_QUANTILE` (.95, rank only), `DEPTH_UPDATE_RANK_SAMPLES` (8192).
+The half-life does not affect rank mode. `DEPTH_UPDATE_MODE=absolute` retains
+an absolute-depth control using `DEPTH_UPDATE_REFERENCE` (2) instead of the
+view reference; relative/rank modes ignore that absolute reference. For a
+geometric ratio `q` per distance interval `d`, choose half-life
+`H = -d*log(2)/log(q)`; continuous geometric and exponential depth decay are
+the same family. Distances are in scene units, metres only if the scene is metric.

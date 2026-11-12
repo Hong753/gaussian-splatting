@@ -14,6 +14,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--gpu',default='0'); parser.add_argument('--output',type=Path)
+    parser.add_argument('--policy',type=json.loads)
     args=parser.parse_args(argv)
     os.environ['CUDA_VISIBLE_DEVICES']=args.gpu
     import numpy as np
@@ -23,7 +24,7 @@ def main(argv=None):
     from gaussian_renderer import render
     from utils.graphics_utils import BasicPointCloud,getProjectionMatrix
     from utils.fixed_lidar import audit,project_scales
-    from utils.distance_updates import weights,adam_step,policy
+    from utils.distance_updates import weights,adam_step,policy,OPTION_FIELDS
     if not torch.cuda.is_available():
         raise RuntimeError('Distance smoke requires the CUDA-enabled 3dgs environment')
     # Same gradient on near/far rows: plain Adam would normalize positive
@@ -45,6 +46,25 @@ def main(argv=None):
     opt_parser=argparse.ArgumentParser(); params=OptimizationParams(opt_parser)
     opt=params.extract(opt_parser.parse_args(['--fixed_lidar','--distance_weighting',
         '--position_lr_init','0','--position_lr_final','0','--densify_until_iter','0']))
+    if args.policy:
+        for name in OPTION_FIELDS:
+            if name in args.policy:setattr(opt,'distance_'+name,args.policy[name])
+        if policy(opt)!=args.policy:raise ValueError('Distance smoke policy differs from experiment')
+    # A distant view must receive the same relative weights, not a uniformly
+    # tiny factor merely because its first visible surface is >10 units away.
+    from copy import copy
+    relative=copy(opt);relative.distance_metric='depth';relative.distance_decay='exponential'
+    relative.distance_normalization='relative';relative.distance_near_quantile=0.;relative.distance_half_life=2.
+    points=torch.tensor([[0.,0,2.],[0,0,4.],[0,0,6.],[0,0,8.]],device='cuda')
+    view=torch.eye(4,device='cuda');center=torch.zeros(3,device='cuda');visible=torch.ones(4,device='cuda',dtype=torch.bool)
+    factors=weights(points,center,policy(relative),world_view_transform=view,keep=visible)
+    distant=weights(points+points.new_tensor([0,0,10]),center,policy(relative),world_view_transform=view,keep=visible)
+    torch.testing.assert_close(factors,points.new_tensor([1.,.5,.25,.125]),rtol=0,atol=0)
+    torch.testing.assert_close(factors,distant,rtol=0,atol=0)
+    ranked=copy(relative);ranked.distance_normalization='rank'
+    flat=points.clone();flat[:,2]=15.
+    torch.testing.assert_close(weights(flat,center,policy(ranked),world_view_transform=view,keep=visible),
+                               points.new_ones(4),rtol=0,atol=0)
     xyz=np.array([[-.15,-.1,1],[.15,-.1,2],[-.15,.1,4],[.15,.1,8]],np.float32)
     model=GaussianModel(0)
     model.create_from_pcd(BasicPointCloud(points=xyz,colors=np.tile([.7,.3,.2],(4,1)),normals=np.zeros_like(xyz)),
@@ -63,8 +83,10 @@ def main(argv=None):
         (result['render']-.6).square().mean().backward()
         assert model._xyz.grad is None and model._features_dc.grad.abs().sum()>0
         assert all(p.grad is None or torch.isfinite(p.grad).all() for g in model.optimizer.param_groups for p in g['params'])
-        w=weights(model._xyz,camera.camera_center,policy(opt),chunk_size=2)
-        adam_step(model.optimizer,w,chunk_size=2)
+        keep=result['radii']>0 if opt.distance_metric=='depth' else None
+        w=weights(model._xyz,camera.camera_center,policy(opt),chunk_size=2,
+                  world_view_transform=camera.world_view_transform,keep=keep)
+        adam_step(model.optimizer,w,chunk_size=2,keep=keep)
         project_scales(model); model.optimizer.zero_grad(set_to_none=True)
         audit(model,step)
     assert torch.equal(model._xyz,original) and model._xyz not in model.optimizer.state
@@ -73,8 +95,16 @@ def main(argv=None):
     restored.restore(model.capture(),opt)
     torch.testing.assert_close(restored._scaling,model._scaling,atol=0,rtol=0)
     assert restored.fixed_lidar_state['distance_update_policy']==policy(opt)
+    # Accumulated momentum must stay frozen on blocked/reserved rows, even
+    # while another row receives a depth-weighted update.
+    p0=p.detach().clone();m0={k:optimizer.state[p][k].clone() for k in ('exp_avg','exp_avg_sq')}
+    p.grad=torch.ones_like(p);keep=torch.tensor([True,False,False],device='cuda')
+    adam_step(optimizer,w[:3],chunk_size=2,keep=keep)
+    assert torch.equal(p[~keep],p0[~keep])
+    for k in m0:assert torch.equal(optimizer.state[p][k][~keep],m0[k][~keep])
     report=dict(passed=True,torch=torch.__version__,cuda_device=torch.cuda.get_device_name(),
-        native_aa_forward_backward=True,unit_weight_adam_parity=True,actual_step_attenuation=True,
+        native_aa_forward_backward=True,unit_weight_adam_parity=True,actual_step_attenuation=True,masked_momentum_frozen=True,
+        distant_view_relative_parity=True,rank_depth_ties_equal=True,
         fixed_xyz=True,checkpoint_round_trip=True,**audit(model,4))
     if args.output:
         from utils.checkpoint_snapshots import atomic_json

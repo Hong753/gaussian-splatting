@@ -128,6 +128,10 @@ def execute_plan(args, plan):
         raise RuntimeError('Activate the CUDA-enabled 3dgs environment')
     model = Path(plan['model'])
     model.mkdir(parents=True, exist_ok=True)
+    if plan.get('distance_updates'):
+        invoke(['scripts/smoke_distance_updates.py','--gpu',args.gpu,
+                '--policy',json.dumps(plan['distance_updates'],sort_keys=True),
+                '--output',str(model/'distance_updates_cuda_smoke.json')])
     if getattr(args,'pose_policy',None) is not None:
         invoke(['scripts/smoke_pose_refinement.py','--gpu',args.gpu,
                 '--output',str(model/'pose_refinement_cuda_smoke.json')])
@@ -144,7 +148,8 @@ def execute_plan(args, plan):
                 '--target-multiplier',str(getattr(args,'target_multiplier',1.)),
                 '--output',str(model/'lidar_offsets_cuda_smoke.json')]+
                 (['--pose-culling'] if getattr(args,'pose_culling_policy',None) is not None else [])+
-                (['--lidar-activation'] if getattr(args,'lidar_activation_policy',None) is not None else []))
+                (['--lidar-activation'] if getattr(args,'lidar_activation_policy',None) is not None else [])+
+                (['--distance-policy',json.dumps(plan['distance_updates'],sort_keys=True)] if plan.get('distance_updates') else []))
     if getattr(args,'pose_culling_policy',None) is not None:
         invoke(['scripts/smoke_ray_occlusion.py','--gpu',args.gpu,
                 '--output',str(model/'ray_occlusion_cuda_smoke.json')])

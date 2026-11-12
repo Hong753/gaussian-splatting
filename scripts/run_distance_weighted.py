@@ -67,7 +67,15 @@ def prepare(argv):
         with periodic.process_lock(folder/'trainer.lock'),periodic.process_lock(folder/'evaluator.lock'):
             existing = periodic.load_plan(args.model)
             serialized = {k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()}
-            if existing['plan'] != plan or existing['training_args'] != serialized:
+            prior=dict(existing['training_args'])
+            prior.setdefault('distance_metric','range')
+            prior.setdefault('distance_decay','inverse_power')
+            prior.setdefault('distance_half_life',2.)
+            prior.setdefault('distance_normalization','absolute')
+            prior.setdefault('distance_near_quantile',.05)
+            prior.setdefault('distance_far_quantile',.95)
+            prior.setdefault('distance_rank_samples',8192)
+            if existing['plan'] != plan or prior != serialized:
                 raise ValueError('Prepared replacement has different settings; use a fresh output directory')
             print(f'Reusing identical prepared replacement: {folder/"plan.json"}',flush=True)
             return 0

@@ -43,6 +43,14 @@ def schedule_arguments(parser):
     parser.add_argument('--offset-lr-init',type=float,default=1e-5)
     parser.add_argument('--offset-lr-final',type=float,default=1e-6)
     parser.add_argument('--offset-prior-weight',type=float,default=.001)
+    parser.add_argument('--depth-decay',action='store_true',help='Exponential camera-z weighting of Gaussian gradients and Adam steps')
+    parser.add_argument('--depth-reference',type=float,default=2.)
+    parser.add_argument('--depth-half-life',type=float,default=2.)
+    parser.add_argument('--depth-min-weight',type=float,default=.05)
+    parser.add_argument('--depth-mode',choices=('relative','rank','absolute'),default='relative')
+    parser.add_argument('--depth-near-quantile',type=float,default=.05)
+    parser.add_argument('--depth-far-quantile',type=float,default=.95)
+    parser.add_argument('--depth-rank-samples',type=int,default=8192)
 
 
 def requested_schedule(args):
@@ -124,6 +132,19 @@ def prepare(argv):
     args.scene_geometry=None
     args.lidar_activation_policy=None
     args.lidar_activation_cache=None
+    args.distance_weighting=bool(request.depth_decay)
+    args.distance_metric='depth' if request.depth_decay else 'range'
+    args.distance_decay='exponential' if request.depth_decay else 'inverse_power'
+    args.distance_half_life=request.depth_half_life
+    args.distance_normalization=request.depth_mode if request.depth_decay else 'absolute'
+    args.distance_near_quantile=request.depth_near_quantile
+    args.distance_far_quantile=request.depth_far_quantile
+    args.distance_rank_samples=request.depth_rank_samples
+    if request.depth_decay:
+        if not (request.pose_refinement and request.lidar_offsets and request.pose_culling and request.lidar_activation):
+            raise ValueError('Depth-decay ablation requires the cap15 pose/culling/adaptive-anchor framework')
+        args.distance_reference=request.depth_reference
+        args.distance_min_weight=request.depth_min_weight
     if request.pose_refinement:
         from utils.pose_refinement import DEFAULTS, validate as validate_pose
         args.pose_policy=validate_pose({**DEFAULTS,**{key:getattr(request,'pose_'+key) for key in
@@ -172,6 +193,13 @@ def prepare(argv):
             prior_args.setdefault('scene_geometry',None)
             prior_args.setdefault('lidar_activation_policy',None)
             prior_args.setdefault('lidar_activation_cache',None)
+            prior_args.setdefault('distance_metric','range')
+            prior_args.setdefault('distance_decay','inverse_power')
+            prior_args.setdefault('distance_half_life',2.)
+            prior_args.setdefault('distance_normalization','absolute')
+            prior_args.setdefault('distance_near_quantile',.05)
+            prior_args.setdefault('distance_far_quantile',.95)
+            prior_args.setdefault('distance_rank_samples',8192)
             if existing['plan'] != plan or prior_args != serialized:
                 raise ValueError('Prepared tuning run differs; use a fresh model directory')
             state_path=folder/'training.json'

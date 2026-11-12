@@ -69,6 +69,16 @@ fi
 if [[ "${LOCAL_SCALE_TUNE_ACTIVATION:-0}" == 1 ]]; then
   tune_schedule_args+=(--lidar-activation)
 fi
+if [[ "${LOCAL_SCALE_TUNE_DEPTH_DECAY:-0}" == 1 ]]; then
+  tune_schedule_args+=(--depth-decay
+    --depth-mode "${DEPTH_UPDATE_MODE:-relative}"
+    --depth-reference "${DEPTH_UPDATE_REFERENCE:-2}"
+    --depth-half-life "${DEPTH_UPDATE_HALF_LIFE:-2}"
+    --depth-min-weight "${DEPTH_UPDATE_MIN_WEIGHT:-0.05}"
+    --depth-near-quantile "${DEPTH_UPDATE_NEAR_QUANTILE:-0.05}"
+    --depth-far-quantile "${DEPTH_UPDATE_FAR_QUANTILE:-0.95}"
+    --depth-rank-samples "${DEPTH_UPDATE_RANK_SAMPLES:-8192}")
+fi
 python -u scripts/tune_local_scale.py --model "$tune_reference"
 python -u scripts/tune_local_scale.py prepare \
   --reference-model "$tune_reference" --model "$tune_model" --gpu "$tune_gpu" \

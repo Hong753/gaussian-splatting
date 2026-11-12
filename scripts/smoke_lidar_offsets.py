@@ -20,6 +20,7 @@ def main(argv=None):
     p.add_argument('--target-multiplier',type=float,default=1.)
     p.add_argument('--pose-culling',action='store_true')
     p.add_argument('--lidar-activation',action='store_true')
+    p.add_argument('--distance-policy',type=json.loads)
     args=p.parse_args(argv)
     if args.lidar_activation and not args.pose_culling:
         raise ValueError('Activation smoke requires --pose-culling')
@@ -57,6 +58,12 @@ def main(argv=None):
         policy={**DEFAULTS,'warmup':1,'ramp':1,'end':6}
         pose_policy={**POSES,'start':1,'end':4,'max_width':64}
         opt.lidar_offsets=json.dumps(policy);opt.pose_refinement=json.dumps(pose_policy)
+        if args.distance_policy:
+            from utils.distance_updates import policy as distance_policy,OPTION_FIELDS
+            opt.distance_weighting=True
+            for name in OPTION_FIELDS:
+                if name in args.distance_policy:setattr(opt,'distance_'+name,args.distance_policy[name])
+            if distance_policy(opt)!=args.distance_policy:raise ValueError('Distance smoke policy differs from experiment')
         if args.pose_culling:
             from utils.pose_culling import DEFAULTS as CULLING
             opt.pose_culling=json.dumps(CULLING)
@@ -112,7 +119,15 @@ def main(argv=None):
                 assert model._xyz.grad is not None and model._xyz.grad.abs().sum()>0
             else:
                 assert model._xyz.grad is None and model._xyz not in model.optimizer.state
-            if args.pose_culling:
+            if args.distance_policy:
+                from utils.distance_updates import weights,adam_step
+                posed=model.pose_refiner.camera(cam)
+                keep=package.get('occlusion_keep',package['radii']>0)
+                if args.lidar_activation:keep=keep&active_mask(model)
+                w=weights(model._xyz,posed.camera_center,args.distance_policy,
+                          world_view_transform=posed.world_view_transform,keep=keep)
+                adam_step(model.optimizer,w,keep=keep)
+            elif args.pose_culling:
                 from utils.occlusion_culling import masked_adam_step
                 masked_adam_step(model.optimizer,package['occlusion_keep'])
             else:

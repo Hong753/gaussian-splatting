@@ -39,6 +39,13 @@ def parser():
     p.add_argument('--distance-power', type=float, default=2.)
     p.add_argument('--distance-min-weight', type=float, default=.05)
     p.add_argument('--distance-chunk-size', type=int, default=131072)
+    p.add_argument('--distance-metric',choices=('range','depth'),default='range')
+    p.add_argument('--distance-decay',choices=('inverse_power','exponential'),default='inverse_power')
+    p.add_argument('--distance-half-life',type=float,default=2.)
+    p.add_argument('--distance-normalization',choices=('absolute','relative','rank'),default='absolute')
+    p.add_argument('--distance-near-quantile',type=float,default=.05)
+    p.add_argument('--distance-far-quantile',type=float,default=.95)
+    p.add_argument('--distance-rank-samples',type=int,default=8192)
     p.add_argument('--resolution', type=int, default=-1)
     p.add_argument('--expected-frames', type=int, default=5009)
     p.add_argument('--report-max-views', type=int, default=64)
@@ -99,16 +106,20 @@ def build_plan(args):
         command += ['--local_scale_cache', str(args.local_scale_cache.expanduser().resolve())]
         policy['scale_limit_semantics'] = 'Local soft target plus an independent hard ceiling after every Adam step'
     if getattr(args,'distance_weighting',False):
-        if (control != 'clamp' or not math.isfinite(args.distance_reference) or args.distance_reference <= 0 or
-                not math.isfinite(args.distance_power) or args.distance_power <= 0 or
-                not math.isfinite(args.distance_min_weight) or not 0 < args.distance_min_weight <= 1 or
-                args.distance_chunk_size < 1):
-            raise ValueError('Distance ablation needs hard clamping and valid reference/power/min-weight/chunk settings')
+        from types import SimpleNamespace
+        from utils.distance_updates import policy as distance_policy
+        config=distance_policy(SimpleNamespace(**{**vars(args),'fixed_lidar':True,'optimizer_type':'default'}))
         command += ['--distance_weighting', '--distance_reference',str(args.distance_reference),
             '--distance_power',str(args.distance_power), '--distance_min_weight',str(args.distance_min_weight),
             '--distance_chunk_size',str(args.distance_chunk_size)]
-        policy['distance_updates'] = dict(reference=args.distance_reference, power=args.distance_power,
-            min_weight=args.distance_min_weight, semantics='weighted_gradient_and_adam_displacement_v1')
+        if config.get('metric') is not None:
+            command += ['--distance_metric',config['metric'],'--distance_decay',config['decay'],
+                        '--distance_half_life',str(config['half_life']),
+                        '--distance_normalization',config['normalization'],
+                        '--distance_near_quantile',str(config['near_quantile']),
+                        '--distance_far_quantile',str(config['far_quantile']),
+                        '--distance_rank_samples',str(config['rank_samples'])]
+        policy['distance_updates']=config
     return dict(source=str(source), model=str(model), gpu=args.gpu, initial_points=len(vertices.data),
                 max_scale_ratio=args.max_scale_ratio, max_scale_world=args.max_scale_world,
                 positions='fixed throughout', population='constant', antialiasing=True,
@@ -136,6 +147,7 @@ def execute_plan(args, plan, *, smoke=True):
     # fixed cloud before loading the large scene. Failures stay direct tracebacks.
     if smoke and getattr(args,'distance_weighting',False):
         invoke(['scripts/smoke_distance_updates.py', '--gpu',args.gpu,
+                '--policy',json.dumps(plan['distance_updates'],sort_keys=True),
                 '--output',str(model/'distance_updates_cuda_smoke.json')])
     elif smoke and getattr(args, 'scale_control', 'clamp') == 'hybrid':
         invoke(['scripts/smoke_local_scale.py', '--gpu', args.gpu,

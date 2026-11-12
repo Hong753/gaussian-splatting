@@ -205,9 +205,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
               f'Adaptive activation and sigma>{opt.discrete_lidar_prune_sigma:g} pruning every '
               f'{opt.densification_interval} steps after {opt.densify_from_iter}; no opacity pruning/resets.')
     if distance_config is not None:
-        print(f'Distance updates: full weight within {distance_config["reference"]:g} scene units; '
-              f'inverse-distance power {distance_config["power"]:g}; floor {distance_config["min_weight"]:g}. '
-              'Attenuates both RGB gradients into Adam and the resulting displacement; forward rendering is unchanged.')
+        import json
+        print('Distance update policy: '+json.dumps(distance_config,sort_keys=True))
+        print('Weights Gaussian gradients and Adam displacement; preserves contribution masks. '
+              'Forward rendering, pose-only updates and densification gradients are unchanged.')
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -499,16 +500,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 else:
                     if distance_config is not None:
                         from utils.distance_updates import weights, diagnostic_sample, adam_step
+                        distance_keep=render_pkg.get('occlusion_keep')
+                        if distance_keep is None and distance_config.get('metric')=='depth':
+                            distance_keep=radii>0
+                        from utils.lidar_activation import active_mask
+                        active=active_mask(gaussians)
+                        if active is not None:
+                            distance_keep=active if distance_keep is None else distance_keep&active
+                        depth_diagnostics={} if iteration==1 or iteration%100==0 else None
                         distance_weights = weights(gaussians._xyz, viewpoint_cam.camera_center,
-                                                  distance_config, opt.distance_chunk_size)
+                                                  distance_config, opt.distance_chunk_size,
+                                                  world_view_transform=viewpoint_cam.world_view_transform,
+                                                  keep=distance_keep,diagnostics=depth_diagnostics)
                         indices = None
                         if iteration == 1 or iteration % 100 == 0:
                             indices, distance_stats = diagnostic_sample(gaussians._xyz, viewpoint_cam.camera_center,
-                                                                      distance_weights, visibility_filter)
-                        step_stats = adam_step(gaussians.optimizer, distance_weights, opt.distance_chunk_size, indices)
+                                                                      distance_weights, visibility_filter,
+                                                                      config=distance_config,world_view_transform=viewpoint_cam.world_view_transform)
+                            distance_stats.update(depth_diagnostics)
+                        step_stats = adam_step(gaussians.optimizer, distance_weights, opt.distance_chunk_size, indices,
+                                               keep=distance_keep)
                         if distance_stats is not None:
                             distance_stats.update(step_stats)
-                        del distance_weights
+                        del distance_weights,distance_keep
                     elif "occlusion_keep" in render_pkg:
                         from utils.occlusion_culling import masked_adam_step
                         masked_adam_step(gaussians.optimizer, render_pkg["occlusion_keep"], pipe.occlusion_chunk_size)
