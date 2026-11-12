@@ -117,6 +117,9 @@ def train(model):
             elif data.get('experiment') == 'local_scale':
                 from scripts import run_local_scale
                 launcher = run_local_scale
+            elif data.get('experiment') == 'distance_weighted':
+                from scripts import run_distance_weighted
+                launcher = run_distance_weighted
             plan = launcher.build_plan(args)
             if plan != data['plan']:
                 raise ValueError('Training plan changed after preparation')
@@ -232,7 +235,7 @@ def experiment_diagnostics(data, start, end):
         return dict(interval=[start, end], logged_checks=len(rows), passed=good, warnings=warnings,
                     added=sum(r['added'] for r in events), scale_pruned=sum(r['scale_pruned'] for r in events),
                     latest=rows[-1] if rows else None)
-    if data.get('experiment') not in ('fixed_lidar', 'local_scale'):
+    if data.get('experiment') not in ('fixed_lidar', 'local_scale', 'distance_weighted'):
         return soft_diagnostics(data['model'], start, end)
     path = Path(data['model'])/'fixed_lidar_training.jsonl'
     rows = []
@@ -271,8 +274,26 @@ def experiment_diagnostics(data, start, end):
         warnings.append('No logged positive scale penalty; check whether any scales exceed the target')
     if hybrid and rows and rows[-1].get('local_scale_audit_samples_omitted', 0):
         warnings.append('Some whole overlap-audit samples exceeded the pair budget; reported counts cover retained samples only')
+    distance = {}
+    distance_policy = data['plan'].get('distance_updates')
+    if distance_policy is not None:
+        path = Path(data['model'])/'distance_updates_training.jsonl'
+        updates = []
+        if path.is_file():
+            for line in path.read_text().splitlines():
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if start < row['iteration'] <= end:
+                    updates.append(row)
+        distance = dict(policy=distance_policy, logged_checks=len(updates), latest=updates[-1] if updates else None)
+        if not updates or not all(r.get('distance_update_policy') == distance_policy for r in rows):
+            good = False
+            warnings.append('Missing or inconsistent distance update policy/step diagnostics')
     return dict(interval=[start, end], logged_checks=len(rows), passed=good,
                 scale_control=data['plan'].get('scale_control', 'clamp'), regularizer=regularizer,
+                **(dict(distance_updates=distance) if distance_policy is not None else {}),
                 latest=rows[-1] if rows else None,
                 warnings=warnings)
 
@@ -311,7 +332,8 @@ def write_history(data, results):
         cells = [row[k] for k in ('iteration', 'gaussians', 'frames', 'all_psnr_db', 'selected_psnr_db', 'unselected_psnr_db')]
         body.append('<tr>'+''.join(f'<td>{html.escape(str(v))}</td>' for v in cells)+f'<td>{links}</td></tr>')
     title = {'local_scale':'Local KNN scale checkpoints', 'fixed_lidar':'Fixed LiDAR checkpoints',
-             'discrete_lidar':'Discrete LiDAR checkpoints'}.get(data.get('experiment'), 'Soft surface checkpoints')
+             'discrete_lidar':'Discrete LiDAR checkpoints',
+             'distance_weighted':'Distance-weighted LiDAR checkpoints'}.get(data.get('experiment'), 'Soft surface checkpoints')
     page = ('<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="30">'
         f'<title>{title}</title><style>body{{font:16px sans-serif;margin:2em}}td,th{{padding:.6em;text-align:left}}</style>'
         f'<h1>{title}</h1><p>All registered frames; AA on; mesh-free inference. '

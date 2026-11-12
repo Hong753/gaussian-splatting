@@ -48,6 +48,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     configure_training(opt, dataset)
     from utils.discrete_lidar import configure_training as configure_discrete_lidar
     configure_discrete_lidar(opt, dataset)
+    from utils.distance_updates import policy as distance_policy
+    distance_config = distance_policy(opt)
     dataset.antialiasing = pipe.antialiasing
     dataset.optimization_settings = vars(opt).copy()
     from scripts.occlusion_options import configure_pipeline, prepare_training_geometry, inference_pipeline
@@ -172,6 +174,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
               f'{len(gaussians.discrete_lidar_pool["xyz"]):,} measured coordinates; XYZ frozen. '
               f'Adaptive activation and sigma>{opt.discrete_lidar_prune_sigma:g} pruning every '
               f'{opt.densification_interval} steps after {opt.densify_from_iter}; no opacity pruning/resets.')
+    if distance_config is not None:
+        print(f'Distance updates: full weight within {distance_config["reference"]:g} scene units; '
+              f'inverse-distance power {distance_config["power"]:g}; floor {distance_config["min_weight"]:g}. '
+              'Attenuates both RGB gradients into Adam and the resulting displacement; forward rendering is unchanged.')
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -419,6 +425,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         if key not in ('iteration', 'image') and value is not None:
                             tb_writer.add_scalar('soft_surface/'+key, value, iteration)
 
+            distance_stats = None
             # Optimizer step
             if iteration < opt.iterations or publish_checkpoint_snapshots:
                 gaussians.exposure_optimizer.step()
@@ -428,7 +435,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer.step(visible, radii.shape[0])
                     gaussians.optimizer.zero_grad(set_to_none = True)
                 else:
-                    if "occlusion_keep" in render_pkg:
+                    if distance_config is not None:
+                        from utils.distance_updates import weights, diagnostic_sample, adam_step
+                        distance_weights = weights(gaussians._xyz, viewpoint_cam.camera_center,
+                                                  distance_config, opt.distance_chunk_size)
+                        indices = None
+                        if iteration == 1 or iteration % 100 == 0:
+                            indices, distance_stats = diagnostic_sample(gaussians._xyz, viewpoint_cam.camera_center,
+                                                                      distance_weights, visibility_filter)
+                        step_stats = adam_step(gaussians.optimizer, distance_weights, opt.distance_chunk_size, indices)
+                        if distance_stats is not None:
+                            distance_stats.update(step_stats)
+                        del distance_weights
+                    elif "occlusion_keep" in render_pkg:
                         from utils.occlusion_culling import masked_adam_step
                         masked_adam_step(gaussians.optimizer, render_pkg["occlusion_keep"], pipe.occlusion_chunk_size)
                     else:
@@ -436,6 +455,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
                 project_scales(gaussians)
+
+            if distance_stats is not None:
+                import json
+                distance_stats.update(iteration=iteration, image=viewpoint_cam.image_name)
+                with open(os.path.join(scene.model_path,'distance_updates_training.jsonl'),'a') as stream:
+                    stream.write(json.dumps(distance_stats,allow_nan=False)+'\n')
+                if tb_writer:
+                    for key,value in distance_stats.items():
+                        if key not in ('iteration','image') and value is not None:
+                            tb_writer.add_scalar('distance_updates/'+key,value,iteration)
 
             # The discrete policy consumes accumulated screen-space gradients,
             # but edits the population only AFTER this iteration's Adam update.

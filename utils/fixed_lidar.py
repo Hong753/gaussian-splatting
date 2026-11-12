@@ -151,4 +151,6 @@ def audit(model, iteration):
     if mode == 'hybrid':
         from utils.local_scale import audit as local_audit
         result.update(local_audit(model))
+    if state.get('distance_update_policy') is not None:
+        result['distance_update_policy'] = state['distance_update_policy']
     return result

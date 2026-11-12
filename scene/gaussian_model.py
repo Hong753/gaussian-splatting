@@ -321,6 +321,8 @@ class GaussianModel:
             if mode == 'hybrid':
                 from utils.local_scale import attach_audit
                 attach_audit(self, training_args.local_scale_cache)
+            from utils.distance_updates import bind_policy
+            bind_policy(self, training_args, fresh=fresh_fixed)
             self._xyz.requires_grad_(False)
             self._xyz.grad = None
         self.surface_mode = training_args.surface_mode

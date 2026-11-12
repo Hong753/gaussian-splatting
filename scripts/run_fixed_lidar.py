@@ -34,6 +34,11 @@ def parser():
                    help='Hard cap, soft penalty, or local soft target with a hard ceiling')
     p.add_argument('--scale-regularization-weight', type=float, default=.01)
     p.add_argument('--local-scale-cache', type=Path, help='Precomputed local bounds, required by hybrid mode')
+    p.add_argument('--distance-weighting', action='store_true')
+    p.add_argument('--distance-reference', type=float, default=2.)
+    p.add_argument('--distance-power', type=float, default=2.)
+    p.add_argument('--distance-min-weight', type=float, default=.05)
+    p.add_argument('--distance-chunk-size', type=int, default=131072)
     p.add_argument('--resolution', type=int, default=-1)
     p.add_argument('--expected-frames', type=int, default=5009)
     p.add_argument('--report-max-views', type=int, default=64)
@@ -93,6 +98,17 @@ def build_plan(args):
             raise ValueError('Hybrid mode requires --local-scale-cache; run_local_scale.py can prepare it')
         command += ['--local_scale_cache', str(args.local_scale_cache.expanduser().resolve())]
         policy['scale_limit_semantics'] = 'Local soft target plus an independent hard ceiling after every Adam step'
+    if getattr(args,'distance_weighting',False):
+        if (control != 'clamp' or not math.isfinite(args.distance_reference) or args.distance_reference <= 0 or
+                not math.isfinite(args.distance_power) or args.distance_power <= 0 or
+                not math.isfinite(args.distance_min_weight) or not 0 < args.distance_min_weight <= 1 or
+                args.distance_chunk_size < 1):
+            raise ValueError('Distance ablation needs hard clamping and valid reference/power/min-weight/chunk settings')
+        command += ['--distance_weighting', '--distance_reference',str(args.distance_reference),
+            '--distance_power',str(args.distance_power), '--distance_min_weight',str(args.distance_min_weight),
+            '--distance_chunk_size',str(args.distance_chunk_size)]
+        policy['distance_updates'] = dict(reference=args.distance_reference, power=args.distance_power,
+            min_weight=args.distance_min_weight, semantics='weighted_gradient_and_adam_displacement_v1')
     return dict(source=str(source), model=str(model), gpu=args.gpu, initial_points=len(vertices.data),
                 max_scale_ratio=args.max_scale_ratio, max_scale_world=args.max_scale_world,
                 positions='fixed throughout', population='constant', antialiasing=True,
@@ -118,7 +134,10 @@ def execute_plan(args, plan, *, smoke=True):
     model.mkdir(parents=True, exist_ok=True)
     # Exercise the actual native CUDA rasterizer and optimizer path on a tiny
     # fixed cloud before loading the large scene. Failures stay direct tracebacks.
-    if smoke and getattr(args, 'scale_control', 'clamp') == 'hybrid':
+    if smoke and getattr(args,'distance_weighting',False):
+        invoke(['scripts/smoke_distance_updates.py', '--gpu',args.gpu,
+                '--output',str(model/'distance_updates_cuda_smoke.json')])
+    elif smoke and getattr(args, 'scale_control', 'clamp') == 'hybrid':
         invoke(['scripts/smoke_local_scale.py', '--gpu', args.gpu,
                 '--output', str(model/'local_scale_cuda_smoke.json')])
     elif smoke:

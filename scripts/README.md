@@ -1478,3 +1478,99 @@ Restart only the evaluation queue, after activating `3dgs`:
 python -u scripts/run_local_scale.py watch \
   --model /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_fixed_lidar_local_knn10_100k_v1
 ```
+
+### Replace GPU 0's first clamp run with distance-weighted updates
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_distance_weighted.sh 0
+```
+
+Hypothesis: far-camera observations may provide poorer texture sampling and
+should have less influence than nearby observations of the same measured point.
+This experiment uses Euclidean distance `d_i = ||XYZ_i - camera_center||` for the
+current camera, in the same world coordinates as the original LiDAR:
+
+`w_i = max(0.05, (2 / max(d_i, 2))**2)`
+
+| Camera distance (metric LiDAR) | Gradient multiplier | Adam displacement multiplier |
+| --- | --- | --- |
+| Up to 2 m | 1 | 1 |
+| 4 m | 0.25 | 0.25 |
+| 8 m | 0.0625 | 0.0625 |
+| At least about 8.94 m | 0.05 | 0.05 |
+
+Both factors are intentional. Adam divides its first moment by the square root
+of the second moment; multiplying every gradient by a constant positive factor
+alone can largely cancel in this normalization. The implementation feeds `w*g`
+into Adam's moments, then also multiplies the resulting parameter displacement
+by `w`. It is a modified optimizer policy, not simply a weighted photometric
+loss. The 5% floor leaves learning possible for surfaces only observed from far
+away. The distance reference is in **scene units**; change it with the geometry
+if the cloud is rescaled. This does not estimate camera calibration quality,
+visibility or depth uncertainty; its quality benefit remains to be measured.
+
+The factor applies to SH/color, opacity, scale and rotation updates. XYZ stays
+exactly fixed and has no gradients or Adam state. It also scales residual Adam
+motion on zero-current-gradient rows; it does not add a frustum mask or freeze
+previous momentum. Forward rendering, alpha compositing, RGB loss values and
+evaluation are unchanged. Inference needs only the usual exported PLY. There
+is no new occlusion mechanism, mesh, DA3 dependency, pruning or densification.
+
+The replacement **inherits the old run's actual clamp settings**, including any
+optional absolute sigma limit, resolution, original input cloud, keyframes,
+iterations and checkpoint schedule. It verifies that the training command changes
+only the output destinations and new distance options. It does **not** substitute
+the GPU 3 local-KNN preset or resume the old learned weights. By default the
+source run is `3dgs_stride3_aa_fixed_lidar_scale2_noprune_100k_v1`, and the fresh
+output is `3dgs_stride3_aa_fixed_lidar_scale2_distance_100k_v1`, under
+`/data/3dgs_outputs/orange_4F/1_full`.
+
+The shell command first validates/prepares the replacement, then sends SIGTERM
+only to this user's recognized Python trainer/evaluator/render processes with
+the exact **old model path**. It checks the old plan's GPU, uses PID handles and
+revalidates process start times, then waits until matching processes exit.
+Other models and users are excluded; no GPU-wide kill or SIGKILL is used. Old
+checkpoints and evaluation outputs remain on disk. If a matching process remains
+after 20 seconds, the command fails before starting training.
+
+After the old run stops, a native CUDA AA smoke test checks forward/backward,
+unit-weight Adam parity, actual update attenuation, fixed centers, scale limits
+and checkpoint restoration. A failed preflight can be retried with the same
+command if preparation is identical and no trained `cfg_args`/checkpoint exists.
+Once training has begun, use a fresh output directory for a new run.
+
+Training and all-frame evaluation run in separate processes on **GPU 0**. For
+the default first run, that is **100k steps, checkpoints every 10k**, PSNR over
+**all 5,009 images**, plus the existing selected/unselected GT/render/error
+galleries. Evaluation is queued sequentially and the launcher waits for it.
+
+`distance_updates_training.jsonl` logs sampled visible-point distances/weights
+and per-parameter raw/weighted gradient norms every 100 steps. It also logs the
+measured Adam displacement against that same weighted-moment Adam proposal
+before its final distance multiplier; scale displacements are measured **before
+the subsequent hard scale projection**. `fixed_lidar_training.jsonl` verifies
+the immutable cloud, scale bounds and saved distance policy. The periodic
+checkpoint diagnostics link includes these records. Optimizer checkpoints reject
+a changed distance policy on restore, including attempts to silently switch
+between weighted and unweighted training.
+
+All weighting and optimizer operations use PyTorch CUDA tensors in bounded
+chunks; no new CUDA extension or scene preprocessing is required. Gradients and
+Adam buffers keep their standard shapes, and no full extra parameter snapshot is
+allocated. The native CUDA smoke runs before loading the large training scene.
+
+Overrides: `DISTANCE_UPDATE_PREVIOUS_MODEL`, `DISTANCE_UPDATE_MODEL`,
+`DISTANCE_UPDATE_OUTPUT_ROOT`, `DISTANCE_UPDATE_REFERENCE`,
+`DISTANCE_UPDATE_POWER`, `DISTANCE_UPDATE_MIN_WEIGHT`, `DISTANCE_UPDATE_CHUNK_SIZE`.
+The old experiment must have its `periodic_evaluation/plan.json`; it supplies the
+original settings and source fingerprints. To inspect the exact replacement
+without stopping or launching anything, use:
+
+```bash
+python scripts/run_distance_weighted.py prepare \
+  --previous-model "$OLD_MODEL" --model "$NEW_MODEL" --gpu 0 --dry-run
+```
