@@ -25,6 +25,8 @@ def configure_training(opt, dataset):
     """Canonicalize the fixed-population ablation before recording cfg_args."""
     if getattr(opt, 'local_scale_schedule', '') and not getattr(opt, 'fixed_lidar', False):
         raise ValueError('Local-scale schedules require fixed LiDAR training')
+    from utils.lidar_offsets import requested
+    offset_policy=requested(opt)
     if not getattr(opt, 'fixed_lidar', False):
         return
     validate_limits(opt.max_scale_ratio, opt.max_scale_world)
@@ -39,6 +41,7 @@ def configure_training(opt, dataset):
     opt.position_lr_init = opt.position_lr_final = 0.0
     opt.position_warmup_steps = opt.position_ramp_steps = opt.densification_phase_offset = 0
     opt.densify_until_iter = 0  # Also bypasses pruning and opacity resets in train.py.
+    if offset_policy is not None: dataset.lidar_offsets=offset_policy
     for name in ('fixed_lidar', 'max_scale_ratio', 'max_scale_world', 'scale_control', 'scale_regularization_weight', 'local_scale_cache'):
         setattr(dataset, name, getattr(opt, name))
 
@@ -51,7 +54,7 @@ def xyz_digest(xyz, chunk=1048576):
 
 
 @torch.no_grad()
-def initialize(model, ratio, world, mode='clamp', weight=.01, cache='', ceiling_multiplier=1., target_multiplier=1.):
+def initialize(model, ratio, world, mode='clamp', weight=.01, cache='', ceiling_multiplier=1., target_multiplier=1., offset_policy=None):
     validate_limits(ratio, world)
     validate_control(mode, weight)
     if (not len(model._xyz) or not torch.isfinite(model._xyz).all() or
@@ -66,6 +69,10 @@ def initialize(model, ratio, world, mode='clamp', weight=.01, cache='', ceiling_
         cap.clamp_(max=math.log(world))
     state = dict(schema=1, ratio=ratio, world=world, count=len(model._xyz),
                  xyz_sha256=xyz_digest(model._xyz), log_scale_cap=cap)
+    if offset_policy is not None:
+        from utils.lidar_offsets import initialize as initialize_offsets
+        # Capture the native initial KNN sigma before any cap relaxation or projection.
+        state['position_offsets']=initialize_offsets(model,offset_policy)
     if mode in ('regularize', 'hybrid'):
         state.update(scale_control=mode, scale_regularization_weight=weight)
     if mode == 'hybrid':
@@ -90,6 +97,9 @@ def project_scales(model, chunk=1048576, *, initializing=False):
         return
     if len(model._xyz) != state['count']:
         raise RuntimeError('Fixed LiDAR population changed')
+    if state.get('position_offsets') is not None:
+        from utils.lidar_offsets import project
+        project(model,chunk)
     if state.get('scale_control', 'clamp') == 'regularize' and not initializing:
         return  # No training-time projection or Adam moment reset in this mode.
     momentum = model.optimizer.state.get(model._scaling, {}) if model.optimizer else {}
@@ -100,7 +110,7 @@ def project_scales(model, chunk=1048576, *, initializing=False):
         torch.minimum(scale, cap, out=scale)
         # Clear both moments on projected axes so stale Adam momentum cannot
         # repeatedly push outward or delay later contraction. Other axes retain
-        # their optimizer state. No XYZ optimizer state is ever accumulated.
+        # their optimizer state. Optional bounded XYZ has a separate projection.
         for key in ('exp_avg', 'exp_avg_sq', 'max_exp_avg_sq'):
             if key in momentum:
                 momentum[key][part].masked_fill_(exceeded, 0.)
@@ -144,7 +154,12 @@ def added_scale_gradient_stats(model, sample):
 @torch.no_grad()
 def audit(model, iteration):
     state = model.fixed_lidar_state
-    same = len(model._xyz) == state['count'] and xyz_digest(model._xyz) == state['xyz_sha256']
+    offsets={}
+    if state.get('position_offsets') is not None:
+        from utils.lidar_offsets import audit as audit_offsets
+        offsets=audit_offsets(model)
+    same = len(model._xyz) == state['count'] and (offsets.get('anchors_unchanged',False)
+        if offsets else xyz_digest(model._xyz) == state['xyz_sha256'])
     finite = bool(torch.isfinite(model._scaling).all() and torch.isfinite(model.get_scaling).all())
     within = bool((model._scaling <= state['log_scale_cap']).all())
     mode = state.get('scale_control', 'clamp')
@@ -156,6 +171,7 @@ def audit(model, iteration):
                 above_target_fraction=float((model._scaling > state.get('log_scale_target', state['log_scale_cap'])).any(1).float().mean()),
                 at_cap_fraction=float((model._scaling >= state['log_scale_cap']-1e-6).any(1).float().mean()),
                 largest_sigma=float(model.get_scaling.max()))
+    result.update(offsets)
     if mode == 'hybrid':
         from utils.local_scale import audit as local_audit
         result.update(local_audit(model))

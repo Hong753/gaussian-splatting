@@ -135,7 +135,8 @@ class GaussianModel:
         self.optimizer.load_state_dict(opt_dict)
         if self.fixed_lidar_state is not None:
             from utils.fixed_lidar import audit, project_scales
-            self.optimizer.state.pop(self._xyz, None)
+            if self.fixed_lidar_state.get('position_offsets') is None:
+                self.optimizer.state.pop(self._xyz, None)
             project_scales(self)
             audit(self, 0)
         if self.discrete_lidar_state is not None:
@@ -299,6 +300,8 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         fixed = bool(getattr(training_args, 'fixed_lidar', False))
+        from utils.lidar_offsets import requested as requested_offsets
+        offset_policy=requested_offsets(training_args)
         if getattr(training_args,'pose_refinement','') and (not fixed or getattr(training_args,'scale_control','')!='hybrid'):
             raise ValueError('Pose refinement requires fixed LiDAR local-scale training')
         if getattr(training_args, 'local_scale_schedule', '') and not fixed:
@@ -322,7 +325,7 @@ class GaussianModel:
                 self.fixed_lidar_state = initialize(self, training_args.max_scale_ratio, training_args.max_scale_world,
                                                    mode, weight, getattr(training_args, 'local_scale_cache', ''),
                                                    getattr(training_args,'local_scale_ceiling_multiplier',1.),
-                                                   getattr(training_args,'local_scale_target_multiplier',1.))
+                                                   getattr(training_args,'local_scale_target_multiplier',1.),offset_policy)
             elif (self.fixed_lidar_state['ratio'], self.fixed_lidar_state['world']) != (
                     training_args.max_scale_ratio, training_args.max_scale_world):
                 raise ValueError('Checkpoint scale limits differ from requested limits')
@@ -338,7 +341,10 @@ class GaussianModel:
                 attach_audit(self, training_args.local_scale_cache)
             from utils.distance_updates import bind_policy
             bind_policy(self, training_args, fresh=fresh_fixed)
-            self._xyz.requires_grad_(False)
+            from utils.lidar_offsets import bind as bind_offsets, state as offset_state
+            bind_offsets(self,training_args)
+            offsets=offset_state(self)
+            self._xyz.requires_grad_(offsets is not None and offsets['iteration']>offsets['policy']['warmup'])
             self._xyz.grad = None
         self.surface_mode = training_args.surface_mode
         if self.surface_mode == 'view_tangent':
@@ -377,6 +383,9 @@ class GaussianModel:
             bind(self, training_args, fresh=fresh_fixed)
             from utils.fixed_lidar import project_scales
             project_scales(self, initializing=fresh_fixed)
+            if offset_state(self) is not None:
+                from utils.lidar_offsets import update as update_offsets
+                update_offsets(self,offset_state(self)['iteration'])
 
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
@@ -399,6 +408,9 @@ class GaussianModel:
 
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "xyz":
+                if (self.fixed_lidar_state or {}).get('position_offsets') is not None:
+                    from utils.lidar_offsets import update as update_offsets
+                    return update_offsets(self,iteration)
                 if self.fixed_lidar_state is not None or self.discrete_lidar_state is not None:
                     param_group['lr'] = 0.
                     return 0.

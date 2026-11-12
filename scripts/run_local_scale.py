@@ -28,6 +28,7 @@ def parser():
     p.add_argument('--reuse-cache',type=Path,help='Reuse original 1x KNN bounds; rebuild overlap audit at the new ceilings')
     p.add_argument('--training-schedule',type=json.loads,help='Explicit JSON cap/LR policy; tune_local_scale.py constructs it')
     p.add_argument('--pose-policy',type=json.loads,help='Optional bounded train-camera refinement policy')
+    p.add_argument('--lidar-offset-policy',type=json.loads,help='Bounded displacement from each original LiDAR row')
     return p
 
 
@@ -69,6 +70,14 @@ def build_plan(args):
         policy=validate_pose(args.pose_policy,args.iterations)
         plan['pose_refinement']=policy
         plan['stages'][0]['argv'] += ['--pose_refinement',json.dumps(policy,sort_keys=True)]
+    if getattr(args,'lidar_offset_policy',None) is not None:
+        from utils.lidar_offsets import validate as validate_offsets
+        if getattr(args,'pose_policy',None) is None:
+            raise ValueError('LiDAR offset experiment requires alternating pose refinement')
+        policy=validate_offsets(args.lidar_offset_policy,args.iterations)
+        plan['lidar_offsets']=policy
+        plan['positions']='bounded displacement from immutable original LiDAR rows; no population changes'
+        plan['stages'][0]['argv'] += ['--lidar_offsets',json.dumps(policy,sort_keys=True)]
     return plan
 
 
@@ -97,13 +106,17 @@ def execute_plan(args, plan):
     if getattr(args,'training_schedule',None) is not None:
         smoke += ['--training-schedule',json.dumps(args.training_schedule,sort_keys=True)]
     invoke(smoke)
+    if getattr(args,'lidar_offset_policy',None) is not None:
+        invoke(['scripts/smoke_lidar_offsets.py','--gpu',args.gpu,
+                '--output',str(model/'lidar_offsets_cuda_smoke.json')])
     from utils.local_scale import prepare as prepare_cache
     data = prepare_cache(args.point_cloud, plan['local_scale_cache'], neighbors=args.neighbors,
         support_sigma=args.support_sigma, overlap_factor=args.overlap_factor,
         ratio=args.max_scale_ratio, world=args.max_scale_world,
         samples=args.audit_samples, pair_budget=args.audit_pair_budget, workers=args.cache_workers,
         ceiling_multiplier=getattr(args,'ceiling_multiplier',1.),target_multiplier=getattr(args,'target_multiplier',1.),
-        reuse_cache=getattr(args,'reuse_cache',None))
+        reuse_cache=getattr(args,'reuse_cache',None),
+        position_padding=(getattr(args,'lidar_offset_policy',None) or {}).get('max_world',0.))
     from utils.checkpoint_snapshots import atomic_json
     atomic_json(model/'local_scale_initialization.json', data)
     return run_fixed_lidar.execute_plan(args, plan, smoke=False)

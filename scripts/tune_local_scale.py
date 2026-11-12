@@ -32,6 +32,14 @@ def schedule_arguments(parser):
     parser.add_argument('--pose-rotation-lr',type=float,default=.0002)
     parser.add_argument('--pose-prior-weight',type=float,default=.001)
     parser.add_argument('--pose-max-width',type=int,default=960)
+    parser.add_argument('--lidar-offsets',action='store_true')
+    parser.add_argument('--offset-max-world',type=float,default=.005)
+    parser.add_argument('--offset-sigma-ratio',type=float,default=.25)
+    parser.add_argument('--offset-warmup',type=int,default=7000)
+    parser.add_argument('--offset-ramp',type=int,default=2000)
+    parser.add_argument('--offset-lr-init',type=float,default=1e-5)
+    parser.add_argument('--offset-lr-final',type=float,default=1e-6)
+    parser.add_argument('--offset-prior-weight',type=float,default=.001)
 
 
 def requested_schedule(args):
@@ -108,10 +116,16 @@ def prepare(argv):
     args.target_multiplier=request.target_multiplier
     args.training_schedule=schedule
     args.pose_policy=None
+    args.lidar_offset_policy=None
     if request.pose_refinement:
         from utils.pose_refinement import DEFAULTS, validate as validate_pose
         args.pose_policy=validate_pose({**DEFAULTS,**{key:getattr(request,'pose_'+key) for key in
             ('start','end','every','max_translation','max_rotation_degrees','translation_lr','rotation_lr','prior_weight','max_width')}},request.iterations)
+    if request.lidar_offsets:
+        from utils.lidar_offsets import DEFAULTS as OFFSET_DEFAULTS, validate as validate_offsets
+        args.lidar_offset_policy=validate_offsets({**OFFSET_DEFAULTS,'end':request.iterations,
+            **{key:getattr(request,'offset_'+key) for key in
+               ('max_world','sigma_ratio','warmup','ramp','lr_init','lr_final','prior_weight')}},request.iterations)
     args.reuse_cache=Path(old['plan']['local_scale_cache'])
     args.local_scale_cache=request.model/'local_scale_cache'
     for name in ('source','model','baseline','keyframes','point_cloud','reuse_cache','local_scale_cache'):
@@ -133,6 +147,7 @@ def prepare(argv):
             prior_args=dict(existing['training_args'])
             prior_args.setdefault('training_schedule',None)
             prior_args.setdefault('pose_policy',None)
+            prior_args.setdefault('lidar_offset_policy',None)
             if existing['plan'] != plan or prior_args != serialized:
                 raise ValueError('Prepared tuning run differs; use a fresh model directory')
             state_path=folder/'training.json'

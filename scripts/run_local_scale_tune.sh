@@ -51,6 +51,18 @@ if [[ "${LOCAL_SCALE_TUNE_POSES:-0}" == 1 ]]; then
     --pose-rotation-lr "${POSE_REFINE_ROTATION_LR:-0.0002}"
     --pose-prior-weight "${POSE_REFINE_PRIOR_WEIGHT:-0.001}" --pose-max-width "${POSE_REFINE_MAX_WIDTH:-960}")
 fi
+if [[ "${LOCAL_SCALE_TUNE_OFFSETS:-0}" == 1 ]]; then
+  if [[ "${LOCAL_SCALE_TUNE_POSES:-0}" != 1 ]]; then
+    echo 'Bounded LiDAR offsets require the alternating-pose experiment.' >&2
+    exit 2
+  fi
+  tune_schedule_args+=(--lidar-offsets
+    --offset-max-world "${LIDAR_OFFSET_MAX_WORLD:-0.005}"
+    --offset-sigma-ratio "${LIDAR_OFFSET_SIGMA_RATIO:-0.25}"
+    --offset-warmup "${LIDAR_OFFSET_WARMUP:-7000}" --offset-ramp "${LIDAR_OFFSET_RAMP:-2000}"
+    --offset-lr-init "${LIDAR_OFFSET_LR_INIT:-0.00001}" --offset-lr-final "${LIDAR_OFFSET_LR_FINAL:-0.000001}"
+    --offset-prior-weight "${LIDAR_OFFSET_PRIOR_WEIGHT:-0.001}")
+fi
 python -u scripts/tune_local_scale.py --model "$tune_reference"
 python -u scripts/tune_local_scale.py prepare \
   --reference-model "$tune_reference" --model "$tune_model" --gpu "$tune_gpu" \

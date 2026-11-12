@@ -169,7 +169,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
               'original camera data is read-only; checkpoint poses are cached in poses.json.')
     if opt.fixed_lidar:
         audit_fixed_lidar(gaussians, first_iter)
-        print(f'Fixed LiDAR: {len(gaussians.get_xyz):,} immutable centers; no cloning, splitting, pruning or opacity resets.')
+        if gaussians.fixed_lidar_state.get('position_offsets') is not None:
+            print(f'Bounded LiDAR offsets: {len(gaussians.get_xyz):,} original anchors; '
+                  'no cloning, splitting, pruning or opacity resets. Absolute XYZ LR without scene-extent scaling.')
+            print(json.dumps(gaussians.fixed_lidar_state['position_offsets']['policy'],indent=2))
+        else:
+            print(f'Fixed LiDAR: {len(gaussians.get_xyz):,} immutable centers; no cloning, splitting, pruning or opacity resets.')
         if opt.scale_control == 'hybrid':
             cfg = gaussians.local_scale_audit['metadata']['config']
             print(f'Local scale: base sigma ceiling = min({opt.max_scale_ratio:g} * initial KNN sigma, '
@@ -342,6 +347,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     scale_stats.update(schedule_stats(gaussians))
             loss = loss.detach() + scale_loss.detach()
             del scale_loss
+        if getattr(opt,'lidar_offsets',''):
+            from utils.lidar_offsets import regularization as offset_regularization
+            offset_loss=offset_regularization(gaussians)
+            if offset_loss.requires_grad:
+                offset_loss.backward()
+            if scale_stats is not None:
+                scale_stats['lidar_offset_loss']=float(offset_loss.detach())
+            loss=loss.detach()+offset_loss.detach()
+            del offset_loss
         soft_stats = None
         if soft_regularizer is not None:
             gradient_sample = None
@@ -379,7 +393,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     progress['scale reg'] = f"{scale_stats['scale_regularization_loss']:.3g}"
                 if opt.lidar_depth_weight > 0:
                     progress["LiDAR"] = f"{ema_lidar_for_log:.{7}f}"
-                if opt.position_warmup_steps or opt.position_ramp_steps:
+                if opt.position_warmup_steps or opt.position_ramp_steps or getattr(opt,'lidar_offsets',''):
                     progress["xyz lr"] = f"{position_lr:.2e}"
                 if 'occlusion_culled' in render_pkg:
                     progress['ray-blocked'] = f"{100*render_pkg['occlusion_culled'].float().mean().item():.1f}%"

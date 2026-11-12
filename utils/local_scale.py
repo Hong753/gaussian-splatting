@@ -63,7 +63,7 @@ def metadata(directory, verify=True):
 
 def prepare(point_cloud, directory, *, neighbors=10, support_sigma=3., overlap_factor=2.,
             ratio=1., world=.015, samples=2048, pair_budget=2000000, workers=8, chunk=65536,
-            ceiling_multiplier=1., target_multiplier=1., reuse_cache=None):
+            ceiling_multiplier=1., target_multiplier=1., reuse_cache=None, position_padding=0.):
     import fcntl
     from plyfile import PlyData
     from scipy.spatial import cKDTree
@@ -72,6 +72,8 @@ def prepare(point_cloud, directory, *, neighbors=10, support_sigma=3., overlap_f
         raise ValueError('Local scale multipliers must be positive and finite')
     if chunk < 1:
         raise ValueError('Local-scale query chunk must be positive')
+    if not math.isfinite(position_padding) or position_padding < 0:
+        raise ValueError('Position padding must be finite and nonnegative')
     point_cloud, directory = Path(point_cloud).expanduser().resolve(), Path(directory).expanduser().resolve()
     directory.mkdir(parents=True, exist_ok=True)
     with (directory/'.prepare.lock').open('a') as lock:
@@ -81,6 +83,8 @@ def prepare(point_cloud, directory, *, neighbors=10, support_sigma=3., overlap_f
         # Omit identity defaults to keep existing 1x caches/plans compatible.
         if ceiling_multiplier != 1. or target_multiplier != 1.:
             config.update(ceiling_multiplier=ceiling_multiplier,target_multiplier=target_multiplier)
+        if position_padding:
+            config['position_padding']=position_padding
         if (directory/'metadata.json').is_file():
             old = metadata(directory)
             if old['config'] != config:
@@ -140,7 +144,8 @@ def prepare(point_cloud, directory, *, neighbors=10, support_sigma=3., overlap_f
         omitted, pairs = 0, 0
         max_radius = support_sigma*float(cap.max())
         for query_id in proposed:
-            radius = support_sigma*float(cap[query_id])+max_radius
+            # Both centers may move toward one another within their anchor balls.
+            radius = support_sigma*float(cap[query_id])+max_radius+2*position_padding
             radius = radius*(1+1e-5)
             candidate_count = tree.query_ball_point(xyz[query_id], radius, return_length=True)
             if candidate_count > max(250000, pair_budget):
@@ -149,7 +154,7 @@ def prepare(point_cloud, directory, *, neighbors=10, support_sigma=3., overlap_f
             candidates = np.asarray(tree.query_ball_point(xyz[query_id], radius), dtype=np.int64)
             candidates = candidates[candidates != query_id]
             delta = xyz[candidates].astype(np.float64)-xyz[query_id].astype(np.float64)
-            limit = support_sigma*(cap[query_id].astype(np.float64)+cap[candidates].astype(np.float64))
+            limit = support_sigma*(cap[query_id].astype(np.float64)+cap[candidates].astype(np.float64))+2*position_padding
             candidates = candidates[np.einsum('ij,ij->i', delta, delta) <= (limit*(1+1e-5))**2]
             if pairs+len(candidates) > pair_budget:
                 omitted += 1

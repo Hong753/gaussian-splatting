@@ -1878,3 +1878,79 @@ crops. Defaults can be changed for a fresh trial with `POSE_REFINE_START`,
 `POSE_REFINE_MAX_ROTATION_DEGREES`, `POSE_REFINE_TRANSLATION_LR`,
 `POSE_REFINE_ROTATION_LR`, `POSE_REFINE_PRIOR_WEIGHT`, and `POSE_REFINE_MAX_WIDTH`.
 The existing `LOCAL_SCALE_TUNE_*` schedule controls remain available.
+
+### GPU 2: larger scales and bounded LiDAR offsets with alternating poses
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_pose_lidar_offsets.sh 2
+```
+
+This fresh experiment uses the same input points and stride-3 keyframes as the
+fourth run, with the camera-pose alternation above. It requires GPU 2 to be free;
+the training process and independent all-frame evaluator then share GPU 2.
+The default output is
+`/data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_offsets_cap2.5_poses_30000_v1`.
+
+- **Scale allowance:** ramp the hard ceiling from 1x to **2.5x** over 7k–20k,
+  instead of the pose-only experiment's 2x. This is 25% more final allowance.
+  The original per-point KNN ceiling still applies, multiplied by 2.5; the
+  absolute maximum principal-axis sigma is `0.015 * 2.5 = 0.0375` scene units.
+  This is 3.75 cm if the LiDAR coordinates are meters, not the splat diameter.
+  Initialization and the 1x soft scale target are unchanged. Scales grow only
+  through optimization; increasing a ceiling does not enlarge them directly.
+- **Position allowance:** for each original input row `p_i`, keep an immutable
+  anchor and a fixed radius `r_i = min(0.005, 0.25 * sigma_init_i)`, using the
+  native initial KNN RMS sigma before scale clamping. Enforce the Euclidean
+  bound `||xyz_i - p_i|| <= r_i` after every Gaussian update and before export.
+  The limit is total displacement from the original row, never per-step drift
+  or independent per-axis clipping. There is no reassignment to another point.
+- **Position schedule:** XYZ stays frozen through 7k, with no XYZ Adam moments.
+  A cosine ramp raises its LR from zero to `1e-5` by 9k; exponential decay then
+  lowers it to `1e-6` at 30k. These are absolute scene-unit learning rates;
+  **there is no scene-extent multiplier**. A weak anchor prior adds
+  `0.001 * mean_i(||(xyz_i - p_i)/r_i||^2)` to Gaussian updates. It helps resist
+  joint drift of camera poses and the point cloud.
+- **Alternation:** during 7k–20k, a pose-only step detaches every Gaussian
+  parameter, including its bounded XYZ; the following Gaussian step detaches
+  the corrected camera. Poses freeze after 20k. Scale, appearance, opacity and
+  rotation keep the existing joint LR schedule. Population stays constant:
+  no cloning, splitting, pruning or opacity reset.
+
+Projection clears XYZ Adam moments only for rows that exceeded their radius;
+other rows retain their state. Checkpoints save original anchors, radii, their
+fingerprints, current XYZ, the offset policy/iteration, Gaussian Adam state and
+the separate camera-pose state. Resume rejects changed policies or anchors.
+The ordinary exported PLY contains the learned bounded positions and current
+clamped scales; inference needs no anchor constraints or occluding surfaces.
+Original COLMAP files and input LiDAR remain untouched.
+
+The overlap audit expands its precomputed candidate search by twice the maximum
+offset, so it can account for two centers moving toward each other. Counts use
+current positions; they are not frozen at initialization. The original KNN
+distances remain reusable, while the enlarged candidate lists are cached in
+this experiment's own directory.
+
+The launcher runs the existing pose/scale CUDA checks and
+`scripts/smoke_lidar_offsets.py` before full training. The latter exercises native
+AA with both optimization blocks, frozen-position warmup, finite XYZ gradients,
+per-point projection, selective momentum clearing, checkpoint resume, complete
+sampled overlap counts and PLY export. CPU regression tests validate Adam and
+checkpoint invariants but do not replace these native CUDA checks.
+
+Every 10k steps, the parallel evaluator computes PSNR over **all 5,009 frames**
+and writes sampled GT/render/error galleries, with the same original-pose and
+cached-refined-pose protocols described above. `fixed_lidar_training.jsonl` now
+records `positions_within_bounds`, `anchors_unchanged`, `offset_max`,
+`offset_mean`, `offset_near_bound_fraction` and `offset_xyz_lr`; actual
+`positions_unchanged` becomes false after positions learn. The offset prior loss
+is logged alongside the scale penalty. A nonzero offset is not an audit failure.
+
+Optional overrides for a fresh output directory: `LIDAR_OFFSET_MAX_WORLD`,
+`LIDAR_OFFSET_SIGMA_RATIO`, `LIDAR_OFFSET_WARMUP`, `LIDAR_OFFSET_RAMP`,
+`LIDAR_OFFSET_LR_INIT`, `LIDAR_OFFSET_LR_FINAL`, `LIDAR_OFFSET_PRIOR_WEIGHT`.
+Scale and pose overrides remain the `LOCAL_SCALE_TUNE_*` / `POSE_REFINE_*`
+variables above. Changing settings requires a new `LOCAL_SCALE_TUNE_MODEL`.
