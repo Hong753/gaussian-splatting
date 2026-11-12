@@ -38,6 +38,37 @@ def ramp(iteration, start, steps):
     return min(1., max(0., (iteration-start)/max(1, steps)))
 
 
+def sample_rgb_gradients(gaussians, visible, limit=2048):
+    """Small deterministic sample for auditing the added regularizer gradient.
+
+    Do not draw random samples: diagnostics must not change the training RNG.
+    """
+    import torch
+    indices = visible.reshape(-1)
+    if indices.dtype == torch.bool:
+        indices = indices.nonzero().reshape(-1)
+    indices = indices[::max(1, math.ceil(len(indices)/limit))]
+    saved = {}
+    for name in ('opacity', 'xyz'):
+        parameter = getattr(gaussians, '_'+name)
+        saved[name] = (parameter.grad[indices].detach().clone() if parameter.grad is not None
+                       else torch.zeros_like(parameter[indices]))
+    return indices, saved
+
+
+def added_gradient_stats(gaussians, sample):
+    import torch
+    indices, before = sample
+    stats = dict(gradient_sample_count=len(indices))
+    for name, rgb in before.items():
+        parameter = getattr(gaussians, '_'+name)
+        after = parameter.grad[indices].detach() if parameter.grad is not None else torch.zeros_like(rgb)
+        rgb_norm, soft_norm = rgb.norm().item(), (after-rgb).norm().item()
+        stats.update({f'rgb_{name}_grad_norm': rgb_norm, f'soft_{name}_grad_norm': soft_norm,
+                      f'soft_to_rgb_{name}_grad_ratio': soft_norm/rgb_norm if rgb_norm > 0 else None})
+    return stats
+
+
 def surface_opacity_loss(opacity, valid, target):
     """Reward surface compositing weight only at supported reference pixels."""
     import torch

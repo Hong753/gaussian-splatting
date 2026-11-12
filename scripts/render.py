@@ -52,6 +52,8 @@ def main(argv=None):
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--max-views", type=int, default=0, help="0: all views; otherwise evenly spaced")
+    parser.add_argument('--eval-set', choices=('saved', 'unselected'), default='saved',
+                        help='unselected: preview frames outside the training manifest, including when --eval was disabled')
     parser.add_argument("--antialiasing", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--in-process", action="store_true", help="Render one model directly, without a Python worker process")
@@ -67,6 +69,9 @@ def main(argv=None):
         if args.in_process and len(paths) != 1:
             raise ValueError("--in-process requires exactly one model")
         specs = [apply_overrides(model_info(p), args) for p in paths]
+        if args.eval_set == 'unselected':
+            for spec in specs:
+                spec['splits']['eval'] = spec['splits']['all'] - spec['splits']['train']
         if args.in_process:
             os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
             meta = specs[0].get("metadata", {})
@@ -150,6 +155,7 @@ def main(argv=None):
                         print(f"{spec['path'].name}: {summary['counts']} frames; PSNR {summary['mean_psnr_db']}", flush=True)
             write_gallery(folder, f"{split_name.title()} views · iteration {iteration}", rows, models,
                           dict(split=split_name, total_shared_views=total, rendered_views=len(names),
+                               eval_set=args.eval_set,
                                excluded_nonshared_views=[len(s)-total for s in sets],
                                pose_protocol="each model's saved source calibration",
                                exposure_protocol="base appearance, no per-image exposure",

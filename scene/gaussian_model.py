@@ -584,7 +584,8 @@ class GaussianModel:
                             if self.surface_refs is not None else None)
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_surface_refs)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, max_grad_abs=None):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, max_grad_abs=None,
+                         record_stats=False):
         if self.surface_mode == 'view_tangent':
             return self.densify_view_tangent(max_grad, min_opacity, extent, max_screen_size, radii)
         grads = self.xyz_gradient_accum / self.denom
@@ -597,9 +598,16 @@ class GaussianModel:
         else:
             split_grads, split_threshold = clone_grads, max_grad
 
+        if record_stats:
+            from utils.densification_diagnostics import growth_window_stats
+            stats = growth_window_stats(self.get_scaling, clone_grads, split_grads, self.max_radii2D,
+                                        extent, self.percent_dense, max_grad, split_threshold)
+            stats['points_before'] = len(self._xyz)
         self.tmp_radii = radii
         self.densify_and_clone(clone_grads, max_grad, extent)
+        if record_stats: after_clone = len(self._xyz)
         self.densify_and_split(split_grads, split_threshold, extent)
+        if record_stats: after_split = len(self._xyz)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
@@ -607,6 +615,10 @@ class GaussianModel:
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
+        if record_stats:
+            self.last_densification_stats = dict(stats, cloned_parents=after_clone-stats['points_before'],
+                split_parents=after_split-after_clone, split_children_per_parent=2,
+                pruned=after_split-len(self._xyz), points_after=len(self._xyz))
         tmp_radii = self.tmp_radii
         self.tmp_radii = None
 

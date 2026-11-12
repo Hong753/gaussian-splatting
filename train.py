@@ -40,7 +40,10 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from,
+             publish_checkpoint_snapshots=False):
+    if publish_checkpoint_snapshots and set(saving_iterations) != set(checkpoint_iterations):
+        raise ValueError('Published snapshots require matching PLY and optimizer checkpoint iterations')
     dataset.antialiasing = pipe.antialiasing
     dataset.optimization_settings = vars(opt).copy()
     from scripts.occlusion_options import configure_pipeline, prepare_training_geometry, inference_pipeline
@@ -257,12 +260,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss.backward()
         soft_stats = None
         if soft_regularizer is not None:
+            gradient_sample = None
+            if iteration == 1 or iteration % 100 == 0:
+                from utils.soft_surface import sample_rgb_gradients, added_gradient_stats
+                gradient_sample = sample_rgb_gradients(gaussians, visibility_filter)
             # Release the RGB backward graph before the auxiliary native CUDA
             # pass. Its geometry is detached; growth still uses RGB gradients.
             soft_loss, soft_stats = soft_regularizer.loss(
                 viewpoint_cam, gaussians, pipe, visibility_filter, iteration)
             if soft_loss.requires_grad:
                 soft_loss.backward()
+            if gradient_sample is not None:
+                soft_stats.update(added_gradient_stats(gaussians, gradient_sample))
+                soft_stats['positions_enabled'] = iteration > opt.position_warmup_steps
             loss = loss.detach() + soft_loss.detach()
             del soft_loss
         if iteration <= opt.position_warmup_steps:
@@ -303,7 +313,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (evaluation_pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp and dataset.eval)
-            if (iteration in saving_iterations):
+            if iteration in saving_iterations and not publish_checkpoint_snapshots:
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
@@ -328,7 +338,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     size_threshold = 20 if phase_iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent,
                                                 size_threshold, radii,
-                                                max_grad_abs=opt.absgs_split_threshold if opt.absgs else None)
+                                                max_grad_abs=opt.absgs_split_threshold if opt.absgs else None,
+                                                record_stats=True)
+                    if opt.surface_mode != 'view_tangent':
+                        import json
+                        growth_stats = dict(iteration=iteration, image=viewpoint_cam.image_name,
+                                            **gaussians.last_densification_stats)
+                        with open(os.path.join(scene.model_path, 'densification.jsonl'), 'a') as stream:
+                            stream.write(json.dumps(growth_stats)+'\n')
                     if opt.surface_mode == 'view_tangent':
                         import json
                         stats = dict(iteration=iteration, **gaussians.last_view_tangent_stats)
@@ -352,11 +369,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     stream.write(json.dumps(stats) + '\n')
                 if tb_writer:
                     for key, value in stats.items():
-                        if key not in ('iteration', 'image'):
+                        if key not in ('iteration', 'image') and value is not None:
                             tb_writer.add_scalar('soft_surface/'+key, value, iteration)
 
             # Optimizer step
-            if iteration < opt.iterations:
+            if iteration < opt.iterations or publish_checkpoint_snapshots:
                 gaussians.exposure_optimizer.step()
                 gaussians.exposure_optimizer.zero_grad(set_to_none = True)
                 if use_sparse_adam:
@@ -371,7 +388,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
-            if (iteration in checkpoint_iterations):
+            if publish_checkpoint_snapshots and iteration in saving_iterations:
+                from utils.checkpoint_snapshots import publish_snapshot
+                print(f'\n[ITER {iteration}] Publishing PLY and optimizer snapshot', flush=True)
+                publish_snapshot(scene, iteration)
+            elif iteration in checkpoint_iterations:
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
@@ -455,6 +476,8 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument('--publish_checkpoint_snapshots', action='store_true',
+                        help='Atomically publish matching post-step PLY and optimizer snapshots for external evaluation')
     args = parser.parse_args(sys.argv[1:])
     if args.model_type != "3dgs":
         parser.error("Use scripts/train.py --model-type scaffold for Scaffold-GS")
@@ -469,7 +492,8 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from,
+             publish_checkpoint_snapshots=args.publish_checkpoint_snapshots)
 
     # All done
     print("\nTraining complete.")

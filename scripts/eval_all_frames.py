@@ -49,6 +49,8 @@ def main():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--iteration", type=int, default=-1, help="Saved iteration, or -1 for latest")
     parser.add_argument("--antialiasing", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--expected-frames', type=int, default=0,
+                        help='Fail unless this many registered images are evaluated (0: no explicit count)')
     add_arguments(parser)
     args = parser.parse_args()
     model, source = args.model.resolve(), args.source.resolve()
@@ -91,6 +93,8 @@ def main():
                      key=lambda camera: camera.image_name)
     if not cameras:
         raise ValueError("No registered COLMAP images found")
+    if args.expected_frames and len(cameras) != args.expected_frames:
+        raise ValueError(f'Expected {args.expected_frames} registered frames, found {len(cameras)}')
     if selected is None:
         if cfg.get("eval", False):
             selected = {camera.image_name for index, camera in enumerate(cameras) if index % 8 != 0}
@@ -173,6 +177,8 @@ def main():
                "training_depth_occlusion_dir": cfg.get("train_depth_occlusion_dir", ""),
                "mean_occlusion_culled_fraction": culled_sum/culled_views if culled_views else None,
                "counts": counts, "mean_psnr_db": means}
+    summary['metric'] = 'mean per-channel PSNR, then arithmetic mean over images'
+    summary['coverage'] = 'all original registered COLMAP frames'
     json_tmp.write_text(json.dumps(summary, indent=2, allow_nan=False) + "\n")
     os.replace(csv_tmp, output / "per_frame.csv")
     os.replace(json_tmp, output / "summary.json")

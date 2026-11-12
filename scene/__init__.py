@@ -89,8 +89,10 @@ class Scene:
             self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent)
 
     def save(self, iteration):
+        from utils.checkpoint_snapshots import atomic_write, atomic_json
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
-        self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+        atomic_write(os.path.join(point_cloud_path, "point_cloud.ply"),
+                     lambda temp: self.gaussians.save_ply(str(temp)))
         if getattr(self.gaussians, "is_scaffold", False):
             self.gaussians.save_mlp_checkpoints(point_cloud_path)
         exposure_dict = {
@@ -98,8 +100,7 @@ class Scene:
             for image_name in self.gaussians.exposure_mapping
         }
 
-        with open(os.path.join(self.model_path, "exposure.json"), "w") as f:
-            json.dump(exposure_dict, f, indent=2)
+        atomic_json(os.path.join(self.model_path, "exposure.json"), exposure_dict)
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]

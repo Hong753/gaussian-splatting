@@ -995,3 +995,136 @@ backward to limit peak graph memory. `soft_surface_training.jsonl` logs surface
 coverage, composited opacity, both losses, normal residuals, position LR and
 Gaussian counts before/after population changes every 100 steps. CUDA smoke
 results are saved as `soft_surface_cuda_smoke.json`.
+
+### Inspect large-scene densification before extending training
+
+`inspect_densification.py` loads the saved native Gaussian model and its LiDAR
+initialization. It reconstructs scene extent from the **selected training camera
+centers**, and shows the actual `percent_dense * scene_extent` threshold. This
+threshold compares a Gaussian's largest **standard deviation**, not its diameter
+or projected radius. Existing saved optimization settings are used; legacy
+configs without `percent_dense` explicitly report the upstream 0.01 assumption.
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh
+conda activate 3dgs
+cd /home/sequor_vfm/gaussian-splatting
+ROOT=/data/3dgs_outputs/orange_4F/1_full
+MODEL="$ROOT/3dgs_stride3_aa_soft_surface_warm7k_lr50_v1"
+python -u scripts/inspect_densification.py \
+  --model "$MODEL" --iteration 30000 --image 06663.jpg \
+  --scene "$ROOT/lidar_scene_surface_v1/scene.json" \
+  --gpu 0 --port 8087 --probe-gradients
+```
+
+Open `http://HOST:8087`. The mesh is optional, initially hidden and visual only;
+all diagnostic renders use native 3DGS + AA with hard culling **off**. LiDAR and
+Gaussian layers have independent controls. Point centers show population and
+size classes; selected 3-sigma ellipsoids show physical covariance extents.
+
+| Color | Meaning |
+|---|---|
+| Orange | CUDA bounding radius above the diagnostic threshold, but world size falls in the clone branch |
+| Magenta | Large CUDA radius and world size falls in the split branch |
+| Teal | Smaller projected footprint |
+| Gray | No native raster footprint for this image |
+
+The initial screen-radius threshold is 20 pixels; changing it changes only the
+diagnostic. Set a normalized ROI with left/top/right/bottom controls and press
+**Analyze selected region**. Counts include every Gaussian whose native bounding
+footprint overlaps the crop. The contribution panel is a separate native CUDA
+pass: class tags replace color, while every Gaussian remains in ordinary alpha
+compositing. Its orange intensity and reported mass fraction therefore measure
+actual image contribution; many large points hidden behind a wall can have a
+large count but negligible weight. These are not culling colors.
+
+The 250k point display cap and 100 ellipsoid cap do not affect any statistics or
+renders. `--max-points 0` displays every point; that can be expensive in a browser.
+`--probe-gradients` additionally computes the current image's photometric screen
+gradient. A PLY does **not** retain accumulated gradients or historical clone/split
+events, so size membership alone never establishes that a clone actually occurred.
+The viewer reports whether the densification window had already ended.
+
+**Export this diagnostic and ZIP** saves GT, render, error, contribution and
+footprint PNGs, `summary.json`, the 1,000 largest ROI footprints as CSV, and
+`MODEL/densification_inspection/iteration_30000/densification_debug.zip`.
+Use `--export-only` for the same outputs without starting Viser. The archive
+contains the most recently exported view/ROI. Checkpoint and configuration hashes
+identify exactly what was inspected. To compare the baseline, rerun with its
+model path at the same iteration, image and ROI.
+
+Future native training runs also write **actual** growth events to
+`densification.jsonl`: clone/split parent counts, pruning/population changes,
+world-size cutoff, and how many eligible parents exceeded a 20-pixel radius in
+the accumulated window. Logging does not alter selection, splitting, cloning,
+opacity resets, learning rates or pruning. Existing PLYs cannot reconstruct this
+history. Large footprints are not inherently wrong on smooth regions; inspect
+their contribution and residuals on texture-rich surfaces before changing policy.
+
+### Prepared 100k soft-surface run with parallel evaluation
+
+Inspect the above diagnostics first. When ready, the longer-run launcher is:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh
+conda activate 3dgs
+cd /home/sequor_vfm/gaussian-splatting
+bash scripts/run_soft_surface_long.sh 0
+```
+
+This starts fresh LiDAR initialization in
+`3dgs_stride3_aa_soft_surface_warm7k_lr50_100k_v1`. It keeps the soft objective,
+7k fixed-position warmup, 2k ramp, 50x reduced position LR endpoints, 21k decay
+duration and original 7,600–21,900 densification window. Position LR reaches its
+floor at 30k and remains there; steps 30k–100k are additional refinement.
+It does not claim to fix a splitting bottleneck. Both training and inference use
+ordinary compositing, and inference needs no occluding surface.
+
+Two independent Python processes run on the same selected GPU. Training publishes
+PLY and optimizer checkpoints **after the same optimizer step** at 10k, 20k, ...,
+100k. A `ready.json` marker is written only after both files are closed and hashed;
+the worker never treats a partial PLY as a job. No inline validation blocks training,
+although saving still pauses it for serialization and disk I/O. All ten optimizer
+checkpoints are retained and can be large. Native `train.py --start_checkpoint`
+accepts the saved `chkpntN.pth` files; the wrapper intentionally refuses to overwrite
+an existing experiment.
+
+The single evaluator processes all published checkpoints in order, streaming all
+**5,009 original frames** at the saved resolution. It verifies exact frame and
+training-split membership and reports all/selected/unselected mean per-channel
+PSNR. It also calls `scripts/render.py --split both --eval-set unselected` for
+64 sampled training and 64 sampled non-training GT/render/error comparisons.
+These sampled galleries are not used to calculate full-trajectory PSNR.
+
+Outputs under the new model:
+
+- `point_cloud/iteration_N/point_cloud.ply`, `ready.json`, and `chkpntN.pth`.
+- `psnr_all_frames/iteration_N/{summary.json,per_frame.csv}`.
+- `view_comparisons/iteration_N/index.html` and images.
+- `periodic_evaluation/{history.csv,history.json,index.html}` for the learning curve.
+- `periodic_evaluation/{training.json,worker.json,evaluator.log}` and `training.log`.
+- `soft_surface_training.jsonl` additionally logs sampled RGB/soft gradient norms
+  and ratios every 100 steps. Sampling is deterministic and does not perturb RNG.
+
+Evaluation shares compute and VRAM with training. Its default PyTorch allocation
+cap is 20% of the GPU, not a reservation. If an evaluation OOMs while training is
+active, it releases temporary allocations and retries the same queued checkpoint;
+it never launches overlapping evaluators or silently skips snapshots. It can fall
+behind training. After training ends the shell waits for the queue to finish. A
+remaining error is reported as incomplete, not a successful 100k evaluation.
+
+Restart only the evaluator, skipping results with verified checkpoint/output hashes:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh
+conda activate 3dgs
+python -u scripts/run_soft_surface_long.py watch --model "$MODEL"
+# If training has finished and the evaluator's cap was too small:
+python -u scripts/run_soft_surface_long.py watch --model "$MODEL" --eval-memory-fraction 0.8
+```
+
+Here `MODEL` must point to the new 100k experiment. Its plan fixes the GPU and frame
+list. `SOFT_SURFACE_MODEL`, `SOFT_SURFACE_SOURCE`, `SOFT_SURFACE_BASELINE`,
+`SOFT_SURFACE_SCENE` and `SOFT_SURFACE_OUTPUT_ROOT` override wrapper paths.
+`SOFT_SURFACE_EVAL_MEMORY_FRACTION` and `SOFT_SURFACE_REPORT_MAX_VIEWS` set worker
+limits. The launcher never assumes a nonexistent 100k baseline checkpoint.

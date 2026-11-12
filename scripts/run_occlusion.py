@@ -24,6 +24,10 @@ def parser(*, depth_maps=False):
     p.add_argument('--video-output', type=Path, help='Comparison video root; defaults to MODEL/comparisons')
     p.add_argument('--gpu', default='0')
     p.add_argument('--iterations', type=int, default=30000)
+    p.add_argument('--checkpoint-every', type=int, default=0,
+                   help='Publish coherent PLY + optimizer snapshots every N steps (0: legacy saves)')
+    p.add_argument('--training-only', action='store_true',
+                   help='External checkpoint worker handles evaluation; disable inline evaluation and videos')
     p.add_argument('--resolution', type=int, default=-1)
     if depth_maps:
         p.set_defaults(voxel_size=.05, max_radius=.1)
@@ -111,9 +115,11 @@ def build_plan(args):
     source, model = args.source.expanduser().resolve(), args.model.expanduser().resolve()
     colmap_model_dir(source)
     validate_build(args.voxel_size, args.max_radius, 24, .6)
-    if (args.iterations < 1 or args.report_max_views < 1 or args.resolution == 0 or args.resolution < -1 or
+    if (args.iterations < 1 or args.checkpoint_every < 0 or args.report_max_views < 1 or args.resolution == 0 or args.resolution < -1 or
             not math.isfinite(args.margin) or args.margin < 0):
         raise ValueError('Invalid iterations, report limit, resolution or margin')
+    if args.training_only and args.evaluate_only:
+        raise ValueError('--training-only and --evaluate-only are mutually exclusive')
     if args.keyframes and not args.keyframes.expanduser().is_file():
         raise FileNotFoundError(args.keyframes)
     if not args.evaluate_only and any((model/'point_cloud').glob('iteration_*/point_cloud.ply')):
@@ -140,14 +146,18 @@ def build_plan(args):
         inference_mode = 'off'
     inference_mode = inference_mode or 'saved'
     steps = sorted(set(i for i in (7000, args.iterations) if i <= args.iterations))
+    if args.checkpoint_every:
+        steps = sorted(set(range(args.checkpoint_every, args.iterations+1, args.checkpoint_every)) | {args.iterations})
     train = ['train.py', '-s', str(source), '-m', str(model), '--iterations', str(args.iterations),
              '--resolution', str(args.resolution), '--data_device', 'cpu', '--disable_viewer', '--antialiasing',
              '--keyframe_manifest', str(model/'keyframes.json'), '--occlusion_mode', 'lidar',
              '--occlusion_voxel_size', str(args.voxel_size), '--occlusion_max_radius', str(args.max_radius),
              '--occlusion_margin', str(args.margin), '--occlusion_backend', backend,
              '--occlusion_inference_mode', inference_mode,
-             '--test_iterations', *map(str, steps),
+             '--test_iterations', *map(str, [-1] if args.training_only else steps),
              '--save_iterations', *map(str, steps)]
+    if args.checkpoint_every:
+        train += ['--checkpoint_iterations', *map(str, steps), '--publish_checkpoint_snapshots']
     scene_geometry = getattr(args, 'scene_geometry', None)
     soft_options = {}
     if soft_surface:
@@ -207,6 +217,10 @@ def build_plan(args):
         for key, value in tangent_options.items():
             train += ['--'+key, str(value)]
     stages = [] if args.evaluate_only else preparation_stages + [dict(name='train', argv=train)]
+    if args.training_only:
+        return dict(source=str(source), model=str(model), gpu=args.gpu, training_schedule=schedule,
+                    view_tangent_options=tangent_options, soft_surface_options=soft_options,
+                    inference_occlusion=inference_mode, stages=stages)
     geometry, cache = str(model/'occlusion_geometry.npz'), str(model/'occlusion_depth_cache')
     if scene_geometry:
         geometry, cache = str(scene_geometry.resolve()), str(scene_geometry.resolve().parent/'occlusion_depth_cache')
@@ -286,6 +300,11 @@ def main(argv=None, argument_parser=None):
     if args.dry_run:
         print(json.dumps(plan, indent=2))
         return 0
+    return execute_plan(args, plan)
+
+
+def execute_plan(args, plan):
+    """Run a validated plan in this process (also used by the periodic launcher)."""
     print('Position/densification schedule (LR endpoints before scene-extent scaling):\n' +
           json.dumps(plan['training_schedule'], indent=2), flush=True)
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
