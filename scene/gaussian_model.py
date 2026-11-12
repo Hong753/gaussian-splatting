@@ -61,6 +61,8 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
         self.optimizer = None
+        # Fresh checkpoint restores and PLY-only loads can bypass create_from_pcd.
+        self.pretrained_exposures = None
         self.percent_dense = 0
         self.use_absgs = False
         self.surface_mode = "off"

@@ -31,10 +31,10 @@ class LidarOffsetTests(unittest.TestCase):
         self.opt.iterations=8
         self.opt.pose_refinement=json.dumps(self.pose_policy)
         self.opt.lidar_offsets=json.dumps(self.policy)
-        self.opt.local_scale_ceiling_multiplier=2.5
+        self.opt.local_scale_ceiling_multiplier=5.
         padded=self.root/'padded'
         with contextlib.redirect_stdout(io.StringIO()):
-            prepare(self.cloud,padded,workers=1,samples=25,ceiling_multiplier=2.5,
+            prepare(self.cloud,padded,workers=1,samples=25,ceiling_multiplier=5.,
                     reuse_cache=self.cache,position_padding=.005)
         self.opt.local_scale_cache=str(padded)
         source=self.root/'source/sparse/0';source.mkdir(parents=True)
@@ -103,7 +103,10 @@ class LidarOffsetTests(unittest.TestCase):
         m=self.model()
         for i in range(1,5): self.step(m,i)
         buf=io.BytesIO();torch.save(m.capture(),buf);buf.seek(0);saved=torch.load(buf,weights_only=True)
-        other=self.model()
+        # Match the native smoke path: a fresh object, not a helper that has
+        # already called create_from_pcd/training_setup and filled exposures.
+        other=fixed.load_model()(m.max_sh_degree)
+        other._exposure=torch.nn.Parameter(m._exposure.detach().clone())
         with fixed.cpu_allocations(): other.restore(saved,self.opt)
         other.pose_refiner=PoseRefiner([self.cam],self.pose_policy,self.root/'source',8,saved=other.pose_refinement_state)
         for k in ('exp_avg','exp_avg_sq'):
@@ -171,13 +174,14 @@ class LidarOffsetPlanTests(unittest.TestCase):
         run_local_scale.prepare(self.argv)
         target=self.root/'gpu2'
         argv=['--reference-model',str(self.model),'--model',str(target),'--gpu','2',
-              '--ceiling-multiplier','2.5','--schedule-mode','joint','--pose-refinement','--lidar-offsets']
+              '--ceiling-multiplier','5','--schedule-mode','joint','--pose-refinement','--lidar-offsets']
         tune_local_scale.prepare(argv);tune_local_scale.prepare(argv)
         data=periodic.load_plan(target);plan=data['plan']
         self.assertEqual(data['gpu'],'2');self.assertEqual(data['frames'],sorted(self.names))
         self.assertEqual(data['iterations'],[10000,20000,30000])
         self.assertEqual(plan['lidar_offsets'],offsets.DEFAULTS)
-        self.assertEqual(plan['effective_max_scale_world'],.0375)
+        self.assertEqual(plan['effective_max_scale_world'],.075)
+        self.assertEqual(plan['training_schedule']['cap']['final_multiplier'],5.)
         cmd=plan['stages'][0]['argv']
         self.assertEqual(json.loads(cmd[cmd.index('--lidar_offsets')+1]),offsets.DEFAULTS)
         self.assertEqual(cmd[cmd.index('--densify_until_iter')+1],'0')

@@ -108,6 +108,7 @@ def execute_plan(args, plan):
     invoke(smoke)
     if getattr(args,'lidar_offset_policy',None) is not None:
         invoke(['scripts/smoke_lidar_offsets.py','--gpu',args.gpu,
+                '--ceiling-multiplier',str(getattr(args,'ceiling_multiplier',1.)),
                 '--output',str(model/'lidar_offsets_cuda_smoke.json')])
     from utils.local_scale import prepare as prepare_cache
     data = prepare_cache(args.point_cloud, plan['local_scale_cache'], neighbors=args.neighbors,

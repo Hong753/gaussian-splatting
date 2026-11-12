@@ -16,6 +16,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--gpu',default='2');p.add_argument('--output',type=Path)
+    p.add_argument('--ceiling-multiplier',type=float,default=5.)
     args=p.parse_args(argv)
     os.environ['CUDA_VISIBLE_DEVICES']=args.gpu
     import numpy as np
@@ -40,17 +41,18 @@ def main(argv=None):
         vertex=np.zeros(len(xyz),dtype=[(k,'f4') for k in ('x','y','z')])
         for i,k in enumerate(('x','y','z')):vertex[k]=xyz[:,i]
         PlyData([PlyElement.describe(vertex,'vertex')]).write(root/'input.ply')
-        prepare(root/'input.ply',root/'cache',samples=25,workers=1,ceiling_multiplier=2.5,position_padding=.005)
+        prepare(root/'input.ply',root/'cache',samples=25,workers=1,
+                ceiling_multiplier=args.ceiling_multiplier,position_padding=.005)
         parser=argparse.ArgumentParser();params=OptimizationParams(parser)
         opt=params.extract(parser.parse_args(['--fixed_lidar','--scale_control','hybrid',
             '--max_scale_ratio','1','--max_scale_world','.015','--local_scale_cache',str(root/'cache'),
-            '--local_scale_ceiling_multiplier','2.5','--position_lr_init','0','--position_lr_final','0',
+            '--local_scale_ceiling_multiplier',str(args.ceiling_multiplier),'--position_lr_init','0','--position_lr_final','0',
             '--densify_until_iter','0','--iterations','6']))
         policy={**DEFAULTS,'warmup':1,'ramp':1,'end':6}
         pose_policy={**POSES,'start':1,'end':4,'max_width':64}
         opt.lidar_offsets=json.dumps(policy);opt.pose_refinement=json.dumps(pose_policy)
         opt.local_scale_schedule=json.dumps(dict(schema=1,
-            cap=dict(initial_multiplier=1.,final_multiplier=2.5,start=1,end=4),
+            cap=dict(initial_multiplier=1.,final_multiplier=args.ceiling_multiplier,start=1,end=4),
             learning_rates=dict(start=1,end=6,groups={k:[v,v*.1] for k,v in GROUP_LRS.items()})))
         m=GaussianModel(1)
         m.create_from_pcd(BasicPointCloud(points=xyz,colors=np.tile([.7,.3,.2],(25,1)),normals=np.zeros_like(xyz)),

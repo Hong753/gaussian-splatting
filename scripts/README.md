@@ -1893,13 +1893,13 @@ This fresh experiment uses the same input points and stride-3 keyframes as the
 fourth run, with the camera-pose alternation above. It requires GPU 2 to be free;
 the training process and independent all-frame evaluator then share GPU 2.
 The default output is
-`/data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_offsets_cap2.5_poses_30000_v1`.
+`/data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_offsets_cap5_poses_30000_v1`.
 
-- **Scale allowance:** ramp the hard ceiling from 1x to **2.5x** over 7k–20k,
-  instead of the pose-only experiment's 2x. This is 25% more final allowance.
-  The original per-point KNN ceiling still applies, multiplied by 2.5; the
-  absolute maximum principal-axis sigma is `0.015 * 2.5 = 0.0375` scene units.
-  This is 3.75 cm if the LiDAR coordinates are meters, not the splat diameter.
+- **Scale allowance:** ramp the hard ceiling from 1x to **5x** over 7k–20k,
+  doubling the previous bounded-offset experiment's 2.5x final allowance.
+  The original per-point KNN ceiling still applies, multiplied by 5; the
+  absolute maximum principal-axis sigma is `0.015 * 5 = 0.075` scene units.
+  This is 7.5 cm if the LiDAR coordinates are meters, not the splat diameter.
   Initialization and the 1x soft scale target are unchanged. Scales grow only
   through optimization; increasing a ceiling does not enlarge them directly.
 - **Position allowance:** for each original input row `p_i`, keep an immutable
