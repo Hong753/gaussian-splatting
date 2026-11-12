@@ -30,9 +30,10 @@ def parser():
     p.add_argument('--checkpoint-every', type=int, default=10000)
     p.add_argument('--max-scale-ratio', type=float, default=2., help='Principal sigma reference / initial nearest-neighbor sigma')
     p.add_argument('--max-scale-world', type=float, default=0., help='Optional absolute reference sigma in scene units (0: off)')
-    p.add_argument('--scale-control', choices=('clamp', 'regularize'), default='clamp',
-                   help='Hard cap after every step, or soft penalty after bounded initialization')
+    p.add_argument('--scale-control', choices=('clamp', 'regularize', 'hybrid'), default='clamp',
+                   help='Hard cap, soft penalty, or local soft target with a hard ceiling')
     p.add_argument('--scale-regularization-weight', type=float, default=.01)
+    p.add_argument('--local-scale-cache', type=Path, help='Precomputed local bounds, required by hybrid mode')
     p.add_argument('--resolution', type=int, default=-1)
     p.add_argument('--expected-frames', type=int, default=5009)
     p.add_argument('--report-max-views', type=int, default=64)
@@ -53,7 +54,7 @@ def build_plan(args):
             args.report_max_views < 1 or args.resolution == 0 or args.resolution < -1 or
             not math.isfinite(args.max_scale_ratio) or args.max_scale_ratio <= 0 or
             not math.isfinite(args.max_scale_world) or args.max_scale_world < 0 or
-            control not in ('clamp', 'regularize') or not math.isfinite(weight) or weight <= 0 or
+            control not in ('clamp', 'regularize', 'hybrid') or not math.isfinite(weight) or weight <= 0 or
             not 0 < args.eval_memory_fraction <= 1 or not 0 < args.poll_seconds <= 60):
         raise ValueError('Invalid scale bounds, iteration/frame counts, resolution or evaluator settings')
     for path in (args.keyframes, args.point_cloud):
@@ -83,10 +84,15 @@ def build_plan(args):
         '--test_iterations', '-1', '--save_iterations', *map(str, steps),
         '--checkpoint_iterations', *map(str, steps), '--publish_checkpoint_snapshots']
     policy = {}
-    if control == 'regularize':
+    if control in ('regularize', 'hybrid'):
         command += ['--scale_control', control, '--scale_regularization_weight', str(weight)]
         policy = dict(scale_control=control, scale_regularization_weight=weight,
                       scale_limit_semantics='Soft penalty target, not a strict training-time maximum')
+    if control == 'hybrid':
+        if not getattr(args, 'local_scale_cache', None):
+            raise ValueError('Hybrid mode requires --local-scale-cache; run_local_scale.py can prepare it')
+        command += ['--local_scale_cache', str(args.local_scale_cache.expanduser().resolve())]
+        policy['scale_limit_semantics'] = 'Local soft target plus an independent hard ceiling after every Adam step'
     return dict(source=str(source), model=str(model), gpu=args.gpu, initial_points=len(vertices.data),
                 max_scale_ratio=args.max_scale_ratio, max_scale_world=args.max_scale_world,
                 positions='fixed throughout', population='constant', antialiasing=True,
@@ -103,7 +109,7 @@ def prepare(argv):
     return periodic.prepare_experiment(args, plan, 'fixed_lidar', [args.keyframes, args.point_cloud])
 
 
-def execute_plan(args, plan):
+def execute_plan(args, plan, *, smoke=True):
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     import torch
     if not torch.cuda.is_available():
@@ -112,7 +118,11 @@ def execute_plan(args, plan):
     model.mkdir(parents=True, exist_ok=True)
     # Exercise the actual native CUDA rasterizer and optimizer path on a tiny
     # fixed cloud before loading the large scene. Failures stay direct tracebacks.
-    invoke(['scripts/smoke_fixed_lidar.py', '--gpu', args.gpu,
+    if smoke and getattr(args, 'scale_control', 'clamp') == 'hybrid':
+        invoke(['scripts/smoke_local_scale.py', '--gpu', args.gpu,
+                '--output', str(model/'local_scale_cuda_smoke.json')])
+    elif smoke:
+        invoke(['scripts/smoke_fixed_lidar.py', '--gpu', args.gpu,
             '--scale-control', getattr(args, 'scale_control', 'clamp'),
             '--output', str(model/'fixed_lidar_cuda_smoke.json')])
     if args.keyframes.resolve() != model/'keyframes.json':

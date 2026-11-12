@@ -104,7 +104,7 @@ def train(model):
                 if digest(path) != expected:
                     raise ValueError(f'Input changed after preparation: {path}')
             args = SimpleNamespace(**data['training_args'])
-            for name in ('source', 'model', 'keyframes', 'baseline', 'video_output', 'scene_geometry', 'point_cloud', 'cache'):
+            for name in ('source', 'model', 'keyframes', 'baseline', 'video_output', 'scene_geometry', 'point_cloud', 'cache', 'local_scale_cache'):
                 if getattr(args, name, None) is not None:
                     setattr(args, name, Path(getattr(args, name)))
             launcher = run_occlusion
@@ -114,6 +114,9 @@ def train(model):
             elif data.get('experiment') == 'discrete_lidar':
                 from scripts import run_discrete_lidar
                 launcher = run_discrete_lidar
+            elif data.get('experiment') == 'local_scale':
+                from scripts import run_local_scale
+                launcher = run_local_scale
             plan = launcher.build_plan(args)
             if plan != data['plan']:
                 raise ValueError('Training plan changed after preparation')
@@ -229,7 +232,7 @@ def experiment_diagnostics(data, start, end):
         return dict(interval=[start, end], logged_checks=len(rows), passed=good, warnings=warnings,
                     added=sum(r['added'] for r in events), scale_pruned=sum(r['scale_pruned'] for r in events),
                     latest=rows[-1] if rows else None)
-    if data.get('experiment') != 'fixed_lidar':
+    if data.get('experiment') not in ('fixed_lidar', 'local_scale'):
         return soft_diagnostics(data['model'], start, end)
     path = Path(data['model'])/'fixed_lidar_training.jsonl'
     rows = []
@@ -242,11 +245,12 @@ def experiment_diagnostics(data, start, end):
             if start < row['iteration'] <= end:
                 rows.append(row)
     regularize = data['plan'].get('scale_control') == 'regularize'
+    hybrid = data['plan'].get('scale_control') == 'hybrid'
     good = bool(rows) and all(r['positions_unchanged'] and
         (r.get('scales_finite', False) if regularize else r['scales_within_bounds']) for r in rows)
     loss_rows = []
     loss_path = Path(data['model'])/'scale_regularization_training.jsonl'
-    if regularize and loss_path.is_file():
+    if (regularize or hybrid) and loss_path.is_file():
         for line in loss_path.read_text().splitlines():
             try:
                 row = json.loads(line)
@@ -261,12 +265,14 @@ def experiment_diagnostics(data, start, end):
         if values:
             regularizer[key] = dict(min=min(values), median=statistics.median(values), max=max(values))
     warnings = [] if good else ['Missing or failed fixed LiDAR invariant checks']
-    if regularize and not loss_rows:
+    if (regularize or hybrid) and not loss_rows:
         warnings.append('No scale regularization diagnostics in this interval')
-    elif regularize and not any(r.get('scale_regularization_loss', 0) > 0 for r in loss_rows):
+    elif (regularize or hybrid) and not any(r.get('scale_regularization_loss', 0) > 0 for r in loss_rows):
         warnings.append('No logged positive scale penalty; check whether any scales exceed the target')
+    if hybrid and rows and rows[-1].get('local_scale_audit_samples_omitted', 0):
+        warnings.append('Some whole overlap-audit samples exceeded the pair budget; reported counts cover retained samples only')
     return dict(interval=[start, end], logged_checks=len(rows), passed=good,
-                scale_control='regularize' if regularize else 'clamp', regularizer=regularizer,
+                scale_control=data['plan'].get('scale_control', 'clamp'), regularizer=regularizer,
                 latest=rows[-1] if rows else None,
                 warnings=warnings)
 
@@ -301,11 +307,14 @@ def write_history(data, results):
     for result, row in zip(results, rows):
         links = ' '.join(f'<a href="{html.escape(os.path.relpath(result[k], folder))}">{label}</a>'
                          for k, label in [('metrics', 'PSNR'), ('per_frame', 'all frames'), ('previews', 'GT / render / error')])
+        links += f' <a href="iteration_{row["iteration"]}.json">Diagnostics</a>'
         cells = [row[k] for k in ('iteration', 'gaussians', 'frames', 'all_psnr_db', 'selected_psnr_db', 'unselected_psnr_db')]
         body.append('<tr>'+''.join(f'<td>{html.escape(str(v))}</td>' for v in cells)+f'<td>{links}</td></tr>')
+    title = {'local_scale':'Local KNN scale checkpoints', 'fixed_lidar':'Fixed LiDAR checkpoints',
+             'discrete_lidar':'Discrete LiDAR checkpoints'}.get(data.get('experiment'), 'Soft surface checkpoints')
     page = ('<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="30">'
-        '<title>Soft surface checkpoints</title><style>body{font:16px sans-serif;margin:2em}td,th{padding:.6em;text-align:left}</style>'
-        '<h1>Soft surface checkpoints</h1><p>All registered frames; AA on; mesh-free inference. '
+        f'<title>{title}</title><style>body{{font:16px sans-serif;margin:2em}}td,th{{padding:.6em;text-align:left}}</style>'
+        f'<h1>{title}</h1><p>All registered frames; AA on; mesh-free inference. '
         'Selected = training keyframes. Unselected = all remaining frames. Image galleries are sampled.</p>'
         '<table><tr><th>Step</th><th>Gaussians</th><th>Frames</th><th>All PSNR</th><th>Selected PSNR</th>'
         '<th>Unselected PSNR</th><th>Reports</th></tr>'+''.join(body)+'</table>')

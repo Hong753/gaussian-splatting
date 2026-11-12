@@ -1348,3 +1348,133 @@ to its output directory, then use:
 ```bash
 python -u scripts/run_discrete_lidar.py watch --model "$MODEL"
 ```
+
+### GPU 3: local KNN scale control for dense, fixed LiDAR
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_local_scale.sh 3
+```
+
+This preset keeps **every original LiDAR center fixed throughout**. It trains
+native **3DGS + AA**, with no pruning, densification, opacity resets, mesh,
+Proxy-GS, culling or surface loss. Color, opacity, rotation and scales learn.
+It is a recommended experiment, not a claim of measured quality improvement.
+
+Making a scene bigger should not enlarge a Gaussian on an unchanged wall. The
+native clone/split decision uses `percent_dense * scene_extent`; here, there is
+no density-control operation and **no scene extent in the scale rule**. For each
+point, preprocessing computes the original three-neighbor RMS initialization
+scale `s0_i` and distance `d10_i` to its tenth nearest *other* input point:
+
+| Quantity | GPU 3 default |
+| --- | --- |
+| Hard maximum principal sigma `b_i` | `min(s0_i, d10_i / 3, 0.015)` |
+| Preferred principal sigma `t_i` | `min(b_i, d10_i / 6)` |
+| Differentiable loss | `0.01 * mean(relu(log(sigma_ik / t_i))**2)` over all points and axes |
+| Initialization | Clip original KNN sigma to `b_i`; do not force it to `t_i` |
+| After each Adam step | Project stored log-scales to `log(b_i)`; clear moments on clipped axes only |
+| Positions/population | Exact original XYZ, constant row count; XYZ has no gradient or Adam state |
+
+Distances are in scene units. For metric LiDAR, **0.015 means 1.5 cm sigma**, or
+a **9 cm diameter at the 3-sigma contour**. It is not a 1.5 cm splat diameter.
+Many points receive smaller limits from their local spacing. The guard prevents
+sparse outliers from receiving meter-scale primitives. When rescaling the scene
+coordinates, rescale this absolute guard too (or explicitly disable it with 0).
+No geometric lower scale bound is imposed; axes can shrink below their targets.
+All three principal axes are bounded, while anisotropy and orientation remain
+learnable. The native PLY contains exactly the resulting learned log-scales;
+exported inference needs no extra clamp, cache or occluder.
+
+Why two thresholds: for similar nearby Gaussian sizes, radius `3*sigma` and
+pairwise support intersections suggest `sigma ~= d10/6` for roughly ten
+neighbors. Making that an unconditional maximum can leave holes at sparse or
+irregularly sampled surfaces. The softer target permits some extra overlap when
+RGB needs coverage, while `b_i` still prevents large primitives. **Neither the
+soft target nor the hard ceiling guarantees at most ten overlapping ellipsoids
+or ten contributing Gaussians per pixel.** Sizes vary, projected AA adds a pixel
+filter, and Gaussians have nonzero tails. This is a density-based size control,
+with measured overlap diagnostics, not an exact combinatorial overlap constraint.
+
+The global guard is optional, but the default is deliberately tighter than the
+earlier 5 cm sigma reference. This run also changes the relative bound to
+1x initial spacing and adds the ten-neighbor rule; it is a combined experiment,
+not a single-variable clamp-versus-regularization ablation. Fixed measured points
+cannot represent arbitrary detail finer than their projected sampling spacing;
+smaller scales alone do not fix pose errors or missing surface samples. Compare
+same-camera textured crops and coverage as well as PSNR.
+
+Defaults: GPU 3, **100k steps**, model
+`3dgs_stride3_aa_fixed_lidar_local_knn10_100k_v1`, reusable cache
+`lidar_local_scale_knn10_v1` under `/data/3dgs_outputs/orange_4F/1_full`.
+Every **10k** steps, PLY/optimizer snapshots are atomically published. A separate
+process on the **same GPU** evaluates **all 5,009 frames**, with selected and
+unselected PSNR, and writes 64-view train and unselected GT/render/error galleries.
+Evaluations queue sequentially; the launcher waits for all of them to finish.
+The evaluator's 20% allocator limit does not reserve VRAM from training; OOMs are
+retried by the existing checkpoint queue.
+
+Outputs include:
+
+- `psnr_all_frames/iteration_N/summary.json` and `per_frame.csv`.
+- `view_comparisons/iteration_N/index.html`: actual images, renders and errors.
+- `periodic_evaluation/index.html`: PSNR history, invariant checks and diagnostics.
+- `local_scale_initialization.json`: exact sigma ceiling/target and d10 quantiles.
+- `fixed_lidar_training.jsonl`, every 1k/checkpoint: all-point XYZ/count/scale checks,
+  sampled 3-sigma bounding-sphere intersection counts, centers inside the actual
+  rotated ellipsoid, fraction of sphere counts exceeding K and sigma quantiles.
+- `scale_regularization_training.jsonl`, every 100 steps: weighted penalty,
+  regularizer/RGB scale-gradient ratio, and sampled visible rasterizer **pixel
+  radius** quantiles for the current training camera (not diameters).
+
+The overlap audit samples 2,048 points, enumerates all possible neighbors under
+the immutable hard ceilings, and tests the current scales/rotations on GPU.
+Sphere intersection counts are an **upper bound** on actual anisotropic
+ellipsoid intersections, not a count of rendered contributors. A two-million-pair
+budget limits memory: if a full sample does not fit, the **whole sample is omitted
+and explicitly reported**, never silently truncated. Omission can bias the
+retained sample toward lower-density areas; increase `--audit-pair-budget` and
+use a new cache if many samples are omitted. Neither point sampling nor omitted
+audit rows changes the training population.
+
+The launcher first runs `scripts/smoke_local_scale.py` on the installed native
+CUDA AA renderer. It checks real forward/backward, penalty gradients, bounded
+Adam updates, immutable XYZ, cached counts against all-pairs counts, checkpoint
+restoration and PLY serialization. Only then does full preprocessing/training
+start. CPU regression tests cannot substitute for this host CUDA smoke.
+
+Full-cloud KNN preprocessing uses **CPU scipy/cKDTree once**, with chunked queries
+and disk-backed output arrays. The tree temporarily holds the entire XYZ cloud
+in RAM; camera images and per-view depths are not cached there. Complete caches
+are reused after source/config/checksum validation. Training loads two float32
+bound vectors (about **80 MB for 10 million points**) and the bounded sampled
+audit pairs into GPU memory. Bound vectors are retained in optimizer checkpoints;
+the audit cache is not duplicated in each checkpoint. Keep the cache for training
+resume/audits. Regularization, projection and training-time diagnostics use
+PyTorch CUDA operations; no additional custom CUDA extension is required.
+
+Overrides: `LOCAL_SCALE_MODEL`, `LOCAL_SCALE_CACHE`, `LOCAL_SCALE_BASELINE`,
+`LOCAL_SCALE_POINTS`, `LOCAL_SCALE_SOURCE`, `LOCAL_SCALE_OUTPUT_ROOT`,
+`LOCAL_SCALE_MAX_SCALE_RATIO`, `LOCAL_SCALE_MAX_SCALE_WORLD`, `LOCAL_SCALE_WEIGHT`,
+`LOCAL_SCALE_NEIGHBORS`, `LOCAL_SCALE_SUPPORT_SIGMA`, `LOCAL_SCALE_OVERLAP_FACTOR`,
+`LOCAL_SCALE_AUDIT_SAMPLES`, `LOCAL_SCALE_AUDIT_PAIR_BUDGET`,
+`LOCAL_SCALE_CACHE_WORKERS`, `LOCAL_SCALE_ITERATIONS`, `LOCAL_SCALE_CHECKPOINT_EVERY`,
+`LOCAL_SCALE_REPORT_MAX_VIEWS` and `LOCAL_SCALE_EVAL_MEMORY_FRACTION`.
+Changed point inputs or preprocessing settings require a new cache directory;
+new experiments require a fresh model directory.
+
+Image resolution stays at `-1` to match the existing runs (native auto-downscale
+above 1600-pixel width). Set `LOCAL_SCALE_RESOLUTION=1` for original image
+resolution, using a fresh output directory and matching evaluation resolution
+when comparing to another experiment. A smaller world-space sigma does not
+itself raise the image resolution.
+
+Restart only the evaluation queue, after activating `3dgs`:
+
+```bash
+python -u scripts/run_local_scale.py watch \
+  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_fixed_lidar_local_knn10_100k_v1
+```

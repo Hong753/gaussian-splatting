@@ -107,6 +107,7 @@ class OptimizationParams(ParamGroup):
         self.max_scale_world = 0.0
         self.scale_control = "clamp"
         self.scale_regularization_weight = 0.01
+        self.local_scale_cache = ""
         self.discrete_lidar = False
         self.discrete_lidar_cache = ""
         self.discrete_lidar_prune_sigma = 0.05

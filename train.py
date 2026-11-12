@@ -151,10 +151,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.restore(model_params, opt)
     if opt.fixed_lidar:
         audit_fixed_lidar(gaussians, first_iter)
-        print(f'Fixed LiDAR: {len(gaussians.get_xyz):,} immutable centers; no cloning, splitting, pruning or opacity resets. '
-              f'Scale {"cap" if opt.scale_control == "clamp" else "penalty target"} = '
-              f'{opt.max_scale_ratio:g} x initialization spacing'
-              + (f', limited to {opt.max_scale_world:g} scene units.' if opt.max_scale_world else '.'))
+        print(f'Fixed LiDAR: {len(gaussians.get_xyz):,} immutable centers; no cloning, splitting, pruning or opacity resets.')
+        if opt.scale_control == 'hybrid':
+            cfg = gaussians.local_scale_audit['metadata']['config']
+            print(f'Local scale: hard sigma ceiling = min({opt.max_scale_ratio:g} * initial KNN sigma, '
+                  f'd{cfg["neighbors"]}/{cfg["support_sigma"]:g}'
+                  + (f', {opt.max_scale_world:g}' if opt.max_scale_world else '') + '); '
+                  f'soft target = min(ceiling, d{cfg["neighbors"]}/{cfg["support_sigma"]*cfg["overlap_factor"]:g}). '
+                  f'Regularizer weight: {opt.scale_regularization_weight:g}. Distances are in scene units.')
+        else:
+            print(f'Scale {"cap" if opt.scale_control == "clamp" else "penalty target"} = '
+                  f'{opt.max_scale_ratio:g} x initialization spacing'
+                  + (f', limited to {opt.max_scale_world:g} scene units.' if opt.max_scale_world else '.'))
         if opt.scale_control == 'regularize':
             print(f'Scale regularizer weight {opt.scale_regularization_weight:g}: capped initialization; '
                   'no post-step clamp or scale-moment resets. The target is not a guaranteed maximum.')
@@ -278,7 +286,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 tb_writer.add_scalar('train_loss_patches/surface_loss', surface_loss.item(), iteration)
         loss.backward()
         scale_stats = None
-        if opt.fixed_lidar and opt.scale_control == 'regularize':
+        if opt.fixed_lidar and opt.scale_control in ('regularize', 'hybrid'):
             from utils.fixed_lidar import scale_regularization, sample_scale_gradients, added_scale_gradient_stats
             log_scales = iteration == 1 or iteration % 100 == 0
             scale_sample = sample_scale_gradients(gaussians, visibility_filter) if log_scales else None
@@ -288,6 +296,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scale_stats = added_scale_gradient_stats(gaussians, scale_sample)
                 scale_stats.update(rgb_loss=float(loss.detach()), scale_regularization_loss=float(scale_loss.detach()),
                                    scale_regularization_weight=opt.scale_regularization_weight)
+                if opt.scale_control == 'hybrid':
+                    from utils.local_scale import projected_stats
+                    scale_stats.update(projected_stats(radii))
             loss = loss.detach() + scale_loss.detach()
             del scale_loss
         soft_stats = None

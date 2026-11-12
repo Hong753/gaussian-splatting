@@ -66,6 +66,7 @@ class GaussianModel:
         self.surface_mode = "off"
         self.surface_refs = None
         self.fixed_lidar_state = None
+        self.local_scale_audit = None
         self.discrete_lidar_state = None
         self.discrete_lidar_pool = None
         self.spatial_lr_scale = 0
@@ -309,14 +310,17 @@ class GaussianModel:
                 raise ValueError('Fixed LiDAR requires default Adam and no other surface mode')
             if self.fixed_lidar_state is None:
                 self.fixed_lidar_state = initialize(self, training_args.max_scale_ratio, training_args.max_scale_world,
-                                                   mode, weight)
+                                                   mode, weight, getattr(training_args, 'local_scale_cache', ''))
             elif (self.fixed_lidar_state['ratio'], self.fixed_lidar_state['world']) != (
                     training_args.max_scale_ratio, training_args.max_scale_world):
                 raise ValueError('Checkpoint scale limits differ from requested limits')
             if self.fixed_lidar_state.get('scale_control', 'clamp') != mode:
                 raise ValueError('Checkpoint scale-control mode differs from requested mode')
-            if mode == 'regularize' and self.fixed_lidar_state['scale_regularization_weight'] != weight:
+            if mode in ('regularize', 'hybrid') and self.fixed_lidar_state['scale_regularization_weight'] != weight:
                 raise ValueError('Checkpoint regularization weight differs from requested weight')
+            if mode == 'hybrid':
+                from utils.local_scale import attach_audit
+                attach_audit(self, training_args.local_scale_cache)
             self._xyz.requires_grad_(False)
             self._xyz.grad = None
         self.surface_mode = training_args.surface_mode

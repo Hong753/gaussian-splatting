@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Fixed LiDAR 3DGS + AA: local KNN hard ceilings and overlap-oriented soft targets."""
+import os
+from pathlib import Path
+import sys
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts import run_fixed_lidar, run_soft_surface_long as periodic
+from scripts.run_occlusion import invoke
+from utils.local_scale import validate
+
+
+def parser():
+    p = run_fixed_lidar.parser()
+    p.description = __doc__
+    p.set_defaults(gpu='3', max_scale_ratio=1., max_scale_world=.015, scale_control='hybrid')
+    p.add_argument('--neighbors', type=int, default=10)
+    p.add_argument('--support-sigma', type=float, default=3.)
+    p.add_argument('--overlap-factor', type=float, default=2.)
+    p.add_argument('--audit-samples', type=int, default=2048)
+    p.add_argument('--audit-pair-budget', type=int, default=2000000)
+    p.add_argument('--cache-workers', type=int, default=8)
+    return p
+
+
+def build_plan(args):
+    if args.scale_control != 'hybrid':
+        raise ValueError('Local scale experiment requires hybrid scale control')
+    validate(args.neighbors, args.support_sigma, args.overlap_factor, args.max_scale_ratio,
+             args.max_scale_world, args.audit_samples, args.audit_pair_budget, args.cache_workers)
+    cache = args.local_scale_cache or args.model/'local_scale_cache'
+    common = SimpleNamespace(**vars(args))
+    common.local_scale_cache = cache
+    plan = run_fixed_lidar.build_plan(common)
+    if plan['initial_points'] <= args.neighbors:
+        raise ValueError('Local-scale initialization needs more points than the requested neighbor count')
+    plan.update(local_scale_cache=str(cache.expanduser().resolve()), neighbors=args.neighbors,
+        support_sigma=args.support_sigma, overlap_factor=args.overlap_factor,
+        audit_samples=args.audit_samples, audit_pair_budget=args.audit_pair_budget,
+        scale_rule='ceiling=min(ratio*sigma_init, dK/support_sigma, optional_world_cap); '
+                   'target=min(ceiling, dK/(support_sigma*overlap_factor))')
+    return plan
+
+
+def prepare(argv):
+    args = parser().parse_args(argv)
+    if args.baseline:
+        args.keyframes = args.keyframes or args.baseline/'keyframes.json'
+        args.point_cloud = args.point_cloud or args.baseline/'input.ply'
+    return periodic.prepare_experiment(args, build_plan(args), 'local_scale', [args.keyframes, args.point_cloud])
+
+
+def execute_plan(args, plan):
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    import torch
+    if not torch.cuda.is_available():
+        raise RuntimeError('Activate the CUDA-enabled 3dgs environment')
+    model = Path(plan['model'])
+    model.mkdir(parents=True, exist_ok=True)
+    invoke(['scripts/smoke_local_scale.py', '--gpu', args.gpu,
+            '--output', str(model/'local_scale_cuda_smoke.json')])
+    from utils.local_scale import prepare as prepare_cache
+    data = prepare_cache(args.point_cloud, plan['local_scale_cache'], neighbors=args.neighbors,
+        support_sigma=args.support_sigma, overlap_factor=args.overlap_factor,
+        ratio=args.max_scale_ratio, world=args.max_scale_world,
+        samples=args.audit_samples, pair_budget=args.audit_pair_budget, workers=args.cache_workers)
+    from utils.checkpoint_snapshots import atomic_json
+    atomic_json(model/'local_scale_initialization.json', data)
+    return run_fixed_lidar.execute_plan(args, plan, smoke=False)
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == 'prepare':
+        return prepare(argv[1:])
+    return periodic.main(argv)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
