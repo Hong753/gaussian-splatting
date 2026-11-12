@@ -105,6 +105,15 @@ class OptimizationParams(ParamGroup):
         self.fixed_lidar = False
         self.max_scale_ratio = 2.0
         self.max_scale_world = 0.0
+        self.scale_control = "clamp"
+        self.scale_regularization_weight = 0.01
+        self.discrete_lidar = False
+        self.discrete_lidar_cache = ""
+        self.discrete_lidar_prune_sigma = 0.05
+        self.discrete_lidar_seed_sigma_ratio = 0.5
+        self.discrete_lidar_radius = 0.10
+        self.discrete_lidar_max_new = 50000
+        self.discrete_lidar_min_observations = 1
         self.lidar_depth_dir = ""
         self.lidar_depth_weight = 0.0
         self.lidar_depth_start = 0

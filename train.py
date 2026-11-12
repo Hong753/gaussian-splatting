@@ -46,6 +46,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         raise ValueError('Published snapshots require matching PLY and optimizer checkpoint iterations')
     from utils.fixed_lidar import configure_training, project_scales, audit as audit_fixed_lidar
     configure_training(opt, dataset)
+    from utils.discrete_lidar import configure_training as configure_discrete_lidar
+    configure_discrete_lidar(opt, dataset)
     dataset.antialiasing = pipe.antialiasing
     dataset.optimization_settings = vars(opt).copy()
     from scripts.occlusion_options import configure_pipeline, prepare_training_geometry, inference_pipeline
@@ -150,8 +152,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if opt.fixed_lidar:
         audit_fixed_lidar(gaussians, first_iter)
         print(f'Fixed LiDAR: {len(gaussians.get_xyz):,} immutable centers; no cloning, splitting, pruning or opacity resets. '
-              f'Max sigma = {opt.max_scale_ratio:g} x initialization spacing'
-              + (f', additionally capped at {opt.max_scale_world:g} scene units.' if opt.max_scale_world else '.'))
+              f'Scale {"cap" if opt.scale_control == "clamp" else "penalty target"} = '
+              f'{opt.max_scale_ratio:g} x initialization spacing'
+              + (f', limited to {opt.max_scale_world:g} scene units.' if opt.max_scale_world else '.'))
+        if opt.scale_control == 'regularize':
+            print(f'Scale regularizer weight {opt.scale_regularization_weight:g}: capped initialization; '
+                  'no post-step clamp or scale-moment resets. The target is not a guaranteed maximum.')
+    if opt.discrete_lidar:
+        from utils.discrete_lidar import audit as audit_discrete_lidar, adapt as adapt_discrete_lidar
+        print(f'Discrete LiDAR: {len(gaussians.get_xyz):,} active / '
+              f'{len(gaussians.discrete_lidar_pool["xyz"]):,} measured coordinates; XYZ frozen. '
+              f'Adaptive activation and sigma>{opt.discrete_lidar_prune_sigma:g} pruning every '
+              f'{opt.densification_interval} steps after {opt.densify_from_iter}; no opacity pruning/resets.')
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -265,6 +277,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if tb_writer and iteration % 100 == 0:
                 tb_writer.add_scalar('train_loss_patches/surface_loss', surface_loss.item(), iteration)
         loss.backward()
+        scale_stats = None
+        if opt.fixed_lidar and opt.scale_control == 'regularize':
+            from utils.fixed_lidar import scale_regularization, sample_scale_gradients, added_scale_gradient_stats
+            log_scales = iteration == 1 or iteration % 100 == 0
+            scale_sample = sample_scale_gradients(gaussians, visibility_filter) if log_scales else None
+            scale_loss = scale_regularization(gaussians)
+            scale_loss.backward()
+            if log_scales:
+                scale_stats = added_scale_gradient_stats(gaussians, scale_sample)
+                scale_stats.update(rgb_loss=float(loss.detach()), scale_regularization_loss=float(scale_loss.detach()),
+                                   scale_regularization_weight=opt.scale_regularization_weight)
+            loss = loss.detach() + scale_loss.detach()
+            del scale_loss
         soft_stats = None
         if soft_regularizer is not None:
             gradient_sample = None
@@ -298,6 +323,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             if iteration % 10 == 0:
                 progress = {"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"}
+                if scale_stats is not None:
+                    progress['scale reg'] = f"{scale_stats['scale_regularization_loss']:.3g}"
                 if opt.lidar_depth_weight > 0:
                     progress["LiDAR"] = f"{ema_lidar_for_log:.{7}f}"
                 if opt.position_warmup_steps or opt.position_ramp_steps:
@@ -326,7 +353,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Densification
             phase_iteration = iteration - opt.densification_phase_offset
-            if not opt.fixed_lidar and 0 < phase_iteration < opt.densify_until_iter:
+            if opt.discrete_lidar:
+                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+            if not opt.fixed_lidar and not opt.discrete_lidar and 0 < phase_iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 growth_filter = visibility_filter
@@ -397,10 +426,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 project_scales(gaussians)
 
+            # The discrete policy consumes accumulated screen-space gradients,
+            # but edits the population only AFTER this iteration's Adam update.
+            if opt.discrete_lidar:
+                import json
+                if iteration > opt.densify_from_iter and (iteration % opt.densification_interval == 0 or iteration == opt.iterations):
+                    stats = adapt_discrete_lidar(gaussians, iteration, opt.densify_grad_threshold)
+                    with open(os.path.join(scene.model_path, 'discrete_lidar_growth.jsonl'), 'a') as stream:
+                        stream.write(json.dumps(stats, allow_nan=False)+'\n')
+                if iteration == 1 or iteration % 1000 == 0 or iteration in saving_iterations:
+                    with open(os.path.join(scene.model_path, 'discrete_lidar_training.jsonl'), 'a') as stream:
+                        stream.write(json.dumps(audit_discrete_lidar(gaussians, iteration), allow_nan=False)+'\n')
+
             if opt.fixed_lidar and (iteration == 1 or iteration % 1000 == 0 or iteration in saving_iterations):
                 import json
                 with open(os.path.join(scene.model_path, 'fixed_lidar_training.jsonl'), 'a') as stream:
                     stream.write(json.dumps(audit_fixed_lidar(gaussians, iteration))+'\n')
+
+            if scale_stats is not None:
+                import json
+                scale_stats.update(iteration=iteration, image=viewpoint_cam.image_name)
+                with open(os.path.join(scene.model_path, 'scale_regularization_training.jsonl'), 'a') as stream:
+                    stream.write(json.dumps(scale_stats, allow_nan=False)+'\n')
+                if tb_writer:
+                    for key, value in scale_stats.items():
+                        if key not in ('iteration', 'image') and value is not None:
+                            tb_writer.add_scalar('scale_regularization/'+key, value, iteration)
 
             if publish_checkpoint_snapshots and iteration in saving_iterations:
                 from utils.checkpoint_snapshots import publish_snapshot

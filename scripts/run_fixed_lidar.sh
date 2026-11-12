@@ -22,6 +22,8 @@ python -u scripts/run_fixed_lidar.py prepare \
   --point-cloud "${FIXED_LIDAR_POINTS:-$lidar_baseline/input.ply}" \
   --max-scale-ratio "${FIXED_LIDAR_MAX_SCALE_RATIO:-2.0}" \
   --max-scale-world "${FIXED_LIDAR_MAX_SCALE_WORLD:-0.0}" \
+  --scale-control "${FIXED_LIDAR_SCALE_CONTROL:-clamp}" \
+  --scale-regularization-weight "${FIXED_LIDAR_SCALE_REGULARIZATION_WEIGHT:-0.01}" \
   --iterations "${FIXED_LIDAR_ITERATIONS:-100000}" \
   --checkpoint-every "${FIXED_LIDAR_CHECKPOINT_EVERY:-10000}" \
   --expected-frames "${FIXED_LIDAR_EXPECTED_FRAMES:-5009}" \

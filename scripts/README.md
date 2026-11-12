@@ -1206,3 +1206,145 @@ python -u scripts/run_fixed_lidar.py watch --model "$MODEL" --eval-memory-fracti
 The original cloud is dense but may have duplicate samples or sparsely sampled
 surfaces. Inspect same-camera crops and scale statistics before choosing a tighter
 ratio; bounds that are too small can leave gaps. Pruning is deliberately deferred.
+
+### Second run: differentiable scale penalty, fixed LiDAR centers
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_scale_regularized.sh 1
+```
+
+The default target for each principal sigma axis is
+`tau_i = min(2 * sigma_init_i, 0.05)` in scene units. After clipping initialization
+once to this target, training adds
+`0.01 * mean(relu(log(sigma_ik / tau_i))**2)` over all Gaussians and all three axes.
+There is **no post-step clamping**, scale reset or pruning in this run. The penalty
+is zero below the target and differentiably penalizes excess above it. Targets are
+independent of opacity, view and scene extent. **5 cm is a soft penalty target,
+not a guaranteed maximum.** Positions remain fixed; appearance, opacity,
+rotation and scales learn. No geometry/occlusion dependency is introduced.
+
+Defaults: GPU 1, 100k steps, fresh model directory
+`3dgs_stride3_aa_fixed_lidar_scalereg_100k_v1`. PLY and optimizer snapshots every
+10k use the same independent all-5,009-frame evaluator and GT/render/error
+galleries described above. `SCALE_REG_MODEL`, `SCALE_REG_RATIO`,
+`SCALE_REG_TARGET_WORLD`, `SCALE_REG_WEIGHT` override the second-run settings;
+the `FIXED_LIDAR_*` source/iteration/evaluator overrides also apply.
+
+`scale_regularization_training.jsonl` records the actual weighted penalty and
+its gradient norm relative to RGB on a deterministic sample of visible Gaussians
+every 100 steps. `fixed_lidar_training.jsonl` records the largest sigma and fraction
+of Gaussians exceeding their targets every 1k/checkpoint, along with immutable XYZ
+and count checks. A zero penalty below target is expected; a persistently tiny
+regularizer/RGB gradient ratio with oversized scales indicates the weight needs
+adjustment. Optimizer checkpoints preserve original spacing targets and any
+learned exceedances exactly.
+
+The original GPU 0 preset uses only the relative `2 * sigma_init_i` cap unless
+an absolute cap was explicitly provided. Comparing its default against this
+GPU 1 preset changes both the constraint type and the absolute target. For a
+matched-reference clamp-versus-penalty ablation, use `SCALE_REG_TARGET_WORLD=0`
+against that original preset, or an independent hard-cap run with
+`FIXED_LIDAR_MAX_SCALE_WORLD=0.05`.
+
+### Third run: adaptive activation on discrete LiDAR coordinates, size pruning
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_discrete_lidar.sh 2
+```
+
+This native **3DGS + AA** experiment uses only coordinates already present in
+the complete original `input.ply`. XYZ gradients are disabled, XYZ LR is zero,
+and no XYZ Adam moments accumulate. Every active Gaussian has one immutable
+candidate ID; at most one Gaussian occupies each unique measured coordinate.
+No interpolated surface points, tangent offsets, mesh, DA3 or hard/soft occlusion
+losses are used. Ordinary PLY inference needs none of the preprocessing data.
+
+The full unique cloud is the candidate pool. The default initialization activates
+50% of it, preserving at least one original point per occupied 5 cm voxel. This
+may activate more than 50% if needed for voxel coverage. **It changes the initial
+population relative to the two full-cloud runs.** Starting with all candidates
+active would leave no unused coordinates for growth. Exact positional duplicates
+are represented once and their first input-row mapping is retained. To start
+with the full unique cloud instead, set `DISCRETE_LIDAR_INITIAL_FRACTION=1` and
+choose a different `DISCRETE_LIDAR_CACHE`; growth can then occur only after
+pruning makes nearby coordinates available.
+
+At every 100 steps after step 500, through the final iteration:
+
+1. Use accumulated screen-space RGB gradients to select observed parents.
+   Observed parents exceeding the scale threshold are prioritized for replacement.
+2. Propose up to two unused measured neighbors per parent from its cached 16-NN
+   list, within 10 cm. Resolve conflicts so each coordinate is activated once;
+   at most 50,000 new Gaussians are activated per event.
+3. Delete every Gaussian whose largest principal sigma exceeds **0.05 scene
+   units** (5 cm for metric input), regardless of global scene extent. There is
+   no opacity-based or image-radius pruning and no opacity reset.
+
+Survivors retain their trained scales and Adam moments. Children inherit parent
+appearance/rotation, start with opacity at most 0.1, and use isotropic sigma from
+the candidate's full-cloud 3-NN RMS spacing, bounded to 0.025 scene units at
+creation. The same bounded initialization is used for initially active points.
+There is **no continuous scale clamp or scale penalty**; oversize is allowed
+between pruning events. Pruned coordinates are unavailable for immediate
+re-seeding in that same event but may be activated by a neighbor later. Population
+edits occur after the current optimizer step, preserving that step's RGB update.
+A 5 cm sigma threshold corresponds to a 15 cm 3-sigma radius, not a 5 cm diameter.
+
+The neighborhood search is spatial only: it does not establish surface identity
+or visibility across a thin wall. That is intentionally left for a later
+surface-aware experiment. Size pruning may still delete useful surface coverage;
+its quality needs comparison on the saved images, not just a smaller point count.
+
+The launcher first runs `scripts/smoke_discrete_lidar.py` against the installed
+native CUDA AA renderer, testing backward before and after activation/pruning,
+fixed XYZ and checkpoint restoration. It then builds a reusable CPU/scipy kNN
+cache. Cache files are written incrementally with a final completion marker and
+content checksums; interrupted preprocessing can be rebuilt, and complete
+matching caches are reused. Training loads the candidate XYZ/spacing/neighbor
+table to GPU and performs candidate selection and population edits there.
+For 10 million candidates and 16 neighbors the table alone is about 640 MB;
+it is not repeated in every optimizer checkpoint. **Keep the cache for training
+resume**, but rendered PLYs remain independent of it. This does not hold all
+camera images or per-view renderings in VRAM.
+
+Defaults: GPU 2, 100k steps, model
+`3dgs_stride3_aa_discrete_lidar_prune5cm_100k_v1`, cache
+`lidar_discrete_pool_v1` under the same output root. Every 10k, an independent
+process on GPU 2 evaluates all 5,009 frames and creates the same train/unselected
+GT-versus-render galleries. Evaluation queues sequentially if it cannot keep up;
+the launcher waits for all saved checkpoints to be evaluated.
+
+`discrete_lidar_initialization.json` records exact source/unique/initial counts.
+`discrete_lidar_growth.jsonl` records additions, scale-pruned count, remaining
+population and unused candidates at every event. Every 1k/checkpoint,
+`discrete_lidar_training.jsonl` checks that **every center**, including children,
+exactly equals its original candidate coordinate, IDs are unique, and XYZ stays
+outside Adam. Failed coordinate checks stop training. The periodic report
+includes growth/prune totals and flags intervals without any activations or with
+major population loss.
+
+Overrides: `DISCRETE_LIDAR_MODEL`, `DISCRETE_LIDAR_CACHE`,
+`DISCRETE_LIDAR_BASELINE`, `DISCRETE_LIDAR_POINTS`, `DISCRETE_LIDAR_SOURCE`,
+`DISCRETE_LIDAR_OUTPUT_ROOT`, `DISCRETE_LIDAR_PRUNE_SIGMA`,
+`DISCRETE_LIDAR_INITIAL_FRACTION`, `DISCRETE_LIDAR_INIT_VOXEL`,
+`DISCRETE_LIDAR_GROWTH_RADIUS`, `DISCRETE_LIDAR_MAX_NEW`,
+`DISCRETE_LIDAR_ITERATIONS`, `DISCRETE_LIDAR_CHECKPOINT_EVERY`,
+`DISCRETE_LIDAR_EVAL_MEMORY_FRACTION` and `DISCRETE_LIDAR_REPORT_MAX_VIEWS`.
+Additional controls are listed by `python scripts/run_discrete_lidar.py prepare --help`.
+An existing cache rejects changed preprocessing settings; select a new cache
+directory when changing its input, fraction, voxel size, neighbor count or seed.
+
+To restart only the third run's evaluation queue, activate `3dgs`, set `MODEL`
+to its output directory, then use:
+
+```bash
+python -u scripts/run_discrete_lidar.py watch --model "$MODEL"
+```

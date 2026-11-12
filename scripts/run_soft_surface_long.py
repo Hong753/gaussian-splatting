@@ -104,13 +104,16 @@ def train(model):
                 if digest(path) != expected:
                     raise ValueError(f'Input changed after preparation: {path}')
             args = SimpleNamespace(**data['training_args'])
-            for name in ('source', 'model', 'keyframes', 'baseline', 'video_output', 'scene_geometry', 'point_cloud'):
+            for name in ('source', 'model', 'keyframes', 'baseline', 'video_output', 'scene_geometry', 'point_cloud', 'cache'):
                 if getattr(args, name, None) is not None:
                     setattr(args, name, Path(getattr(args, name)))
             launcher = run_occlusion
             if data.get('experiment') == 'fixed_lidar':
                 from scripts import run_fixed_lidar
                 launcher = run_fixed_lidar
+            elif data.get('experiment') == 'discrete_lidar':
+                from scripts import run_discrete_lidar
+                launcher = run_discrete_lidar
             plan = launcher.build_plan(args)
             if plan != data['plan']:
                 raise ValueError('Training plan changed after preparation')
@@ -205,6 +208,27 @@ def evaluate(data, snapshot, start):
 
 
 def experiment_diagnostics(data, start, end):
+    if data.get('experiment') == 'discrete_lidar':
+        rows, events = [], []
+        for filename, destination in (('discrete_lidar_training.jsonl', rows), ('discrete_lidar_growth.jsonl', events)):
+            path = Path(data['model'])/filename
+            if path.is_file():
+                for line in path.read_text().splitlines():
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if start < row['iteration'] <= end:
+                        destination.append(row)
+        good = bool(rows) and all(r['positions_in_pool'] and r['unique_coordinates'] and r['xyz_frozen'] for r in rows)
+        warnings = [] if good else ['Missing or failed discrete LiDAR coordinate checks']
+        if not events or not any(r['added'] for r in events):
+            warnings.append('No candidate activations in this interval; inspect gradient threshold and unused-neighbor coverage')
+        if rows and rows[-1]['gaussians'] < rows[0]['gaussians']*.5:
+            warnings.append('More than half the active population was lost in this interval')
+        return dict(interval=[start, end], logged_checks=len(rows), passed=good, warnings=warnings,
+                    added=sum(r['added'] for r in events), scale_pruned=sum(r['scale_pruned'] for r in events),
+                    latest=rows[-1] if rows else None)
     if data.get('experiment') != 'fixed_lidar':
         return soft_diagnostics(data['model'], start, end)
     path = Path(data['model'])/'fixed_lidar_training.jsonl'
@@ -217,10 +241,34 @@ def experiment_diagnostics(data, start, end):
                 continue
             if start < row['iteration'] <= end:
                 rows.append(row)
-    good = bool(rows) and all(r['positions_unchanged'] and r['scales_within_bounds'] for r in rows)
+    regularize = data['plan'].get('scale_control') == 'regularize'
+    good = bool(rows) and all(r['positions_unchanged'] and
+        (r.get('scales_finite', False) if regularize else r['scales_within_bounds']) for r in rows)
+    loss_rows = []
+    loss_path = Path(data['model'])/'scale_regularization_training.jsonl'
+    if regularize and loss_path.is_file():
+        for line in loss_path.read_text().splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if start < row['iteration'] <= end:
+                loss_rows.append(row)
+    regularizer = {}
+    for key in ('scale_regularization_loss', 'regularizer_scale_grad_norm',
+                'regularizer_to_rgb_scale_grad_ratio'):
+        values = [r[key] for r in loss_rows if r.get(key) is not None]
+        if values:
+            regularizer[key] = dict(min=min(values), median=statistics.median(values), max=max(values))
+    warnings = [] if good else ['Missing or failed fixed LiDAR invariant checks']
+    if regularize and not loss_rows:
+        warnings.append('No scale regularization diagnostics in this interval')
+    elif regularize and not any(r.get('scale_regularization_loss', 0) > 0 for r in loss_rows):
+        warnings.append('No logged positive scale penalty; check whether any scales exceed the target')
     return dict(interval=[start, end], logged_checks=len(rows), passed=good,
+                scale_control='regularize' if regularize else 'clamp', regularizer=regularizer,
                 latest=rows[-1] if rows else None,
-                warnings=[] if good else ['Missing or failed fixed LiDAR invariant checks'])
+                warnings=warnings)
 
 
 def completed_result(model, iteration, snapshot):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""3DGS + AA: fixed LiDAR centers, capped scales, constant population.
+"""3DGS + AA: fixed LiDAR centers, hard/soft scale limits, constant population.
 
 100k iterations by default; every 10k publish a checkpoint for the independent
 all-frame evaluator. Uses only native 3DGS (no mesh, DA3, Proxy-GS or nvdiffrast).
@@ -28,8 +28,11 @@ def parser():
     p.add_argument('--gpu', default='0')
     p.add_argument('--iterations', type=int, default=100000)
     p.add_argument('--checkpoint-every', type=int, default=10000)
-    p.add_argument('--max-scale-ratio', type=float, default=2., help='Maximum principal sigma / initial nearest-neighbor sigma')
-    p.add_argument('--max-scale-world', type=float, default=0., help='Optional additional maximum sigma in scene units (0: off)')
+    p.add_argument('--max-scale-ratio', type=float, default=2., help='Principal sigma reference / initial nearest-neighbor sigma')
+    p.add_argument('--max-scale-world', type=float, default=0., help='Optional absolute reference sigma in scene units (0: off)')
+    p.add_argument('--scale-control', choices=('clamp', 'regularize'), default='clamp',
+                   help='Hard cap after every step, or soft penalty after bounded initialization')
+    p.add_argument('--scale-regularization-weight', type=float, default=.01)
     p.add_argument('--resolution', type=int, default=-1)
     p.add_argument('--expected-frames', type=int, default=5009)
     p.add_argument('--report-max-views', type=int, default=64)
@@ -43,11 +46,14 @@ def build_plan(args):
     from utils.colmap_paths import colmap_model_dir
     from plyfile import PlyData
     source, model = args.source.expanduser().resolve(), args.model.expanduser().resolve()
+    control = getattr(args, 'scale_control', 'clamp')
+    weight = getattr(args, 'scale_regularization_weight', .01)
     colmap_model_dir(source)
     if (args.iterations < 1 or args.checkpoint_every < 1 or args.expected_frames < 1 or
             args.report_max_views < 1 or args.resolution == 0 or args.resolution < -1 or
             not math.isfinite(args.max_scale_ratio) or args.max_scale_ratio <= 0 or
             not math.isfinite(args.max_scale_world) or args.max_scale_world < 0 or
+            control not in ('clamp', 'regularize') or not math.isfinite(weight) or weight <= 0 or
             not 0 < args.eval_memory_fraction <= 1 or not 0 < args.poll_seconds <= 60):
         raise ValueError('Invalid scale bounds, iteration/frame counts, resolution or evaluator settings')
     for path in (args.keyframes, args.point_cloud):
@@ -76,11 +82,16 @@ def build_plan(args):
         '--occlusion_mode', 'off', '--occlusion_inference_mode', 'off',
         '--test_iterations', '-1', '--save_iterations', *map(str, steps),
         '--checkpoint_iterations', *map(str, steps), '--publish_checkpoint_snapshots']
+    policy = {}
+    if control == 'regularize':
+        command += ['--scale_control', control, '--scale_regularization_weight', str(weight)]
+        policy = dict(scale_control=control, scale_regularization_weight=weight,
+                      scale_limit_semantics='Soft penalty target, not a strict training-time maximum')
     return dict(source=str(source), model=str(model), gpu=args.gpu, initial_points=len(vertices.data),
                 max_scale_ratio=args.max_scale_ratio, max_scale_world=args.max_scale_world,
                 positions='fixed throughout', population='constant', antialiasing=True,
                 hard_culling=False, soft_surface=False, opacity_resets=False,
-                stages=[dict(name='train', argv=command)])
+                stages=[dict(name='train', argv=command)], **policy)
 
 
 def prepare(argv):
@@ -102,6 +113,7 @@ def execute_plan(args, plan):
     # Exercise the actual native CUDA rasterizer and optimizer path on a tiny
     # fixed cloud before loading the large scene. Failures stay direct tracebacks.
     invoke(['scripts/smoke_fixed_lidar.py', '--gpu', args.gpu,
+            '--scale-control', getattr(args, 'scale_control', 'clamp'),
             '--output', str(model/'fixed_lidar_cuda_smoke.json')])
     if args.keyframes.resolve() != model/'keyframes.json':
         shutil.copyfile(args.keyframes, model/'keyframes.json')

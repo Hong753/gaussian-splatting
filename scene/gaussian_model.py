@@ -66,6 +66,8 @@ class GaussianModel:
         self.surface_mode = "off"
         self.surface_refs = None
         self.fixed_lidar_state = None
+        self.discrete_lidar_state = None
+        self.discrete_lidar_pool = None
         self.spatial_lr_scale = 0
         self.setup_functions()
 
@@ -86,6 +88,7 @@ class GaussianModel:
             self.surface_refs,
             self.surface_mode,
             self.fixed_lidar_state,
+            self.discrete_lidar_state,
         )
     
     def restore(self, model_args, training_args):
@@ -95,6 +98,10 @@ class GaussianModel:
         if (saved_fixed is not None) != bool(getattr(training_args, 'fixed_lidar', False)):
             raise ValueError('Checkpoint fixed LiDAR mode differs from requested mode')
         self.fixed_lidar_state = saved_fixed
+        saved_discrete = model_args[15] if len(model_args) > 15 else None
+        if (saved_discrete is not None) != bool(getattr(training_args, 'discrete_lidar', False)):
+            raise ValueError('Checkpoint discrete LiDAR mode differs from requested mode')
+        self.discrete_lidar_state = saved_discrete
         model_args = model_args[:12]
         if saved_surface_refs is not None and saved_surface_mode != training_args.surface_mode:
             raise ValueError("Checkpoint surface mode differs from requested mode")
@@ -123,6 +130,10 @@ class GaussianModel:
             from utils.fixed_lidar import audit, project_scales
             self.optimizer.state.pop(self._xyz, None)
             project_scales(self)
+            audit(self, 0)
+        if self.discrete_lidar_state is not None:
+            from utils.discrete_lidar import freeze_xyz, audit
+            freeze_xyz(self)
             audit(self, 0)
 
     @property
@@ -281,16 +292,31 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         fixed = bool(getattr(training_args, 'fixed_lidar', False))
+        discrete = bool(getattr(training_args, 'discrete_lidar', False))
+        if discrete:
+            if fixed or training_args.surface_mode != 'off' or self.optimizer_type != 'default':
+                raise ValueError('Discrete LiDAR requires its own population policy, default Adam and no surface mode')
+            from utils.discrete_lidar import setup
+            setup(self, training_args)
+        fresh_fixed = fixed and self.fixed_lidar_state is None
         if fixed:
-            from utils.fixed_lidar import initialize, validate_limits
+            from utils.fixed_lidar import initialize, validate_limits, validate_control
             validate_limits(training_args.max_scale_ratio, training_args.max_scale_world)
+            mode = getattr(training_args, 'scale_control', 'clamp')
+            weight = getattr(training_args, 'scale_regularization_weight', .01)
+            validate_control(mode, weight)
             if self.optimizer_type != 'default' or training_args.surface_mode != 'off':
                 raise ValueError('Fixed LiDAR requires default Adam and no other surface mode')
             if self.fixed_lidar_state is None:
-                self.fixed_lidar_state = initialize(self, training_args.max_scale_ratio, training_args.max_scale_world)
+                self.fixed_lidar_state = initialize(self, training_args.max_scale_ratio, training_args.max_scale_world,
+                                                   mode, weight)
             elif (self.fixed_lidar_state['ratio'], self.fixed_lidar_state['world']) != (
                     training_args.max_scale_ratio, training_args.max_scale_world):
                 raise ValueError('Checkpoint scale limits differ from requested limits')
+            if self.fixed_lidar_state.get('scale_control', 'clamp') != mode:
+                raise ValueError('Checkpoint scale-control mode differs from requested mode')
+            if mode == 'regularize' and self.fixed_lidar_state['scale_regularization_weight'] != weight:
+                raise ValueError('Checkpoint regularization weight differs from requested weight')
             self._xyz.requires_grad_(False)
             self._xyz.grad = None
         self.surface_mode = training_args.surface_mode
@@ -307,7 +333,7 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         l = [
-            {'params': [self._xyz], 'lr': 0. if fixed else training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
+            {'params': [self._xyz], 'lr': 0. if fixed or discrete else training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
@@ -327,7 +353,7 @@ class GaussianModel:
         self.exposure_optimizer = torch.optim.Adam([self._exposure])
         if fixed:
             from utils.fixed_lidar import project_scales
-            project_scales(self)
+            project_scales(self, initializing=fresh_fixed)
 
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
@@ -347,7 +373,7 @@ class GaussianModel:
 
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "xyz":
-                if self.fixed_lidar_state is not None:
+                if self.fixed_lidar_state is not None or self.discrete_lidar_state is not None:
                     param_group['lr'] = 0.
                     return 0.
                 from utils.warmup_schedule import position_lr_step
@@ -483,6 +509,8 @@ class GaussianModel:
     def prune_points(self, mask):
         if self.fixed_lidar_state is not None:
             raise RuntimeError('Pruning is disabled for fixed LiDAR')
+        if self.discrete_lidar_state is not None and not getattr(self, '_discrete_population_edit', False):
+            raise RuntimeError('Discrete LiDAR population edits must use the measured-coordinate policy')
         valid_points_mask = ~mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
@@ -526,6 +554,8 @@ class GaussianModel:
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_surface_refs=None):
         if self.fixed_lidar_state is not None:
             raise RuntimeError('Cloning/splitting is disabled for fixed LiDAR')
+        if self.discrete_lidar_state is not None and not getattr(self, '_discrete_population_edit', False):
+            raise RuntimeError('Discrete LiDAR growth must use measured candidate coordinates')
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
