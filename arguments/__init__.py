@@ -56,6 +56,7 @@ class ModelParams(ParamGroup):
         self._images = "images"
         self._depths = ""
         self.keyframe_manifest = ""
+        self.initial_point_cloud = ""
         self._resolution = -1
         self._white_background = False
         self.train_test_exp = False
@@ -101,6 +102,9 @@ class OptimizationParams(ParamGroup):
         self.position_warmup_steps = 0
         self.position_ramp_steps = 0
         self.densification_phase_offset = 0
+        self.fixed_lidar = False
+        self.max_scale_ratio = 2.0
+        self.max_scale_world = 0.0
         self.lidar_depth_dir = ""
         self.lidar_depth_weight = 0.0
         self.lidar_depth_start = 0

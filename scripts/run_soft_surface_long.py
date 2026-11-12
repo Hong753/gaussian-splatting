@@ -45,6 +45,11 @@ def prepare(argv):
             not 0 < args.eval_memory_fraction <= 1 or not 0 < args.poll_seconds <= 60):
         parser.error('Need a fresh soft-surface run, keyframes, positive frame/checkpoint counts and valid evaluator limits')
     plan = run_occlusion.build_plan(args)
+    return prepare_experiment(args, plan, 'soft_surface', [args.keyframes, args.scene_geometry])
+
+
+def prepare_experiment(args, plan, experiment, input_paths):
+    """Shared durable checkpoint queue; experiment launchers own their training plan."""
     records = read_colmap_records(Path(plan['source']))
     if len(records) != args.expected_frames:
         raise ValueError(f'Expected {args.expected_frames} registered frames, found {len(records)}')
@@ -55,13 +60,12 @@ def prepare(argv):
     if not selected or len(selected) != len(set(selected)) or not set(selected) <= set(records):
         raise ValueError('Training manifest is empty, duplicated or outside the source cameras')
     steps = sorted(set(range(args.checkpoint_every, args.iterations+1, args.checkpoint_every)) | {args.iterations})
-    data = dict(schema=1, model=plan['model'], source=plan['source'], gpu=args.gpu,
+    data = dict(schema=1, experiment=experiment, model=plan['model'], source=plan['source'], gpu=args.gpu,
         iterations=steps, frames=sorted(records), selected=sorted(selected),
         expected_frames=args.expected_frames, report_max_views=args.report_max_views,
         memory_fraction=args.eval_memory_fraction, poll_seconds=args.poll_seconds,
         training_args={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
-        plan=plan, input_fingerprints={str(args.keyframes.resolve()): digest(args.keyframes),
-                                     str(args.scene_geometry.resolve()): digest(args.scene_geometry)})
+        plan=plan, input_fingerprints={str(path.resolve()): digest(path) for path in input_paths})
     if args.dry_run:
         print(json.dumps(data, indent=2))
         return 0
@@ -100,14 +104,18 @@ def train(model):
                 if digest(path) != expected:
                     raise ValueError(f'Input changed after preparation: {path}')
             args = SimpleNamespace(**data['training_args'])
-            for name in ('source', 'model', 'keyframes', 'baseline', 'video_output', 'scene_geometry'):
+            for name in ('source', 'model', 'keyframes', 'baseline', 'video_output', 'scene_geometry', 'point_cloud'):
                 if getattr(args, name, None) is not None:
                     setattr(args, name, Path(getattr(args, name)))
-            plan = run_occlusion.build_plan(args)
+            launcher = run_occlusion
+            if data.get('experiment') == 'fixed_lidar':
+                from scripts import run_fixed_lidar
+                launcher = run_fixed_lidar
+            plan = launcher.build_plan(args)
             if plan != data['plan']:
                 raise ValueError('Training plan changed after preparation')
             atomic_json(folder/'training.json', dict(state='running', pid=os.getpid()))
-            run_occlusion.execute_plan(args, plan)
+            launcher.execute_plan(args, plan)
         except BaseException as exc:
             atomic_json(folder/'training.json', dict(state='failed', error=str(exc), pid=os.getpid()))
             raise
@@ -191,9 +199,28 @@ def evaluate(data, snapshot, start):
         checkpoint_files=snapshot['files'], counts=summary['counts'], mean_psnr_db=summary['mean_psnr_db'],
         metrics=str(metric/'summary.json'), per_frame=str(metric/'per_frame.csv'), previews=str(previews/'index.html'),
         metrics_sha256=digest(metric/'summary.json'), per_frame_sha256=digest(metric/'per_frame.csv'),
-        diagnostics=soft_diagnostics(model, start, iteration))
+        diagnostics=experiment_diagnostics(data, start, iteration))
     atomic_json(directory(model)/f'iteration_{iteration}.json', result)
     return result
+
+
+def experiment_diagnostics(data, start, end):
+    if data.get('experiment') != 'fixed_lidar':
+        return soft_diagnostics(data['model'], start, end)
+    path = Path(data['model'])/'fixed_lidar_training.jsonl'
+    rows = []
+    if path.is_file():
+        for line in path.read_text().splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if start < row['iteration'] <= end:
+                rows.append(row)
+    good = bool(rows) and all(r['positions_unchanged'] and r['scales_within_bounds'] for r in rows)
+    return dict(interval=[start, end], logged_checks=len(rows), passed=good,
+                latest=rows[-1] if rows else None,
+                warnings=[] if good else ['Missing or failed fixed LiDAR invariant checks'])
 
 
 def completed_result(model, iteration, snapshot):

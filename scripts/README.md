@@ -1128,3 +1128,81 @@ list. `SOFT_SURFACE_MODEL`, `SOFT_SURFACE_SOURCE`, `SOFT_SURFACE_BASELINE`,
 `SOFT_SURFACE_SCENE` and `SOFT_SURFACE_OUTPUT_ROOT` override wrapper paths.
 `SOFT_SURFACE_EVAL_MEMORY_FRACTION` and `SOFT_SURFACE_REPORT_MAX_VIEWS` set worker
 limits. The launcher never assumes a nonexistent 100k baseline checkpoint.
+
+### Fixed LiDAR centers with a local maximum scale (no growth or pruning)
+
+This independent native **3DGS + AA** ablation starts from the stride-3 baseline's
+original `input.ply`, not its learned Gaussians. All initialized centers remain
+fixed for the entire run, with no XYZ Adam state. Colors/SH, opacity, scales and
+rotations learn. Cloning, splitting, pruning, opacity resets, exposure compensation,
+hard culling and soft-surface losses are disabled. No mesh or DA3 cache is needed.
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+FIXED_LIDAR_MAX_SCALE_RATIO=2.0 bash scripts/run_fixed_lidar.sh 0
+```
+
+The default upper bound is `sigma_max(i) = 2 * sigma_init(i)` for **each principal
+axis**, using the existing nearest-neighbor point-cloud initialization scale.
+It does not grow with the global scene extent. This is local point spacing, not
+LiDAR sensor range, and is an experimental setting rather than a claim about
+XGRIDS. Scales may shrink. Rotations remain free; this ablation adds no normal
+alignment or thickness objective. A Gaussian's 3-sigma radius is three times its
+sigma, so the value is not an ellipsoid diameter or pixel-radius cutoff.
+
+Scale bounds are enforced before the first render and after every Adam step.
+Projected axes have their Adam moments cleared; unprojected axes retain theirs.
+Caps are stored in optimizer checkpoints, and exported PLYs already contain the
+bounded physical scales, so ordinary renderers need no special cap implementation.
+The immutable XYZ checksum, point count and scale inequalities are checked at
+step 1, every 1k and each saved checkpoint in `fixed_lidar_training.jsonl`.
+
+Defaults: 100k training iterations, coherent PLY + optimizer checkpoints every
+10k, plus one separate evaluator on the same GPU scoring **all 5,009 frames**.
+Each checkpoint also gets GT/render/error galleries for 64 train and 64 unselected
+frames. Evaluation can queue behind training and never silently skips checkpoints.
+The shell waits for the queue after training. It runs the native CUDA AA smoke
+test `scripts/smoke_fixed_lidar.py` before loading the full scene.
+
+Default model directory:
+
+```text
+/data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_fixed_lidar_scale2_noprune_100k_v1
+  psnr_all_frames/iteration_10000/{summary.json,per_frame.csv}
+  view_comparisons/iteration_10000/index.html
+  periodic_evaluation/{history.csv,history.json,index.html,evaluator.log}
+  fixed_lidar_training.jsonl
+```
+
+For an additional absolute cap, set `FIXED_LIDAR_MAX_SCALE_WORLD` (default 0,
+disabled). The bound becomes `min(ratio * sigma_init(i), world_cap)` in **scene
+units**; interpret those as meters only when the cloud is metric. Use a new model
+directory when changing settings, e.g.:
+
+```bash
+FIXED_LIDAR_MODEL=/data/3dgs_outputs/orange_4F/1_full/3dgs_fixed_lidar_scale2_cap005_v1 \
+FIXED_LIDAR_MAX_SCALE_RATIO=2.0 FIXED_LIDAR_MAX_SCALE_WORLD=0.05 \
+bash scripts/run_fixed_lidar.sh 0
+```
+
+The absolute cap above is an optional example, not the default. Other overrides:
+`FIXED_LIDAR_BASELINE`, `FIXED_LIDAR_POINTS`, `FIXED_LIDAR_SOURCE`,
+`FIXED_LIDAR_OUTPUT_ROOT`, `FIXED_LIDAR_ITERATIONS`,
+`FIXED_LIDAR_CHECKPOINT_EVERY`, `FIXED_LIDAR_EVAL_MEMORY_FRACTION`, and
+`FIXED_LIDAR_REPORT_MAX_VIEWS`. Native resolution handling is unchanged (`-1`,
+which limits source images wider than 1600 pixels to 1600).
+
+To restart only evaluation after a failure (activate `3dgs` first):
+
+```bash
+python -u scripts/run_fixed_lidar.py watch --model "$MODEL"
+# Once training has finished, a larger evaluator cap can be used if needed:
+python -u scripts/run_fixed_lidar.py watch --model "$MODEL" --eval-memory-fraction 0.8
+```
+
+The original cloud is dense but may have duplicate samples or sparsely sampled
+surfaces. Inspect same-camera crops and scale statistics before choosing a tighter
+ratio; bounds that are too small can leave gaps. Pruning is deliberately deferred.

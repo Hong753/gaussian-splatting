@@ -12,6 +12,7 @@
 import os
 import random
 import json
+import shutil
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
@@ -55,8 +56,13 @@ class Scene:
             assert False, "Could not recognize scene type!"
 
         if not self.loaded_iter:
-            with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
-                dest_file.write(src_file.read())
+            if getattr(args, 'initial_point_cloud', ''):
+                from scene.dataset_readers import fetchPly
+                initial_path = os.path.abspath(os.path.expanduser(args.initial_point_cloud))
+                scene_info = scene_info._replace(point_cloud=fetchPly(initial_path), ply_path=initial_path)
+            destination = os.path.join(self.model_path, 'input.ply')
+            if os.path.realpath(scene_info.ply_path) != os.path.realpath(destination):
+                shutil.copyfile(scene_info.ply_path, destination)
             json_cams = []
             camlist = []
             if scene_info.test_cameras:

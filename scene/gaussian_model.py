@@ -65,6 +65,7 @@ class GaussianModel:
         self.use_absgs = False
         self.surface_mode = "off"
         self.surface_refs = None
+        self.fixed_lidar_state = None
         self.spatial_lr_scale = 0
         self.setup_functions()
 
@@ -84,11 +85,16 @@ class GaussianModel:
             self.spatial_lr_scale,
             self.surface_refs,
             self.surface_mode,
+            self.fixed_lidar_state,
         )
     
     def restore(self, model_args, training_args):
         saved_surface_refs = model_args[12] if len(model_args) > 12 else None
         saved_surface_mode = model_args[13] if len(model_args) > 13 else "off"
+        saved_fixed = model_args[14] if len(model_args) > 14 else None
+        if (saved_fixed is not None) != bool(getattr(training_args, 'fixed_lidar', False)):
+            raise ValueError('Checkpoint fixed LiDAR mode differs from requested mode')
+        self.fixed_lidar_state = saved_fixed
         model_args = model_args[:12]
         if saved_surface_refs is not None and saved_surface_mode != training_args.surface_mode:
             raise ValueError("Checkpoint surface mode differs from requested mode")
@@ -113,6 +119,11 @@ class GaussianModel:
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
+        if self.fixed_lidar_state is not None:
+            from utils.fixed_lidar import audit, project_scales
+            self.optimizer.state.pop(self._xyz, None)
+            project_scales(self)
+            audit(self, 0)
 
     @property
     def get_scaling(self):
@@ -269,6 +280,19 @@ class GaussianModel:
         return indices
 
     def training_setup(self, training_args):
+        fixed = bool(getattr(training_args, 'fixed_lidar', False))
+        if fixed:
+            from utils.fixed_lidar import initialize, validate_limits
+            validate_limits(training_args.max_scale_ratio, training_args.max_scale_world)
+            if self.optimizer_type != 'default' or training_args.surface_mode != 'off':
+                raise ValueError('Fixed LiDAR requires default Adam and no other surface mode')
+            if self.fixed_lidar_state is None:
+                self.fixed_lidar_state = initialize(self, training_args.max_scale_ratio, training_args.max_scale_world)
+            elif (self.fixed_lidar_state['ratio'], self.fixed_lidar_state['world']) != (
+                    training_args.max_scale_ratio, training_args.max_scale_world):
+                raise ValueError('Checkpoint scale limits differ from requested limits')
+            self._xyz.requires_grad_(False)
+            self._xyz.grad = None
         self.surface_mode = training_args.surface_mode
         if self.surface_mode == 'view_tangent':
             from utils.view_tangent import options
@@ -283,7 +307,7 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         l = [
-            {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
+            {'params': [self._xyz], 'lr': 0. if fixed else training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
@@ -301,6 +325,9 @@ class GaussianModel:
                 self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
         self.exposure_optimizer = torch.optim.Adam([self._exposure])
+        if fixed:
+            from utils.fixed_lidar import project_scales
+            project_scales(self)
 
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
@@ -320,6 +347,9 @@ class GaussianModel:
 
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "xyz":
+                if self.fixed_lidar_state is not None:
+                    param_group['lr'] = 0.
+                    return 0.
                 from utils.warmup_schedule import position_lr_step
                 multiplier, schedule_step = position_lr_step(iteration, self.position_warmup_steps, self.position_ramp_steps)
                 lr = multiplier * self.xyz_scheduler_args(schedule_step)
@@ -451,6 +481,8 @@ class GaussianModel:
         return optimizable_tensors
 
     def prune_points(self, mask):
+        if self.fixed_lidar_state is not None:
+            raise RuntimeError('Pruning is disabled for fixed LiDAR')
         valid_points_mask = ~mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
@@ -492,6 +524,8 @@ class GaussianModel:
         return optimizable_tensors
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_surface_refs=None):
+        if self.fixed_lidar_state is not None:
+            raise RuntimeError('Cloning/splitting is disabled for fixed LiDAR')
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,

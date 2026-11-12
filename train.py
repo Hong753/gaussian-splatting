@@ -44,6 +44,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
              publish_checkpoint_snapshots=False):
     if publish_checkpoint_snapshots and set(saving_iterations) != set(checkpoint_iterations):
         raise ValueError('Published snapshots require matching PLY and optimizer checkpoint iterations')
+    from utils.fixed_lidar import configure_training, project_scales, audit as audit_fixed_lidar
+    configure_training(opt, dataset)
     dataset.antialiasing = pipe.antialiasing
     dataset.optimization_settings = vars(opt).copy()
     from scripts.occlusion_options import configure_pipeline, prepare_training_geometry, inference_pipeline
@@ -145,6 +147,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+    if opt.fixed_lidar:
+        audit_fixed_lidar(gaussians, first_iter)
+        print(f'Fixed LiDAR: {len(gaussians.get_xyz):,} immutable centers; no cloning, splitting, pruning or opacity resets. '
+              f'Max sigma = {opt.max_scale_ratio:g} x initialization spacing'
+              + (f', additionally capped at {opt.max_scale_world:g} scene units.' if opt.max_scale_world else '.'))
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -319,7 +326,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Densification
             phase_iteration = iteration - opt.densification_phase_offset
-            if 0 < phase_iteration < opt.densify_until_iter:
+            if not opt.fixed_lidar and 0 < phase_iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 growth_filter = visibility_filter
@@ -387,6 +394,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     else:
                         gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
+
+                project_scales(gaussians)
+
+            if opt.fixed_lidar and (iteration == 1 or iteration % 1000 == 0 or iteration in saving_iterations):
+                import json
+                with open(os.path.join(scene.model_path, 'fixed_lidar_training.jsonl'), 'a') as stream:
+                    stream.write(json.dumps(audit_fixed_lidar(gaussians, iteration))+'\n')
 
             if publish_checkpoint_snapshots and iteration in saving_iterations:
                 from utils.checkpoint_snapshots import publish_snapshot
