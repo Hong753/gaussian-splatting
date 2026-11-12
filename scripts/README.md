@@ -1954,3 +1954,89 @@ Optional overrides for a fresh output directory: `LIDAR_OFFSET_MAX_WORLD`,
 `LIDAR_OFFSET_LR_INIT`, `LIDAR_OFFSET_LR_FINAL`, `LIDAR_OFFSET_PRIOR_WEIGHT`.
 Scale and pose overrides remain the `LOCAL_SCALE_TUNE_*` / `POSE_REFINE_*`
 variables above. Changing settings requires a new `LOCAL_SCALE_TUNE_MODEL`.
+
+### GPU 3: cap5 + bounded LiDAR offsets + poses + CUDA mesh culling
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_pose_lidar_culling.sh 3
+```
+
+This is a fresh, **30k-step** counterpart to GPU 2's cap5/offset/pose run. It
+keeps the same scale/LR schedules, original anchors and displacement limits.
+There is **no pruning, densification, or opacity reset**: visibility does not
+delete Gaussians. It requires a free GPU 3 and does not stop other jobs. Training
+and the independent all-frame evaluation process then share GPU 3.
+
+The measured full-scene mesh is read from
+`/data/3dgs_outputs/orange_4F/1_full/lidar_scene_surface_v1/scene.json`.
+Override with `LIDAR_CULLING_SCENE`. The mesh must match the original LiDAR,
+source cameras and training keyframes. Predicted supplementary meshes are not
+used by this experiment. Mesh and input checksums are recorded before launch;
+optimizer resumes also validate the culling policy and geometry fingerprints.
+
+For each **current corrected camera**, nvdiffrast rasterizes first-hit mesh
+depth on CUDA. The Gaussian CUDA compositor rejects a fragment when its
+Gaussian center's camera-z exceeds the pixel cutoff:
+
+`cutoff = conservative_mesh_depth + min(0.15, 0.05 + 0.005 * conservative_mesh_depth)`
+
+The constants are scene units: with metric LiDAR this is a 5 cm + 0.5% depth
+band, capped at 15 cm. It accommodates small registration/surface errors while
+blocking distant rooms. A two-pixel maximum-depth neighborhood relaxes culling
+near boundaries; unknown pixels stay infinite. Doorways and mesh holes are not
+filled. This is a per-pixel center-depth test, matching the compositor's depth
+ordering, not an ellipsoid/ray intersection or an exemption for large splats.
+Partially visible splats retain their unblocked contributions.
+
+During a pose-only step, all Gaussian parameters are detached. Mesh depth is
+recomputed for the proposed corrected camera and detached from autograd; pose
+gradients are piecewise gradients of the splat renderer. Pose fitting uses mesh
+interiors (valid neighboring depths spanning no more than the tolerance), with
+the pixel mask held fixed for the proposal and acceptance check. Views with
+fewer than 256 usable pixels skip the pose update. Gaussian optimization still
+uses the full RGB image, including pixels with unknown mesh depth.
+
+Gaussian rows with **no accepted rendering contribution** do not receive Adam
+updates or moment decay for that view. This includes fully blocked and
+out-of-view rows. Partial contributors update from their surviving pixels.
+Adam's parameter-group scalar step counter still advances. The local scale and
+anchor priors remain enabled, but do not move these frozen rows. Increased scale
+ceilings do not directly enlarge hidden Gaussians. This policy prevents stale
+momentum from moving a hidden point while preserving the original population.
+
+Depth caching keeps at most **two frames** on the device, plus the fixed mesh.
+Pose proposals and training steps during pose refinement are memory-only.
+Warmup and final frozen-pose depths use one replaceable disk entry per image and
+resolution, validated against the full camera signature. This does not load all
+view depths into RAM/VRAM or accumulate thousands of obsolete pose versions.
+
+The launcher checks native ray clipping/backward, corrected-pose depth and
+six-coordinate pose gradients, zero blocked-background RGB gradients, frozen
+Adam rows, and a complete pose/offset/scale update and checkpoint-resume cycle.
+All use the installed CUDA extensions before the full scene loads. Install the
+existing dependencies if absent; no new CUDA kernel is introduced:
+
+```bash
+python -m pip install --no-build-isolation -r requirements-occlusion.txt &&
+python -m pip install --no-build-isolation ./submodules/diff-gaussian-rasterization-occlusion
+```
+
+Output:
+`/data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_offsets_cap5_poses_culling_30000_v1`.
+Every 10k steps the independent evaluator computes **all 5,009-frame PSNR with
+culling OFF**, separately for original and cached training poses. It also
+renders matched train/held-out samples with culling ON and assembles
+**GT | culling OFF | culling ON**, including error maps and per-view PSNR, under
+`view_comparisons/iteration_STEP/culling_comparison/`. The periodic dashboard
+links these previews. They diagnose dependence on the external mesh; training
+with culling does not guarantee opaque foreground coverage at mesh-free inference.
+
+`pose_culling_training.jsonl` logs every 100 steps: mesh cutoff coverage,
+pose-interior coverage, image-footprint candidates, fully/partially blocked and
+contributing Gaussians, and the depth signature. `blocked/candidates` uses the
+number of Gaussians whose projected bounding footprints intersect the image,
+not the total scene population and not the fraction of pixels blocked.

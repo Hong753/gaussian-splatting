@@ -343,6 +343,8 @@ class GaussianModel:
                 attach_audit(self, training_args.local_scale_cache)
             from utils.distance_updates import bind_policy
             bind_policy(self, training_args, fresh=fresh_fixed)
+            from utils.pose_culling import bind_policy as bind_culling
+            bind_culling(self, training_args, fresh=fresh_fixed)
             from utils.lidar_offsets import bind as bind_offsets, state as offset_state
             bind_offsets(self,training_args)
             offsets=offset_state(self)

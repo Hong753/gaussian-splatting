@@ -27,6 +27,20 @@ def configure_training(opt, dataset):
         raise ValueError('Local-scale schedules require fixed LiDAR training')
     from utils.lidar_offsets import requested
     offset_policy=requested(opt)
+    from utils.pose_culling import requested as requested_culling
+    culling_policy=requested_culling(opt)
+    if culling_policy is not None:
+        if (not getattr(opt, 'fixed_lidar', False) or offset_policy is None or
+                not getattr(opt, 'pose_refinement', '') or dataset.occlusion_mode != 'mesh' or
+                dataset.occlusion_backend != 'ray' or dataset.occlusion_inference_mode != 'off' or
+                dataset.occlusion_margin != 0):
+            raise ValueError('Pose culling requires bounded LiDAR offsets, poses, ray mesh training and culling-free inference')
+        dataset.pose_culling=culling_policy
+        from utils.pose_culling import geometry_inputs
+        from utils.lidar_occlusion import file_digest
+        # Include the actual geometry in optimizer resume validation as well as
+        # the launcher's immutable input manifest.
+        opt.pose_culling_reference={str(path):file_digest(path) for path in geometry_inputs(dataset.occlusion_geometry)}
     if not getattr(opt, 'fixed_lidar', False):
         return
     validate_limits(opt.max_scale_ratio, opt.max_scale_world)
@@ -35,7 +49,7 @@ def configure_training(opt, dataset):
         raise ValueError('Hybrid scale control requires the original LiDAR local_scale_cache')
     if (dataset.model_type != '3dgs' or opt.optimizer_type != 'default' or
             opt.surface_mode != 'off' or opt.soft_surface_geometry or opt.absgs or
-            dataset.occlusion_mode != 'off' or dataset.train_depth_occlusion_dir or
+            (dataset.occlusion_mode != 'off' and culling_policy is None) or dataset.train_depth_occlusion_dir or
             opt.lidar_depth_weight or dataset.depths or dataset.train_test_exp):
         raise ValueError('Fixed LiDAR ablation uses native 3DGS, default Adam, no exposure, depth or surface losses/culling')
     opt.position_lr_init = opt.position_lr_final = 0.0

@@ -63,6 +63,9 @@ if [[ "${LOCAL_SCALE_TUNE_OFFSETS:-0}" == 1 ]]; then
     --offset-lr-init "${LIDAR_OFFSET_LR_INIT:-0.00001}" --offset-lr-final "${LIDAR_OFFSET_LR_FINAL:-0.000001}"
     --offset-prior-weight "${LIDAR_OFFSET_PRIOR_WEIGHT:-0.001}")
 fi
+if [[ "${LOCAL_SCALE_TUNE_CULLING:-0}" == 1 ]]; then
+  tune_schedule_args+=(--pose-culling --scene-geometry "${LIDAR_CULLING_SCENE:-$tune_root/lidar_scene_surface_v1/scene.json}")
+fi
 python -u scripts/tune_local_scale.py --model "$tune_reference"
 python -u scripts/tune_local_scale.py prepare \
   --reference-model "$tune_reference" --model "$tune_model" --gpu "$tune_gpu" \

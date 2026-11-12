@@ -113,6 +113,7 @@ class OptimizationParams(ParamGroup):
         self.local_scale_schedule = ""
         self.pose_refinement = ""
         self.lidar_offsets = ""
+        self.pose_culling = ""
         self.distance_weighting = False
         self.distance_reference = 2.0
         self.distance_power = 2.0

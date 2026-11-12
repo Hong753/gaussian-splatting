@@ -29,6 +29,8 @@ def parser():
     p.add_argument('--training-schedule',type=json.loads,help='Explicit JSON cap/LR policy; tune_local_scale.py constructs it')
     p.add_argument('--pose-policy',type=json.loads,help='Optional bounded train-camera refinement policy')
     p.add_argument('--lidar-offset-policy',type=json.loads,help='Bounded displacement from each original LiDAR row')
+    p.add_argument('--pose-culling-policy',type=json.loads,help='Pose-aware primary LiDAR mesh cutoffs')
+    p.add_argument('--scene-geometry',type=Path)
     return p
 
 
@@ -78,6 +80,20 @@ def build_plan(args):
         plan['lidar_offsets']=policy
         plan['positions']='bounded displacement from immutable original LiDAR rows; no population changes'
         plan['stages'][0]['argv'] += ['--lidar_offsets',json.dumps(policy,sort_keys=True)]
+    if getattr(args, 'pose_culling_policy', None) is not None:
+        from utils.pose_culling import validate as validate_culling, geometry_inputs
+        if not getattr(args, 'lidar_offset_policy', None) or not getattr(args, 'scene_geometry', None):
+            raise ValueError('Pose culling requires bounded LiDAR offsets and the scene mesh')
+        policy=validate_culling(args.pose_culling_policy)
+        geometry_inputs(args.scene_geometry, args.point_cloud, args.source)
+        command=plan['stages'][0]['argv']
+        command[command.index('--occlusion_mode')+1]='mesh'
+        command += ['--occlusion_backend','ray','--occlusion_geometry',str(args.scene_geometry.resolve()),
+                    '--occlusion_margin','0','--occlusion_edge_pixels',str(policy['edge_pixels']),
+                    '--pose_culling',json.dumps(policy,sort_keys=True)]
+        plan.update(hard_culling=True,pose_culling=policy,scene_geometry=str(args.scene_geometry.resolve()),
+            culling_protocol='primary measured mesh; corrected camera; per-pixel CUDA clipping; no-contribution Adam rows frozen',
+            inference_protocol='culling off; original/refined poses; additional matched culling-on previews')
     return plan
 
 
@@ -86,7 +102,11 @@ def prepare(argv):
     if args.baseline:
         args.keyframes = args.keyframes or args.baseline/'keyframes.json'
         args.point_cloud = args.point_cloud or args.baseline/'input.ply'
-    return periodic.prepare_experiment(args, build_plan(args), 'local_scale', [args.keyframes, args.point_cloud])
+    inputs=[args.keyframes,args.point_cloud]
+    if args.pose_culling_policy:
+        from utils.pose_culling import geometry_inputs
+        inputs += geometry_inputs(args.scene_geometry,args.point_cloud,args.source)
+    return periodic.prepare_experiment(args, build_plan(args), 'local_scale', inputs)
 
 
 def execute_plan(args, plan):
@@ -109,7 +129,13 @@ def execute_plan(args, plan):
     if getattr(args,'lidar_offset_policy',None) is not None:
         invoke(['scripts/smoke_lidar_offsets.py','--gpu',args.gpu,
                 '--ceiling-multiplier',str(getattr(args,'ceiling_multiplier',1.)),
-                '--output',str(model/'lidar_offsets_cuda_smoke.json')])
+                '--output',str(model/'lidar_offsets_cuda_smoke.json')]+
+                (['--pose-culling'] if getattr(args,'pose_culling_policy',None) is not None else []))
+    if getattr(args,'pose_culling_policy',None) is not None:
+        invoke(['scripts/smoke_ray_occlusion.py','--gpu',args.gpu,
+                '--output',str(model/'ray_occlusion_cuda_smoke.json')])
+        invoke(['scripts/smoke_pose_culling.py','--gpu',args.gpu,
+                '--output',str(model/'pose_culling_cuda_smoke.json')])
     from utils.local_scale import prepare as prepare_cache
     data = prepare_cache(args.point_cloud, plan['local_scale_cache'], neighbors=args.neighbors,
         support_sigma=args.support_sigma, overlap_factor=args.overlap_factor,

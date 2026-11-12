@@ -33,6 +33,8 @@ def schedule_arguments(parser):
     parser.add_argument('--pose-prior-weight',type=float,default=.001)
     parser.add_argument('--pose-max-width',type=int,default=960)
     parser.add_argument('--lidar-offsets',action='store_true')
+    parser.add_argument('--pose-culling',action='store_true')
+    parser.add_argument('--scene-geometry',type=Path)
     parser.add_argument('--offset-max-world',type=float,default=.005)
     parser.add_argument('--offset-sigma-ratio',type=float,default=.25)
     parser.add_argument('--offset-warmup',type=int,default=7000)
@@ -117,6 +119,8 @@ def prepare(argv):
     args.training_schedule=schedule
     args.pose_policy=None
     args.lidar_offset_policy=None
+    args.pose_culling_policy=None
+    args.scene_geometry=None
     if request.pose_refinement:
         from utils.pose_refinement import DEFAULTS, validate as validate_pose
         args.pose_policy=validate_pose({**DEFAULTS,**{key:getattr(request,'pose_'+key) for key in
@@ -127,6 +131,10 @@ def prepare(argv):
             **{key:getattr(request,'offset_'+key) for key in
                ('max_world','sigma_ratio','warmup','ramp','lr_init','lr_final','prior_weight')}},request.iterations)
     args.reuse_cache=Path(old['plan']['local_scale_cache'])
+    if request.pose_culling:
+        from utils.pose_culling import DEFAULTS as CULLING_DEFAULTS
+        args.pose_culling_policy=dict(CULLING_DEFAULTS)
+        args.scene_geometry=request.scene_geometry
     args.local_scale_cache=request.model/'local_scale_cache'
     for name in ('source','model','baseline','keyframes','point_cloud','reuse_cache','local_scale_cache'):
         if getattr(args,name,None) is not None:
@@ -138,6 +146,11 @@ def prepare(argv):
     if args.pose_policy is not None:
         from utils.pose_refinement import source_fingerprints
         inputs.extend(Path(path) for path in source_fingerprints(args.source))
+    if args.pose_culling_policy:
+        from utils.pose_culling import geometry_inputs
+        if args.scene_geometry is None:
+            raise ValueError('--pose-culling requires --scene-geometry')
+        inputs += geometry_inputs(args.scene_geometry,args.point_cloud,args.source)
     plan=run_local_scale.build_plan(args)
     folder=periodic.directory(args.model)
     if not args.dry_run and (folder/'plan.json').is_file():
@@ -148,6 +161,8 @@ def prepare(argv):
             prior_args.setdefault('training_schedule',None)
             prior_args.setdefault('pose_policy',None)
             prior_args.setdefault('lidar_offset_policy',None)
+            prior_args.setdefault('pose_culling_policy',None)
+            prior_args.setdefault('scene_geometry',None)
             if existing['plan'] != plan or prior_args != serialized:
                 raise ValueError('Prepared tuning run differs; use a fresh model directory')
             state_path=folder/'training.json'

@@ -17,6 +17,7 @@ def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--gpu',default='2');p.add_argument('--output',type=Path)
     p.add_argument('--ceiling-multiplier',type=float,default=5.)
+    p.add_argument('--pose-culling',action='store_true')
     args=p.parse_args(argv)
     os.environ['CUDA_VISIBLE_DEVICES']=args.gpu
     import numpy as np
@@ -51,6 +52,9 @@ def main(argv=None):
         policy={**DEFAULTS,'warmup':1,'ramp':1,'end':6}
         pose_policy={**POSES,'start':1,'end':4,'max_width':64}
         opt.lidar_offsets=json.dumps(policy);opt.pose_refinement=json.dumps(pose_policy)
+        if args.pose_culling:
+            from utils.pose_culling import DEFAULTS as CULLING
+            opt.pose_culling=json.dumps(CULLING)
         opt.local_scale_schedule=json.dumps(dict(schema=1,
             cap=dict(initial_multiplier=1.,final_multiplier=args.ceiling_multiplier,start=1,end=4),
             learning_rates=dict(start=1,end=6,groups={k:[v,v*.1] for k,v in GROUP_LRS.items()})))
@@ -65,6 +69,11 @@ def main(argv=None):
             world_view_transform=torch.eye(4,device='cuda'),projection_matrix=projection,full_proj_transform=projection,
             camera_center=torch.zeros(3,device='cuda'),original_image=torch.zeros(3,64,64),alpha_mask=torch.ones(1,64,64))
         pipe=SimpleNamespace(convert_SHs_python=False,compute_cov3D_python=False,debug=True,antialiasing=True,occlusion_mode='off')
+        if args.pose_culling:
+            from scripts.smoke_pose_culling import write_wall
+            cam.znear,cam.zfar=.01,100.
+            pipe.occlusion_mode='mesh';pipe.occlusion_backend='ray';pipe.pose_culling=dict(CULLING)
+            pipe.occlusion_geometry=str(write_wall(root,.31));pipe.occlusion_cache=str(root/'depth_cache');pipe.occlusion_margin=0.
         bg=torch.zeros(3,device='cuda')
         with torch.no_grad():
             cam.original_image=render_pose(cam,m,pipe,bg,bg.new_tensor([.003,-.002,.001]),bg.new_tensor([.001,0.,-.001])).cpu()
@@ -78,7 +87,8 @@ def main(argv=None):
             for k,value in zip(attrs,before):
                 assert torch.equal(getattr(model,k),value) and getattr(model,k).grad is None
             poses=[p.detach().clone() for p in model.pose_refiner.params[cam.image_name]]
-            image=render(model.pose_refiner.camera(cam),model,pipe,bg)['render']
+            package=render(model.pose_refiner.camera(cam),model,pipe,bg)
+            image=package['render']
             loss=(image-cam.original_image.cuda()).square().mean()+scale_regularization(model)+regularization(model)
             assert torch.isfinite(loss)
             loss.backward()
@@ -87,7 +97,12 @@ def main(argv=None):
                 assert model._xyz.grad is not None and model._xyz.grad.abs().sum()>0
             else:
                 assert model._xyz.grad is None and model._xyz not in model.optimizer.state
-            model.optimizer.step();project_scales(model);model.optimizer.zero_grad(set_to_none=True)
+            if args.pose_culling:
+                from utils.occlusion_culling import masked_adam_step
+                masked_adam_step(model.optimizer,package['occlusion_keep'])
+            else:
+                model.optimizer.step()
+            project_scales(model);model.optimizer.zero_grad(set_to_none=True)
             for a,b in zip(poses,model.pose_refiner.params[cam.image_name]):assert torch.equal(a,b)
             audit(model,i)
             return row
@@ -119,6 +134,7 @@ def main(argv=None):
         np.testing.assert_array_equal(np.column_stack([vertex[k] for k in ('x','y','z')]),restored._xyz.detach().cpu().numpy())
         assert source_fingerprints(root/'source')==fingerprints
         report=dict(passed=True,cuda_device=torch.cuda.get_device_name(),torch=torch.__version__,
+            pose_aware_culling=args.pose_culling,
             native_aa_alternating_updates=True,gaussians_frozen_during_pose_step=True,poses_frozen_during_gaussian_step=True,
             warmup_has_no_xyz_moments=True,absolute_xyz_lr=True,selective_xyz_moment_projection=True,
             original_anchors_and_xyz_optimizer_resume=True,overlap_counts_match_all_pairs=True,

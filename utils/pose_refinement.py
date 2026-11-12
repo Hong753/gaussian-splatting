@@ -87,11 +87,21 @@ def camera_with_transform(camera,w2c):
 
 def render_pose(camera, gaussians, pipe, background, translation, rotation, quaternion=None):
     """Native AA rasterization; only the six pose coordinates receive gradients."""
-    from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
     from utils.sh_utils import eval_sh
-    if getattr(pipe,'occlusion_mode','off') != 'off' or getattr(pipe,'absgs',False):
-        raise ValueError('Pose refinement uses ordinary native 3DGS + AA without external culling')
+    culling = getattr(pipe, 'occlusion_mode', 'off') != 'off'
+    if getattr(pipe,'absgs',False) or (culling and not getattr(pipe, 'pose_culling', None)):
+        raise ValueError('Pose refinement requires native 3DGS or explicit pose-aware ray culling')
+    extra = {}
     w2c,center=corrected_transform(camera,translation,rotation)
+    if culling:
+        from diff_gaussian_rasterization_occlusion import GaussianRasterizationSettings, GaussianRasterizer
+        from utils.ray_occlusion import pixel_cutoff
+        with torch.no_grad():
+            posed = camera_with_transform(camera, w2c.detach())
+            posed.occlusion_transient = True
+            extra['occlusion_depth'] = pixel_cutoff(posed, gaussians, pipe)
+    else:
+        from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
     with torch.no_grad():
         xyz=gaussians.get_xyz.detach()
         scales=gaussians.get_scaling.detach()
@@ -113,7 +123,7 @@ def render_pose(camera, gaussians, pipe, background, translation, rotation, quat
         sh_degree=gaussians.active_sh_degree,campos=xyz.new_zeros(3),prefiltered=False,
         # Explicit compensation above retains the AA forward image and avoids
         # the pinned native AA compensation derivative's double-added variance.
-        debug=getattr(pipe,'debug',False),antialiasing=False)
+        debug=getattr(pipe,'debug',False),antialiasing=False, **extra)
     result=GaussianRasterizer(raster_settings=settings)(means3D=means,means2D=torch.zeros_like(means),
         shs=None,colors_precomp=colors,opacities=opacity,scales=scales,rotations=rotations,cov3D_precomp=None)
     if len(result)>2 and result[2].requires_grad:
@@ -187,6 +197,15 @@ class PoseRefiner:
         target=F.interpolate(camera.original_image[:3].to(background.device)[None],size=(h,w),mode='bilinear',align_corners=False,antialias=True)[0]
         mask=camera.alpha_mask
         mask=target.new_ones((1,h,w)) if mask is None else F.interpolate(mask.to(background.device)[None],size=(h,w),mode='nearest')[0]
+        if getattr(pipe, 'pose_culling', None) and getattr(pipe, 'occlusion_mode', 'off') != 'off':
+            from utils.pose_culling import provider
+            with torch.no_grad():
+                posed=self.camera(cam)
+                posed.occlusion_transient=True
+                mask=mask*provider(pipe).frame(posed, background.device)['pose_mask'][None]
+            if int((mask > 0).sum()) < pipe.pose_culling['pose_min_pixels']:
+                return dict(iteration=iteration, image=name, accepted=False, skipped='insufficient_mesh_interior',
+                            pose_pixels=int((mask > 0).sum()))
         if not bool(mask.any()): return None
         optimizer=self.optimizer(name)
         phase=(iteration-cfg['start'])/(cfg['end']-cfg['start'])
@@ -223,7 +242,7 @@ class PoseRefiner:
             optimizer.load_state_dict(old_optimizer)
         optimizer.zero_grad(set_to_none=True)
         self.counts[name]['attempts']+=1;self.counts[name]['accepted']+=int(accepted)
-        return dict(iteration=iteration,image=name,accepted=accepted,projected=clipped,
+        return dict(iteration=iteration,image=name,accepted=accepted,projected=clipped,pose_pixels=int((mask > 0).sum()),
             objective_before=before,objective_candidate=after if after is not None and math.isfinite(after) else None,
             photo_before=before_photo,photo_candidate=after_photo if after_photo is not None and math.isfinite(after_photo) else None,
             translation_norm=float(self.params[name][0].norm()),rotation_degrees=math.degrees(float(self.params[name][1].norm())),
@@ -234,7 +253,9 @@ class PoseRefiner:
     def camera(self,camera):
         if camera.image_name not in self.params: return camera
         w2c,_=corrected_transform(camera,*self.params[camera.image_name])
-        return camera_with_transform(camera,w2c)
+        result=camera_with_transform(camera,w2c)
+        result.occlusion_transient=self.policy['start'] < self.iteration <= self.policy['end']
+        return result
 
     def capture(self):
         return dict(schema=1,policy=self.policy,source=self.source,fingerprints=self.fingerprints,base=self.base,

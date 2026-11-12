@@ -5,7 +5,7 @@ from pathlib import Path
 
 DEFAULTS = dict(occlusion_mode="off", occlusion_backend="whole", occlusion_geometry="", occlusion_cache="",
                 occlusion_margin=0.05, occlusion_sigma=3.0, occlusion_edge_pixels=1,
-                occlusion_chunk_size=131072)
+                occlusion_chunk_size=131072, pose_culling=None)
 
 
 def add_arguments(parser, per_model=False):
@@ -81,6 +81,12 @@ def validate(cfg):
         raise ValueError("occlusion_mode must be off, lidar, or mesh")
     if c["occlusion_mode"] == "off":
         return
+    if c['pose_culling']:
+        from utils.pose_culling import validate as validate_culling, geometry_inputs
+        validate_culling(c['pose_culling'])
+        if c['occlusion_mode'] != 'mesh' or c['occlusion_backend'] != 'ray' or c['occlusion_margin'] != 0:
+            raise ValueError('Pose-aware culling uses a mesh, the ray backend, and its own metric margin')
+        geometry_inputs(c['occlusion_geometry'])
     if not c["occlusion_geometry"] or not Path(c["occlusion_geometry"]).is_file():
         raise FileNotFoundError("Missing LiDAR occlusion geometry; native training prepares it automatically, "
                                 "or use scripts/prepare_occlusion.py for an existing checkpoint")

@@ -7,6 +7,9 @@ import torch
 
 
 def pixel_cutoff(camera, pc, pipe):
+    if getattr(pipe, 'pose_culling', None):
+        from utils.pose_culling import provider
+        return provider(pipe).pixel_depth(camera, pc.get_xyz.device).detach()
     if not hasattr(pipe, '_occlusion_provider'):
         if pipe.occlusion_mode == 'mesh':
             from utils.scene_occlusion import MeshDepthCache

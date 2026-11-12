@@ -284,6 +284,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp,
                             separate_sh=SPARSE_ADAM_AVAILABLE, occlusion_tiles=training_tiles, occlusion_depth=ray_depth)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        if getattr(pipe,'pose_culling',None) and (iteration == 1 or iteration % 100 == 0):
+            from utils.pose_culling import statistics as culling_statistics
+            import json
+            with open(os.path.join(scene.model_path,'pose_culling_training.jsonl'),'a') as stream:
+                stream.write(json.dumps(culling_statistics(render_pkg,viewpoint_cam,gaussians,pipe,iteration),allow_nan=False)+'\n')
 
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
@@ -396,7 +401,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if opt.position_warmup_steps or opt.position_ramp_steps or getattr(opt,'lidar_offsets',''):
                     progress["xyz lr"] = f"{position_lr:.2e}"
                 if 'occlusion_culled' in render_pkg:
-                    progress['ray-blocked'] = f"{100*render_pkg['occlusion_culled'].float().mean().item():.1f}%"
+                    candidate_count=(render_pkg['raster_radii'] > 0).sum().clamp_min(1)
+                    progress['blocked/candidates'] = f"{100*render_pkg['occlusion_culled'].sum().item()/candidate_count.item():.1f}%"
                 elif "occlusion_keep" in render_pkg:
                     progress["culled"] = f"{100*(1-render_pkg['occlusion_keep'].float().mean().item()):.1f}%"
                 if training_tiles is not None:

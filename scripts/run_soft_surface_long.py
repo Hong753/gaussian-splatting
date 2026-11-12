@@ -231,6 +231,16 @@ def evaluate(data, snapshot, start):
         result['refined_poses']=dict(metrics=str(refined/'summary.json'),per_frame=str(refined/'per_frame.csv'),
             previews=str(refined_previews/'index.html'),metrics_sha256=digest(refined/'summary.json'),
             per_frame_sha256=digest(refined/'per_frame.csv'),mean_psnr_db=cached['mean_psnr_db'],counts=cached['counts'])
+        if data['plan'].get('pose_culling'):
+            from scripts.pose_culling_preview import combine
+            enabled=previews/'poses_refined_culling_on'
+            run_occlusion.invoke(['scripts/render.py','--model',str(model),'--iteration',str(iteration),
+                '--split','both','--eval-set','unselected','--max-views',str(data['report_max_views']),
+                '--antialiasing','--occlusion','on','--camera-poses','refined','--gpu',data['gpu'],
+                '--in-process','--output',str(enabled)])
+            result['culling_comparison']=str(combine(refined_previews,enabled,previews/'culling_comparison',model,iteration))
+            if read_snapshot(model,iteration)!=snapshot:
+                raise ValueError('Checkpoint changed during culling comparison')
     atomic_json(directory(model)/f'iteration_{iteration}.json', result)
     return result
 
@@ -298,6 +308,15 @@ def experiment_diagnostics(data, start, end):
         warnings.append('No logged positive scale penalty; check whether any scales exceed the target')
     if hybrid and rows and rows[-1].get('local_scale_audit_samples_omitted', 0):
         warnings.append('Some whole overlap-audit samples exceeded the pair budget; reported counts cover retained samples only')
+    culling={}
+    if data['plan'].get('pose_culling'):
+        from scripts.tune_local_scale import read_rows
+        updates=[r for r in read_rows(Path(data['model'])/'pose_culling_training.jsonl') if start < r['iteration'] <= end]
+        culling=dict(logged_views=len(updates),latest=updates[-1] if updates else None)
+        if not updates or any(r['policy'] != data['plan']['pose_culling'] for r in updates):
+            good=False;warnings.append('Missing or inconsistent pose-aware culling diagnostics')
+        elif not any(r['fully_blocked'] or r['partially_blocked'] for r in updates):
+            warnings.append('No logged blocked Gaussians; inspect depth coverage and culling previews')
     distance = {}
     distance_policy = data['plan'].get('distance_updates')
     if distance_policy is not None:
@@ -318,6 +337,7 @@ def experiment_diagnostics(data, start, end):
     return dict(interval=[start, end], logged_checks=len(rows), passed=good,
                 scale_control=data['plan'].get('scale_control', 'clamp'), regularizer=regularizer,
                 **(dict(distance_updates=distance) if distance_policy is not None else {}),
+                **(dict(pose_culling=culling) if culling else {}),
                 latest=rows[-1] if rows else None,
                 warnings=warnings)
 
@@ -327,6 +347,8 @@ def completed_result(model, iteration, snapshot):
     if not path.is_file():
         return None
     result = json.loads(path.read_text())
+    if result.get('culling_comparison') and not Path(result['culling_comparison']).is_file():
+        return None
     if result.get('snapshot_id') != snapshot['snapshot_id'] or result.get('checkpoint_files') != snapshot['files']:
         return None
     for key in ('metrics', 'per_frame'):
@@ -369,6 +391,8 @@ def write_history(data, results):
             refined=result['refined_poses']
             links+=f' <a href="{html.escape(os.path.relpath(refined["previews"],folder))}">Cached-pose GT / render</a>'
             cells += [row['refined_all_psnr_db'],row['refined_selected_psnr_db']]
+        if result.get('culling_comparison'):
+            links+=f' <a href="{html.escape(os.path.relpath(result["culling_comparison"],folder))}">GT / culling OFF / culling ON</a>'
         body.append('<tr>'+''.join(f'<td>{html.escape(str(v))}</td>' for v in cells)+f'<td>{links}</td></tr>')
     title = {'local_scale':'Local KNN scale checkpoints', 'fixed_lidar':'Fixed LiDAR checkpoints',
              'discrete_lidar':'Discrete LiDAR checkpoints',
