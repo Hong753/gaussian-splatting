@@ -164,6 +164,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print(f'Ceiling multiplier: {cfg.get("ceiling_multiplier",1.):g}; '
                   f'target multiplier: {cfg.get("target_multiplier",1.):g}. '
                   'Relaxed caps keep the original 1x initialization. Targets are limited by the new ceiling.')
+            if gaussians.fixed_lidar_state.get('local_scale_schedule') is not None:
+                import json
+                print('Local scale / LR schedule: ' + json.dumps(gaussians.fixed_lidar_state['local_scale_schedule']['policy'], sort_keys=True))
         else:
             print(f'Scale {"cap" if opt.scale_control == "clamp" else "penalty target"} = '
                   f'{opt.max_scale_ratio:g} x initialization spacing'
@@ -309,6 +312,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     from utils.local_scale import projected_stats, pressure_stats
                     scale_stats.update(projected_stats(radii))
                     scale_stats.update(pressure_stats(gaussians,scale_sample))
+                    from utils.local_scale_schedule import stats as schedule_stats
+                    scale_stats.update(schedule_stats(gaussians))
             loss = loss.detach() + scale_loss.detach()
             del scale_loss
         soft_stats = None

@@ -15,11 +15,31 @@ tune_previous="${LOCAL_SCALE_TUNE_STOP_MODEL:-$tune_root/3dgs_stride3_aa_fixed_l
 tune_ceiling="${LOCAL_SCALE_TUNE_CEILING:-2}"
 tune_target="${LOCAL_SCALE_TUNE_TARGET:-1}"
 tune_iterations="${LOCAL_SCALE_TUNE_ITERATIONS:-30000}"
-tune_model="${LOCAL_SCALE_TUNE_MODEL:-$tune_root/3dgs_stride3_aa_fixed_lidar_local_cap${tune_ceiling}_target${tune_target}_${tune_iterations}_v1}"
+tune_schedule="${LOCAL_SCALE_TUNE_SCHEDULE:-off}"
+tune_suffix=''
+if [[ "$tune_schedule" != off ]]; then tune_suffix="_${tune_schedule}"; fi
+tune_model="${LOCAL_SCALE_TUNE_MODEL:-$tune_root/3dgs_stride3_aa_fixed_lidar_local_cap${tune_ceiling}_target${tune_target}${tune_suffix}_${tune_iterations}_v1}"
+tune_schedule_args=(--schedule-mode "$tune_schedule"
+  --scale-start-multiplier "${LOCAL_SCALE_TUNE_START_CEILING:-1}"
+  --scale-ramp-start "${LOCAL_SCALE_TUNE_RAMP_START:-7000}"
+  --scale-ramp-end "${LOCAL_SCALE_TUNE_RAMP_END:-20000}"
+  --lr-decay-start "${LOCAL_SCALE_TUNE_LR_START:-7000}"
+  --lr-decay-end "${LOCAL_SCALE_TUNE_LR_END:-$tune_iterations}"
+  --lr-scaling "${LOCAL_SCALE_TUNE_LR_SCALE:-0.001}"
+  --lr-scaling-final "${LOCAL_SCALE_TUNE_LR_SCALE_FINAL:-0.0001}"
+  --lr-opacity "${LOCAL_SCALE_TUNE_LR_OPACITY:-0.01}"
+  --lr-opacity-final "${LOCAL_SCALE_TUNE_LR_OPACITY_FINAL:-0.001}"
+  --lr-rotation "${LOCAL_SCALE_TUNE_LR_ROTATION:-0.0005}"
+  --lr-rotation-final "${LOCAL_SCALE_TUNE_LR_ROTATION_FINAL:-0.00005}"
+  --lr-f-dc "${LOCAL_SCALE_TUNE_LR_DC:-0.0025}"
+  --lr-f-dc-final "${LOCAL_SCALE_TUNE_LR_DC_FINAL:-0.00025}"
+  --lr-f-rest "${LOCAL_SCALE_TUNE_LR_REST:-0.000125}"
+  --lr-f-rest-final "${LOCAL_SCALE_TUNE_LR_REST_FINAL:-0.0000125}")
 python -u scripts/tune_local_scale.py --model "$tune_reference"
 python -u scripts/tune_local_scale.py prepare \
   --reference-model "$tune_reference" --model "$tune_model" --gpu "$tune_gpu" \
-  --ceiling-multiplier "$tune_ceiling" --target-multiplier "$tune_target" --iterations "$tune_iterations"
+  --ceiling-multiplier "$tune_ceiling" --target-multiplier "$tune_target" --iterations "$tune_iterations" \
+  "${tune_schedule_args[@]}"
 python -u scripts/stop_reconstruction_run.py --model "$tune_previous" --gpu "$tune_gpu" --stop
 tune_eval_pid=''
 tune_train_pid=''

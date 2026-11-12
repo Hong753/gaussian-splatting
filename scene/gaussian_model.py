@@ -293,6 +293,8 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         fixed = bool(getattr(training_args, 'fixed_lidar', False))
+        if getattr(training_args, 'local_scale_schedule', '') and not fixed:
+            raise ValueError('Local-scale schedules require fixed LiDAR training')
         discrete = bool(getattr(training_args, 'discrete_lidar', False))
         if discrete:
             if fixed or training_args.surface_mode != 'off' or self.optimizer_type != 'default':
@@ -363,6 +365,8 @@ class GaussianModel:
 
         self.exposure_optimizer = torch.optim.Adam([self._exposure])
         if fixed:
+            from utils.local_scale_schedule import bind
+            bind(self, training_args, fresh=fresh_fixed)
             from utils.fixed_lidar import project_scales
             project_scales(self, initializing=fresh_fixed)
 
@@ -378,6 +382,9 @@ class GaussianModel:
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
+        if self.fixed_lidar_state is not None:
+            from utils.local_scale_schedule import update
+            update(self, iteration)
         if self.pretrained_exposures is None:
             for param_group in self.exposure_optimizer.param_groups:
                 param_group['lr'] = self.exposure_scheduler_args(iteration)

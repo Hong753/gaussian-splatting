@@ -8,6 +8,7 @@ import signal
 import time
 
 SCRIPTS = {'run_fixed_lidar.py','run_distance_weighted.py','run_soft_surface_long.py',
+           'run_local_scale.py',
            'train.py','render.py','render_views_worker.py','eval_all_frames.py'}
 
 

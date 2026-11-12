@@ -9,6 +9,30 @@ import sys
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from scripts import run_local_scale,run_soft_surface_long as periodic
 from utils.checkpoint_snapshots import digest
+from utils.local_scale_schedule import GROUP_LRS, validate as validate_schedule
+
+
+def schedule_arguments(parser):
+    parser.add_argument('--schedule-mode',choices=('off','cap','lr','joint'),default='off')
+    parser.add_argument('--scale-start-multiplier',type=float,default=1.)
+    parser.add_argument('--scale-ramp-start',type=int,default=7000)
+    parser.add_argument('--scale-ramp-end',type=int,default=20000)
+    parser.add_argument('--lr-decay-start',type=int,default=7000)
+    parser.add_argument('--lr-decay-end',type=int,help='Defaults to the final training step')
+    for name, value in GROUP_LRS.items():
+        parser.add_argument('--lr-'+name.replace('_','-'),type=float,default=value)
+        parser.add_argument('--lr-'+name.replace('_','-')+'-final',type=float,default=value*.1)
+
+
+def requested_schedule(args):
+    if args.schedule_mode == 'off':
+        return None
+    cap = (dict(initial_multiplier=args.scale_start_multiplier,final_multiplier=args.ceiling_multiplier,
+                start=args.scale_ramp_start,end=args.scale_ramp_end) if args.schedule_mode in ('cap','joint') else None)
+    rates = (dict(start=args.lr_decay_start,end=args.lr_decay_end if args.lr_decay_end is not None else args.iterations,
+                  groups={name:[getattr(args,'lr_'+name),getattr(args,'lr_'+name+'_final')] for name in GROUP_LRS})
+             if args.schedule_mode in ('lr','joint') else None)
+    return validate_schedule(dict(schema=1,cap=cap,learning_rates=rates),args.ceiling_multiplier,args.iterations)
 
 
 def read_rows(path):
@@ -32,6 +56,9 @@ def inspect(model):
         values=[row[key] for row in updates if row.get(key) is not None]
         if values:
             result[key+'_recent_median']=statistics.median(values)
+    if updates:
+        result['latest_schedule'] = {key:value for key,value in updates[-1].items()
+            if key.startswith('lr_') or key in ('schedule_iteration','current_ceiling_multiplier')}
     result['interpretation']='Growth at cap measures supervised points whose RGB gradient requests larger scales. Global at-cap fraction alone also includes untouched initialization points.'
     print(json.dumps(result,indent=2),flush=True)
     return result
@@ -39,7 +66,7 @@ def inspect(model):
 
 def audit_subset(row):
     return {key:row[key] for key in ('iteration','gaussians','at_cap_fraction','above_target_fraction','largest_sigma',
-        'ceiling_multiplier','target_multiplier','effective_max_scale_world') if key in row}
+        'ceiling_multiplier','current_ceiling_multiplier','target_multiplier','effective_max_scale_world') if key in row}
 
 
 def prepare(argv):
@@ -51,7 +78,9 @@ def prepare(argv):
     p.add_argument('--target-multiplier',type=float,default=1.)
     p.add_argument('--iterations',type=int,default=30000)
     p.add_argument('--dry-run',action='store_true')
+    schedule_arguments(p)
     request=p.parse_args(argv)
+    schedule=requested_schedule(request)
     reference=request.reference_model.expanduser().resolve()
     old=periodic.load_plan(reference)
     if (old.get('experiment') != 'local_scale' or old['plan'].get('ceiling_multiplier',1.) != 1. or
@@ -67,6 +96,7 @@ def prepare(argv):
     args.dry_run=request.dry_run
     args.ceiling_multiplier=request.ceiling_multiplier
     args.target_multiplier=request.target_multiplier
+    args.training_schedule=schedule
     args.reuse_cache=Path(old['plan']['local_scale_cache'])
     args.local_scale_cache=request.model/'local_scale_cache'
     for name in ('source','model','baseline','keyframes','point_cloud','reuse_cache','local_scale_cache'):
@@ -82,7 +112,9 @@ def prepare(argv):
         with periodic.process_lock(folder/'trainer.lock'),periodic.process_lock(folder/'evaluator.lock'):
             existing=periodic.load_plan(args.model)
             serialized={key:str(value) if isinstance(value,Path) else value for key,value in vars(args).items()}
-            if existing['plan'] != plan or existing['training_args'] != serialized:
+            prior_args=dict(existing['training_args'])
+            prior_args.setdefault('training_schedule',None)
+            if existing['plan'] != plan or prior_args != serialized:
                 raise ValueError('Prepared tuning run differs; use a fresh model directory')
             print(f'Reusing identical prepared tuning run: {folder/"plan.json"}',flush=True)
             return 0

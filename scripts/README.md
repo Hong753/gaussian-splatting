@@ -1674,3 +1674,90 @@ at once. Overrides: `LOCAL_SCALE_TUNE_REFERENCE`, `LOCAL_SCALE_TUNE_STOP_MODEL`,
 `LOCAL_SCALE_TUNE_TARGET=1.5`, for example, is a separate relaxation of the soft
 preference; keep it at 1 for the first cap-only test. Changing a multiplier requires
 a fresh trial; optimizer checkpoints reject mismatched multipliers on restore.
+
+### Gradual scale allowance and independent parameter learning rates
+
+To test a gradual allowance together with more conservative shape/opacity rates:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+LOCAL_SCALE_TUNE_SCHEDULE=joint bash scripts/run_local_scale_tune.sh 0
+```
+
+Use this in place of the static 2x command. The fresh output is
+`3dgs_stride3_aa_fixed_lidar_local_cap2_target1_joint_30000_v1`. The original
+GPU 3 experiment remains the reference. This wrapper still stops only the
+explicit `LOCAL_SCALE_TUNE_STOP_MODEL` (the old GPU 0 clamping run by default).
+If the static 2x trial has already been started on GPU 0 and should be replaced,
+set `LOCAL_SCALE_TUNE_STOP_MODEL` to its full model path before this command.
+Do not run both trainers on GPU 0 concurrently.
+
+For each original local ceiling `b_i`, the allowed sigma becomes `m(t) * b_i`:
+
+- Steps 0–7k: `m=1`.
+- Steps 7k–20k: a half-cosine ramp from `m=1` to `m=2`.
+- Steps 20k–30k: `m=2`.
+
+`LOCAL_SCALE_TUNE_CEILING=2.5` changes the final allowance to 2.5x. The cap is
+computed from immutable bounds every step, so there is no cumulative rounding
+drift. Changing it does **not** scale the learned Gaussians or optimizer moments.
+The smaller soft target remains fixed. RGB optimization must justify any growth.
+The final-cap cache also bounds the overlap audit for every earlier step.
+
+The joint preset proposes the following LRs. These are starting hypotheses to
+evaluate, not measured optimal values. The scale LR acts on **log sigma**; no
+global scene-extent multiplier is applied to these groups.
+
+| Parameter | Previous constant LR | Steps 0–7k | At 30k |
+| --- | --- | --- | --- |
+| Scale | 0.005 | 0.001 | 0.0001 |
+| Opacity logits | 0.025 | 0.01 | 0.001 |
+| Rotation parameters | 0.001 | 0.0005 | 0.00005 |
+| SH DC | 0.0025 | 0.0025 | 0.00025 |
+| Higher-order SH | 0.000125 | 0.000125 | 0.0000125 |
+| XYZ | 0 | 0 | 0 |
+
+Each non-position group holds its initial LR through 7k, then smoothly interpolates
+in log-LR space to its own final value at 30k. Exposure compensation is disabled.
+All original LiDAR centers and the population remain fixed; there are no opacity
+resets, pruning, densification, mesh culling, or distance-weighted updates.
+
+For controlled comparisons, `LOCAL_SCALE_TUNE_SCHEDULE` accepts `off` (the previous
+static cap and constant LRs), `cap` (cap ramp only, previous constant LRs), `lr`
+(new LR schedules, static final cap), or `joint`. Each mode gets a distinct output
+name. Compare at matching 10k/20k/30k snapshots and shared camera poses. Every
+10k, the independent evaluator still processes all 5,009 frames and produces
+train/unselected PSNR and actual/render/error comparisons. Changing both caps
+and LRs together measures the combined recipe; the cap-only run isolates the
+effect of the new learning-rate recipe.
+
+Overrides for the schedule are `LOCAL_SCALE_TUNE_START_CEILING`,
+`LOCAL_SCALE_TUNE_RAMP_START`, `LOCAL_SCALE_TUNE_RAMP_END`,
+`LOCAL_SCALE_TUNE_LR_START`, and `LOCAL_SCALE_TUNE_LR_END`. Initial LRs use
+`LOCAL_SCALE_TUNE_LR_SCALE`, `_OPACITY`, `_ROTATION`, `_DC`, and `_REST`;
+append `_FINAL` for their separate final values. For example, after another
+trial has finished:
+
+```bash
+LOCAL_SCALE_TUNE_SCHEDULE=joint \
+LOCAL_SCALE_TUNE_LR_SCALE=0.0005 \
+LOCAL_SCALE_TUNE_LR_SCALE_FINAL=0.00005 \
+LOCAL_SCALE_TUNE_MODEL=/data/3dgs_outputs/orange_4F/1_full/local_ramp2_scale_lr_half_v1 \
+bash scripts/run_local_scale_tune.sh 0
+```
+
+Use a fresh model name when changing the rates or timing. The saved plan records
+the exact policy, and optimizer checkpoints include its current iteration and
+bounds. Resume rejects a changed policy and continues the original cap/LR phase.
+The native CUDA smoke exercises all phases on a tiny scene before full training.
+
+`scale_regularization_training.jsonl` logs `current_ceiling_multiplier`,
+`schedule_iteration`, and the actual `lr_xyz`, `lr_scaling`, `lr_opacity`,
+`lr_rotation`, `lr_f_dc`, and `lr_f_rest` alongside active growth pressure and
+projected sizes. `fixed_lidar_training.jsonl` reports the current absolute cap,
+not just the eventual 2x cap. The inspection command above summarizes these
+fields. Use held-out quality, floor/texture crops, and these diagnostics to choose
+the next LR trial; reaching a cap alone is not evidence that an LR is too high.

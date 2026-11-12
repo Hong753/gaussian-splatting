@@ -23,6 +23,8 @@ def validate_control(mode, weight):
 
 def configure_training(opt, dataset):
     """Canonicalize the fixed-population ablation before recording cfg_args."""
+    if getattr(opt, 'local_scale_schedule', '') and not getattr(opt, 'fixed_lidar', False):
+        raise ValueError('Local-scale schedules require fixed LiDAR training')
     if not getattr(opt, 'fixed_lidar', False):
         return
     validate_limits(opt.max_scale_ratio, opt.max_scale_world)
@@ -162,4 +164,8 @@ def audit(model, iteration):
                       effective_max_scale_world=state['world']*state.get('local_scale_ceiling_multiplier',1.))
     if state.get('distance_update_policy') is not None:
         result['distance_update_policy'] = state['distance_update_policy']
+    if state.get('local_scale_schedule') is not None:
+        from utils.local_scale_schedule import stats
+        result.update(stats(model))
+        result['effective_max_scale_world'] = state['world'] * result['current_ceiling_multiplier']
     return result

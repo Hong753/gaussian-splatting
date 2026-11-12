@@ -2,6 +2,7 @@
 """Fixed LiDAR 3DGS + AA: local KNN hard ceilings and overlap-oriented soft targets."""
 import os
 import math
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -25,6 +26,7 @@ def parser():
     p.add_argument('--ceiling-multiplier',type=float,default=1.)
     p.add_argument('--target-multiplier',type=float,default=1.)
     p.add_argument('--reuse-cache',type=Path,help='Reuse original 1x KNN bounds; rebuild overlap audit at the new ceilings')
+    p.add_argument('--training-schedule',type=json.loads,help='Explicit JSON cap/LR policy; tune_local_scale.py constructs it')
     return p
 
 
@@ -56,6 +58,11 @@ def build_plan(args):
                                       '--local_scale_target_multiplier',str(target)]
     if getattr(args,'reuse_cache',None) is not None:
         plan['reuse_cache'] = str(Path(args.reuse_cache).expanduser().resolve())
+    if getattr(args,'training_schedule',None) is not None:
+        from utils.local_scale_schedule import validate as validate_schedule
+        policy = validate_schedule(args.training_schedule, ceiling, args.iterations)
+        plan['training_schedule'] = policy
+        plan['stages'][0]['argv'] += ['--local_scale_schedule',json.dumps(policy,sort_keys=True)]
     return plan
 
 
@@ -74,10 +81,13 @@ def execute_plan(args, plan):
         raise RuntimeError('Activate the CUDA-enabled 3dgs environment')
     model = Path(plan['model'])
     model.mkdir(parents=True, exist_ok=True)
-    invoke(['scripts/smoke_local_scale.py', '--gpu', args.gpu,
+    smoke = ['scripts/smoke_local_scale.py', '--gpu', args.gpu,
             '--ceiling-multiplier',str(getattr(args,'ceiling_multiplier',1.)),
             '--target-multiplier',str(getattr(args,'target_multiplier',1.)),
-            '--output', str(model/'local_scale_cuda_smoke.json')])
+            '--output', str(model/'local_scale_cuda_smoke.json')]
+    if getattr(args,'training_schedule',None) is not None:
+        smoke += ['--training-schedule',json.dumps(args.training_schedule,sort_keys=True)]
+    invoke(smoke)
     from utils.local_scale import prepare as prepare_cache
     data = prepare_cache(args.point_cloud, plan['local_scale_cache'], neighbors=args.neighbors,
         support_sigma=args.support_sigma, overlap_factor=args.overlap_factor,
