@@ -1822,6 +1822,24 @@ colors using the corresponding world-space directions. The launcher first runs
 pose coordinates, frozen Gaussian parameters, bounded accepted updates, and
 cache/resume checks on CUDA. A failed check stops the experiment before training.
 
+The pose-only pass applies AA opacity compensation explicitly, with chunked
+recomputation for its derivative. This avoids an incorrect derivative in the
+pinned rasterizer, which evaluates the compensation derivative using covariance
+entries that already contain the 0.3 pixel blur variance. Its forward factor is
+unchanged; ordinary Gaussian training continues to use the installed native
+kernel. No extension rebuild is required. Full-image forward parity is checked
+on the original 25-splat fixture. Six-coordinate gradient checks use a separate
+anisotropic splat, nonidentity camera and nonconstant SH, in both AA modes,
+against a float64 matrix-covariance reference and two finite-difference steps.
+The fixed probe pixels must remain away from alpha cutoff, opacity cap, tile and
+transmittance branches for every perturbation. Arbitrary full-image differences
+can jump across those hard branches; the gradient tolerances are not relaxed.
+
+If this preflight fails before Gaussian training starts, pulling a fix and
+rerunning the same launcher reuses the prepared directory and resets its failed
+status before starting the evaluator. A failed directory that already contains
+training artifacts is not silently restarted from initialization.
+
 Original COLMAP poses, intrinsics, images and LiDAR input are never rewritten.
 The source calibration is fingerprinted. With an explicit input PLY, loading also
 skips point-cloud conversion inside the source directory. Each saved snapshot has

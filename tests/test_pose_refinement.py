@@ -202,7 +202,11 @@ class PosePlanTests(unittest.TestCase):
         run_local_scale.prepare(self.argv)
         destination=self.root/'pose_trial'
         args=['--reference-model',str(self.model),'--model',str(destination),'--gpu','0','--schedule-mode','joint','--pose-refinement']
-        tune_local_scale.prepare(args);tune_local_scale.prepare(args)
+        tune_local_scale.prepare(args)
+        state=periodic.directory(destination)/'training.json'
+        atomic_json(state,dict(state='failed',error='pose CUDA preflight'))
+        tune_local_scale.prepare(args)
+        self.assertEqual(json.loads(state.read_text())['state'],'prepared')
         data=periodic.load_plan(destination)
         self.assertEqual(data['plan']['pose_refinement'],DEFAULTS)
         self.assertEqual(data['iterations'],[10000,20000,30000])
@@ -212,6 +216,11 @@ class PosePlanTests(unittest.TestCase):
         self.assertIn('--local_scale_schedule',command)
         self.assertEqual(command[command.index('--position_lr_init')+1],'0')
         self.assertTrue(any(path.endswith('images.txt') for path in data['input_fingerprints']))
+        # A real partially trained run must not silently restart from scratch.
+        (destination/'cfg_args').write_text('Namespace()')
+        atomic_json(state,dict(state='failed',error='training error'))
+        with self.assertRaisesRegex(ValueError,'fresh model directory'):
+            tune_local_scale.prepare(args)
 
 
 class PoseEvaluationTests(unittest.TestCase):

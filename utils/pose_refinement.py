@@ -101,6 +101,9 @@ def render_pose(camera, gaussians, pipe, background, translation, rotation, quat
     means=(xyz-center) @ w2c[:3,:3].T
     q=quaternion_product(rotation_quaternion(rotation),quaternion if quaternion is not None else base_quaternion(camera))
     rotations=quaternion_product(q,rotations)
+    if pipe.antialiasing:
+        from utils.pose_antialiasing import pose_compensation
+        opacity=opacity*pose_compensation(means,scales,rotations,camera)
     directions=F.normalize(xyz-center,dim=-1,eps=1e-8)
     colors=(eval_sh(gaussians.active_sh_degree,sh,directions)+.5).clamp_min(0).contiguous()
     identity=torch.eye(4,device=xyz.device,dtype=xyz.dtype)
@@ -108,7 +111,9 @@ def render_pose(camera, gaussians, pipe, background, translation, rotation, quat
         tanfovx=math.tan(camera.FoVx/2),tanfovy=math.tan(camera.FoVy/2),bg=background,
         scale_modifier=1.,viewmatrix=identity,projmatrix=camera.projection_matrix,
         sh_degree=gaussians.active_sh_degree,campos=xyz.new_zeros(3),prefiltered=False,
-        debug=getattr(pipe,'debug',False),antialiasing=pipe.antialiasing)
+        # Explicit compensation above retains the AA forward image and avoids
+        # the pinned native AA compensation derivative's double-added variance.
+        debug=getattr(pipe,'debug',False),antialiasing=False)
     result=GaussianRasterizer(raster_settings=settings)(means3D=means,means2D=torch.zeros_like(means),
         shs=None,colors_precomp=colors,opacities=opacity,scales=scales,rotations=rotations,cov3D_precomp=None)
     if len(result)>2 and result[2].requires_grad:

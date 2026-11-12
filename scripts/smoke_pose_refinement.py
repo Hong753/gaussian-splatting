@@ -51,23 +51,13 @@ def main(argv=None):
         native=render(camera_with_transform(camera,corrected_transform(camera,translation,rotation)[0]),model,pipe,bg)['render']
     transformed=render_pose(camera,model,pipe,bg,translation,rotation)
     torch.testing.assert_close(transformed,native,atol=4e-5,rtol=3e-4)
-    weights=torch.rand_like(transformed)-.5
-    objective=(transformed*weights).sum()/transformed.numel()
-    analytic=torch.cat(torch.autograd.grad(objective,(translation,rotation)))
-    numeric=[]
-    with torch.no_grad():
-        for axis in range(6):
-            eps=.001
-            values=[]
-            for sign in (-1,1):
-                t,r=translation.detach().clone(),rotation.detach().clone()
-                (t if axis<3 else r)[axis%3]+=sign*eps
-                cam=camera_with_transform(camera,corrected_transform(camera,t,r)[0])
-                values.append(float((render(cam,model,pipe,bg)['render']*weights).sum()/weights.numel()))
-            numeric.append((values[1]-values[0])/(2*eps))
-    numeric=torch.tensor(numeric,device='cuda')
-    assert torch.isfinite(analytic).all() and analytic[:3].norm()>1e-7 and analytic[3:].norm()>1e-7
-    torch.testing.assert_close(analytic,numeric,atol=2e-5,rtol=.05)
+    # The dense image still checks full forward parity. Its hard 1/255 alpha
+    # cutoffs make an arbitrary full-image finite difference nondifferentiable.
+    # Check derivatives on a separate anisotropic, nonidentity, nonconstant-SH
+    # probe with guarded stable branches, in AA-off AND AA-on modes.
+    del transformed,native
+    from scripts.pose_gradient_check import probe_model,cuda_pose_gradient_check
+    gradient_checks=cuda_pose_gradient_check(camera,probe_model(bg.device),pipe,bg)
     assert all(getattr(model,name).grad is None for name in ('_xyz','_scaling','_rotation','_opacity','_features_dc','_features_rest'))
     with tempfile.TemporaryDirectory(prefix='pose_smoke_') as tmp:
         root=Path(tmp);sparse=root/'source/sparse/0';sparse.mkdir(parents=True)
@@ -95,7 +85,7 @@ def main(argv=None):
         assert path.is_file() and source_fingerprints(root/'source')==original
     report=dict(passed=True,cuda_device=torch.cuda.get_device_name(),torch=torch.__version__,
         native_vs_pose_render_parity=True,six_dof_finite_difference=True,
-        analytic_gradient=analytic.tolist(),finite_difference_gradient=numeric.tolist(),
+        gradient_checks=gradient_checks,exact_pose_aa_compensation=True,
         gaussians_frozen_during_pose_step=True,accepted_pose_steps=sum(r['accepted'] for r in rows),
         bounds_and_resume=True,source_calibration_unchanged=True)
     if args.output:

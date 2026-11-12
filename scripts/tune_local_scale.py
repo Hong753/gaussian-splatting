@@ -135,6 +135,15 @@ def prepare(argv):
             prior_args.setdefault('pose_policy',None)
             if existing['plan'] != plan or prior_args != serialized:
                 raise ValueError('Prepared tuning run differs; use a fresh model directory')
+            state_path=folder/'training.json'
+            state=json.loads(state_path.read_text())
+            if state.get('state')=='failed':
+                # The watcher starts before the trainer. A stale failed status
+                # would make it exit immediately on a preflight retry.
+                if ((args.model/'cfg_args').exists() or any(args.model.glob('chkpnt*.pth')) or
+                        any((args.model/'point_cloud').glob('iteration_*'))):
+                    raise ValueError('Failed run contains training artifacts; use a fresh model directory or explicit checkpoint resume')
+                periodic.atomic_json(state_path,dict(state='prepared',retry_after_error=state.get('error')))
             print(f'Reusing identical prepared tuning run: {folder/"plan.json"}',flush=True)
             return 0
     return periodic.prepare_experiment(args,plan,'local_scale',inputs)
