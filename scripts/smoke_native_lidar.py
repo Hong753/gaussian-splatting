@@ -20,6 +20,7 @@ def main(argv=None):
     p.add_argument('--scaling-lr', type=float, default=.005)
     p.add_argument('--iterations', type=int, default=30000)
     p.add_argument('--preserve-densification-radii', action='store_true')
+    p.add_argument('--freeze-lidar-positions', action='store_true')
     args = p.parse_args(argv)
     if not math.isfinite(args.percent_dense) or not 0 < args.percent_dense <= 1:
         p.error('percent-dense must be finite and in (0, 1]')
@@ -43,7 +44,8 @@ def main(argv=None):
         '--position_lr_final', str(.0000016/args.position_lr_divisor),
         '--scaling_lr', str(args.scaling_lr), '--iterations', str(args.iterations),
         '--position_lr_max_steps', str(args.iterations),
-        '--disable_opacity_resets', '--disable_pruning', '--percent_dense', str(args.percent_dense)]))
+        '--disable_opacity_resets', '--disable_pruning', '--percent_dense', str(args.percent_dense),
+        *(['--freeze_lidar_positions'] if args.freeze_lidar_positions else [])]))
     cloud = BasicPointCloud(points=np.array([[-.15,-.1,2],[.15,-.1,2],[-.15,.1,2],[.15,.1,2]], np.float32),
         colors=np.array([[.7,.2,.1],[.2,.6,.2],[.2,.3,.8],[.8,.7,.2]], np.float32),
         normals=np.zeros((4,3), np.float32))
@@ -51,6 +53,7 @@ def main(argv=None):
     model.create_from_pcd(cloud, [SimpleNamespace(image_name='smoke')], 100.)
     model.training_setup(opt)
     original = model.get_xyz.detach().clone()
+    original_color = model._features_dc.detach().clone()
     camera = SimpleNamespace(image_width=48, image_height=48, FoVx=math.pi/2, FoVy=math.pi/2,
         world_view_transform=torch.eye(4, device='cuda'),
         full_proj_transform=getProjectionMatrix(.01,100.,math.pi/2,math.pi/2).cuda().T,
@@ -58,15 +61,51 @@ def main(argv=None):
     pipe = SimpleNamespace(convert_SHs_python=False, compute_cov3D_python=False,
                            debug=True, antialiasing=True, occlusion_mode='off')
     for step in range(1, 4):
-        assert model.update_learning_rate(step) > 0
+        lr = model.update_learning_rate(step)
+        assert (lr == 0) if args.freeze_lidar_positions else (lr > 0)
         image = render(camera, model, pipe, torch.zeros(3, device='cuda'))['render']
         assert torch.isfinite(image).all()
         (image-.6).square().mean().backward()
-        assert model._xyz.grad is not None and model._xyz.grad.abs().sum() > 0
+        if args.freeze_lidar_positions:
+            assert model._xyz.grad is None and not model._xyz.requires_grad
+        else:
+            assert model._xyz.grad is not None and model._xyz.grad.abs().sum() > 0
         assert all(p.grad is None or torch.isfinite(p.grad).all()
                    for g in model.optimizer.param_groups for p in g['params'])
         model.optimizer.step()
         model.optimizer.zero_grad(set_to_none=True)
+    if args.freeze_lidar_positions:
+        assert torch.equal(original, model.get_xyz)
+        assert not torch.equal(original_color, model._features_dc)
+        assert model._xyz not in model.optimizer.state
+        with torch.no_grad():
+            model._scaling[:] = math.log(.001)
+            model._scaling[1] = math.log(.02)
+            model._opacity[0] = -20
+            model.xyz_gradient_accum[:] = 1  # Even high gradients cannot trigger growth.
+            model.denom[:] = 1
+            model.densify_and_prune(.0001, .005, 1., 0., torch.ones(4, device='cuda'),
+                record_stats=True, max_world_size=.01, preserve_radii=True)
+        assert len(model.get_xyz) == 2
+        assert model.last_densification_stats['cloned_parents'] == model.last_densification_stats['split_parents'] == 0
+        assert model.last_densification_stats['pruned'] == 2 and model.last_densification_stats['positions_frozen']
+        assert torch.equal(model.get_xyz, original[2:]) and not model._xyz.requires_grad
+        restored = GaussianModel(0)
+        restored._exposure = torch.nn.Parameter(model._exposure.detach().clone())
+        restored.restore(model.capture(), opt)
+        restored._features_dc.sum().backward()
+        restored.optimizer.step()
+        assert not restored._xyz.requires_grad and restored._xyz not in restored.optimizer.state
+        assert torch.equal(restored.get_xyz, original[2:])
+        result = dict(passed=True, cuda_device=torch.cuda.get_device_name(), torch=torch.__version__,
+            native_aa_rgb_gradients=True, fixed_centers=True, appearance_updated=True,
+            opacity_and_world_pruning=True, no_cloning_or_splitting=True,
+            checkpoint_round_trip=True, scaling_lr=opt.scaling_lr)
+        if args.output:
+            from utils.checkpoint_snapshots import atomic_json
+            atomic_json(args.output, result)
+        print(json.dumps(result, indent=2))
+        return 0
     assert not torch.equal(original, model.get_xyz)
     # Force both native growth branches and an opacity that would be pruned.
     with torch.no_grad():

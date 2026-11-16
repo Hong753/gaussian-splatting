@@ -18,6 +18,8 @@ def parser():
     p.description = __doc__
     p.set_defaults(gpu='1', iterations=30000, scale_control='off')
     p.add_argument('--position-lr-divisor', type=float, default=50.)
+    p.add_argument('--freeze-lidar-positions', action='store_true',
+                   help='Freeze original XYZ and disable cloning/splitting while retaining optional pruning')
     p.add_argument('--pruning', action='store_true', help='Enable native opacity/size pruning during densification')
     p.add_argument('--percent-dense', type=float, default=None,
                    help='Clone/split sigma boundary as a fraction of scene extent (native default: 0.01)')
@@ -97,6 +99,15 @@ def build_plan(args):
     if getattr(args, 'preserve_densification_radii', False):
         command.append('--preserve_densification_radii')
         plan['preserve_densification_radii'] = True
+    if getattr(args, 'freeze_lidar_positions', False):
+        command.append('--freeze_lidar_positions')
+        for field in ('--position_lr_init', '--position_lr_final'):
+            command[command.index(field)+1] = '0'
+        plan.update(positions='fixed throughout; surviving original LiDAR coordinates',
+                    freeze_lidar_positions=True,
+                    population='pruning only; no cloning/splitting' if pruning else 'constant',
+                    position_lr=dict(init=0., final=0., max_steps=args.iterations, warmup_steps=0))
+        plan['densification']['enabled'] = False
     return plan
 
 
@@ -118,6 +129,8 @@ def execute_plan(args, plan):
             '--output', str(Path(plan['model'])/'native_lidar_cuda_smoke.json')]
     if plan.get('preserve_densification_radii'):
         smoke.append('--preserve-densification-radii')
+    if plan.get('freeze_lidar_positions'):
+        smoke.append('--freeze-lidar-positions')
     invoke(smoke)
     return fixed.execute_plan(args, plan, smoke=False)
 

@@ -103,6 +103,7 @@ class OptimizationParams(ParamGroup):
         self.position_ramp_steps = 0
         self.densification_phase_offset = 0
         self.fixed_lidar = False
+        self.freeze_lidar_positions = False
         self.max_scale_ratio = 2.0
         self.max_scale_world = 0.0
         self.scale_control = "clamp"

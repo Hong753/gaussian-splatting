@@ -260,11 +260,14 @@ def experiment_diagnostics(data, start, end):
         bad = [r['iteration'] for r in rows
                if not data['plan'].get('pruning', False) and
                (r['pruned'] != 0 or r['points_after'] < r['points_before'])]
+        if data['plan'].get('freeze_lidar_positions'):
+            bad += [r['iteration'] for r in rows if not r.get('positions_frozen') or
+                    r['cloned_parents'] or r['split_parents'] or r['points_after'] > r['points_before']]
         warnings = []
         if missing:
             warnings.append(f'Missing {len(missing)} native densification events')
         if bad:
-            warnings.append(f'Unexpected population loss/pruning at {bad[:5]}')
+            warnings.append(f'Population/position policy violation at {bad[:5]}')
         return dict(interval=[start, end], passed=not missing and not bad, warnings=warnings,
             logged_events=len(rows), cloned_parents=sum(r['cloned_parents'] for r in rows),
             split_parents=sum(r['split_parents'] for r in rows),

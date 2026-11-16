@@ -68,6 +68,7 @@ class GaussianModel:
         self.surface_mode = "off"
         self.surface_refs = None
         self.fixed_lidar_state = None
+        self.freeze_lidar_positions = False
         self.local_scale_audit = None
         self.pose_refinement_state = None
         self.pose_refiner = None
@@ -95,9 +96,13 @@ class GaussianModel:
             self.fixed_lidar_state,
             self.discrete_lidar_state,
             self.pose_refiner.capture() if self.pose_refiner is not None else self.pose_refinement_state,
+            self.freeze_lidar_positions,
         )
     
     def restore(self, model_args, training_args):
+        saved_frozen = model_args[17] if len(model_args) > 17 else False
+        if saved_frozen != bool(getattr(training_args, 'freeze_lidar_positions', False)):
+            raise ValueError('Checkpoint frozen LiDAR position mode differs from requested mode')
         saved_surface_refs = model_args[12] if len(model_args) > 12 else None
         saved_surface_mode = model_args[13] if len(model_args) > 13 else "off"
         saved_fixed = model_args[14] if len(model_args) > 14 else None
@@ -135,6 +140,10 @@ class GaussianModel:
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
+        if self.freeze_lidar_positions:
+            self._xyz.requires_grad_(False)
+            self._xyz.grad = None
+            self.optimizer.state.pop(self._xyz, None)
         if self.fixed_lidar_state is not None:
             from utils.fixed_lidar import audit, project_scales
             if self.fixed_lidar_state.get('position_offsets') is None:
@@ -311,6 +320,13 @@ class GaussianModel:
         if getattr(training_args, 'local_scale_schedule', '') and not fixed:
             raise ValueError('Local-scale schedules require fixed LiDAR training')
         discrete = bool(getattr(training_args, 'discrete_lidar', False))
+        self.freeze_lidar_positions = bool(getattr(training_args, 'freeze_lidar_positions', False))
+        if self.freeze_lidar_positions:
+            if (fixed or discrete or training_args.surface_mode != 'off' or self.optimizer_type != 'default'
+                    or getattr(training_args, 'scale_control', 'off') != 'off'):
+                raise ValueError('Frozen native LiDAR positions require default Adam, unconstrained scales and no other population/surface policy')
+            self._xyz.requires_grad_(False)
+            self._xyz.grad = None
         if discrete:
             if fixed or training_args.surface_mode != 'off' or self.optimizer_type != 'default':
                 raise ValueError('Discrete LiDAR requires its own population policy, default Adam and no surface mode')
@@ -368,7 +384,7 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         l = [
-            {'params': [self._xyz], 'lr': 0. if fixed or discrete else training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
+            {'params': [self._xyz], 'lr': 0. if fixed or discrete or self.freeze_lidar_positions else training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
@@ -419,7 +435,7 @@ class GaussianModel:
                 if (self.fixed_lidar_state or {}).get('position_offsets') is not None:
                     from utils.lidar_offsets import update as update_offsets
                     return update_offsets(self,iteration)
-                if self.fixed_lidar_state is not None or self.discrete_lidar_state is not None:
+                if self.fixed_lidar_state is not None or self.discrete_lidar_state is not None or self.freeze_lidar_positions:
                     param_group['lr'] = 0.
                     return 0.
                 from utils.warmup_schedule import position_lr_step
@@ -543,18 +559,19 @@ class GaussianModel:
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
+            requires_grad = group['params'][0].requires_grad
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
                 stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
 
                 del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter((group["params"][0][mask].requires_grad_(True)))
+                group["params"][0] = nn.Parameter(group["params"][0][mask], requires_grad=requires_grad)
                 self.optimizer.state[group['params'][0]] = stored_state
 
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
-                group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
+                group["params"][0] = nn.Parameter(group["params"][0][mask], requires_grad=requires_grad)
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
@@ -604,6 +621,8 @@ class GaussianModel:
         return optimizable_tensors
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_surface_refs=None, new_max_radii=None):
+        if self.freeze_lidar_positions:
+            raise RuntimeError('Cloning/splitting is disabled for frozen LiDAR positions')
         if self.fixed_lidar_state is not None:
             raise RuntimeError('Cloning/splitting is disabled for fixed LiDAR')
         if self.discrete_lidar_state is not None and not getattr(self, '_discrete_population_edit', False):
@@ -730,9 +749,11 @@ class GaussianModel:
                                         extent, self.percent_dense, max_grad, split_threshold)
             stats['points_before'] = len(self._xyz)
         self.tmp_radii = radii
-        self.densify_and_clone(clone_grads, max_grad, extent, preserve_radii=preserve_radii)
+        if not self.freeze_lidar_positions:
+            self.densify_and_clone(clone_grads, max_grad, extent, preserve_radii=preserve_radii)
         if record_stats: after_clone = len(self._xyz)
-        self.densify_and_split(split_grads, split_threshold, extent, preserve_radii=preserve_radii)
+        if not self.freeze_lidar_positions:
+            self.densify_and_split(split_grads, split_threshold, extent, preserve_radii=preserve_radii)
         if record_stats: after_split = len(self._xyz)
 
         # Split parents are replaced by their children above. This switch only
@@ -753,11 +774,17 @@ class GaussianModel:
                 prune_mask = torch.logical_or(prune_mask, self.get_scaling.max(dim=1).values > world_limit)
             self.prune_points(prune_mask)
         if record_stats:
+            if self.freeze_lidar_positions:
+                stats.update(positions_frozen=not self._xyz.requires_grad and self._xyz not in self.optimizer.state,
+                             growth_enabled=False, eligible_clone_parents=0, eligible_split_parents=0)
             self.last_densification_stats = dict(stats, cloned_parents=after_clone-stats['points_before'],
                 split_parents=after_split-after_clone, split_children_per_parent=2,
                 pruned=after_split-len(self._xyz), points_after=len(self._xyz))
         tmp_radii = self.tmp_radii
         self.tmp_radii = None
+        if self.freeze_lidar_positions:
+            self.xyz_gradient_accum.zero_()
+            self.denom.zero_()
         if preserve_radii:
             # Start the next observation window only after the pruning check.
             self.max_radii2D.zero_()

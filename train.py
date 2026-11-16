@@ -214,6 +214,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
               f'{len(gaussians.discrete_lidar_pool["xyz"]):,} measured coordinates; XYZ frozen. '
               f'Adaptive activation and sigma>{opt.discrete_lidar_prune_sigma:g} pruning every '
               f'{opt.densification_interval} steps after {opt.densify_from_iter}; no opacity pruning/resets.')
+    if opt.freeze_lidar_positions:
+        print('LiDAR XYZ frozen: no position gradients or cloning/splitting. '
+              f'Opacity/world-size pruning {"disabled" if opt.disable_pruning else "enabled"}; '
+              'surviving centers remain at their measured coordinates.')
     if distance_config is not None:
         import json
         print('Distance update policy: '+json.dumps(distance_config,sort_keys=True))
@@ -462,7 +466,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     surface_match_fraction = len(growth_filter)/max(1, visibility_filter.numel())
                     if tb_writer and iteration % 100 == 0:
                         tb_writer.add_scalar('view_tangent/matched_visible_fraction', surface_match_fraction, iteration)
-                gaussians.add_densification_stats(viewspace_point_tensor, growth_filter)
+                if not opt.freeze_lidar_positions:
+                    gaussians.add_densification_stats(viewspace_point_tensor, growth_filter)
 
                 if phase_iteration > opt.densify_from_iter and phase_iteration % opt.densification_interval == 0:
                     from utils.densification_policy import size_pruning_thresholds

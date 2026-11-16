@@ -2629,3 +2629,51 @@ python scripts/serve_training_previews.py \
 Open `http://211.172.247.108:8089/`. The same two train and two held-out frame
 names are used with the default seed; full-resolution GT/render/error previews
 appear at step 1, every 500 steps, and final.
+
+### GPU 1: fixed LiDAR positions, 200k steps, pruning enabled
+
+This separate run starts from the original LiDAR input and uses the large-scene
+appearance settings: native 3DGS + AA, full resolution, scale LR `0.001`, and
+native color/opacity/rotation LRs. XYZ has no gradients or Adam updates. Cloning
+and splitting are disabled, so all surviving centers remain exactly on their
+original LiDAR coordinates. There are no scale clamps/penalties, opacity resets,
+culling, pose refinement, or distance weighting.
+
+Pruning remains enabled on the GPU 0 preset's schedule: every 250 steps after
+2k and before 40k; opacity `<0.005`, plus maximum principal sigma
+`>0.01 * scene_extent` after 5k. Screen-size-only deletion remains disabled.
+The population can decrease, and deleted points are not replaced. The remaining
+160k steps optimize appearance, scale and rotation with the surviving population.
+This uses `--freeze-lidar-positions`, which retains pruning, separately from the
+older constant-population `--fixed_lidar` experiment. Pruning and checkpoint
+restore preserve the frozen XYZ state; incompatible position modes cannot resume
+silently. The startup CUDA smoke exercises RGB gradients, fixed centers, both
+pruning criteria, and checkpoint restore.
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_native_lidar_fixed_200k.sh 1
+```
+
+The launcher checks GPU 1 is idle and starts a fresh model at
+`/data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/3dgs_stride3_aa_fixed_lidar_large_scene_200k_v1`.
+It uses the same `NATIVE_LIDAR_*` path overrides as the large-scene GPU 0 launcher.
+GT/render/error previews run at step 1, every 500 steps, and final. Twenty
+checkpoints at 10k increments are evaluated over all 5,009 frames by the separate
+same-GPU worker, including train/held-out comparison reports.
+
+In a second terminal, after the first preview:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+python scripts/serve_training_previews.py \
+  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/3dgs_stride3_aa_fixed_lidar_large_scene_200k_v1 \
+  --port 8090
+```
+
+Open `http://211.172.247.108:8090/`.
