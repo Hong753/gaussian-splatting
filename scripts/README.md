@@ -2442,7 +2442,7 @@ directory and `--port 8084`, leaving the default inference variant (8082 remains
 available for the GPU 1 viewer). The servers
 consume no GPU. Existing Python trainers acquire the hooks only after restart.
 
-### GPU 1: native scales, reduced position LR, native densification
+### GPU 1: native scales, reduced position LR, native densification and pruning
 
 ```bash
 source /opt/anaconda3/etc/profile.d/conda.sh &&
@@ -2462,9 +2462,11 @@ warmup or local offset clamp. Other parameter learning rates remain native.
 Native gradient-triggered cloning/splitting runs every 100 steps, with
 `densify_from_iter=500`, `densify_until_iter=15000` and gradient threshold
 `0.0002` (events at steps 600 through 14900). Split children replace their
-parents. Low-opacity, screen-size and world-size pruning are disabled separately,
-as are all opacity resets, including the white-background reset. The population
-can grow. The native scene-extent criterion still decides clone versus split.
+parents. Native low-opacity pruning (`opacity < 0.005`) is enabled at these
+events. The original size-pruning branch is enabled after step 3000, using
+`max_screen_size=20` and world sigma `> 0.1 * scene_extent`. All opacity resets,
+including the white-background reset, remain disabled. The population can grow
+or shrink. The native scene-extent criterion still decides clone versus split.
 No maximum scale, scale regularizer, culling, camera pose refinement, distance
 weighting, or tangent-surface constraints are enabled.
 
@@ -2472,16 +2474,33 @@ The launcher runs a tiny native CUDA AA/XYZ/growth check before loading the scen
 GT/render/error previews use the same fixed random 2 train and 2 held-out frames
 at step 1, every 500 steps and the final step. Checkpoints are published every
 10k; the separate evaluator on GPU 1 processes all 5,009 images and saves train
-and held-out comparisons. `densification.jsonl` records clone/split counts and
-checks that there is no opacity/size pruning. Evaluation after step 15k correctly
+and held-out comparisons. `densification.jsonl` records clone/split/prune counts.
+Evaluation after step 15k correctly
 expects no further growth events.
 
 Default output:
-`/data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_unconstrained_lr50_densify_noresets_noprune_30000_v1`.
+`/data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_unconstrained_lr50_densify_noresets_prune_30000_v1`.
 Set `NATIVE_LIDAR_MODEL` for a different fresh destination. Optional path overrides
 are `NATIVE_LIDAR_SOURCE`, `NATIVE_LIDAR_BASELINE`, `NATIVE_LIDAR_POINTS` and
 `NATIVE_LIDAR_OUTPUT_ROOT`. The launcher activates conda `3dgs` and refuses an
 occupied GPU; it does not stop the GPU 2 run.
+
+To stop the previous GPU 1 no-pruning experiment before launching this fresh run:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+python scripts/stop_reconstruction_run.py --gpu 1 --stop \
+  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_unconstrained_lr50_densify_noresets_noprune_30000_v1 &&
+bash scripts/run_native_lidar_densify.sh 1
+```
+
+Only the named run's trainer/evaluator are stopped; saved outputs are retained.
+Old saved plans without `pruning` keep their original no-pruning behavior. The
+shell launcher now passes `--pruning` explicitly and chooses a fresh output.
+Pruning deletes Gaussians; it does not periodically reset surviving opacities.
 
 In another terminal, once the first preview is saved:
 
@@ -2490,8 +2509,9 @@ source /opt/anaconda3/etc/profile.d/conda.sh &&
 conda activate 3dgs &&
 cd /home/sequor_vfm/gaussian-splatting &&
 python scripts/serve_training_previews.py \
-  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_unconstrained_lr50_densify_noresets_noprune_30000_v1 \
-  --port 8085
+  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_unconstrained_lr50_densify_noresets_prune_30000_v1 \
+  --port 8086
 ```
 
-Open `http://211.172.247.108:8085/`. The preview server uses no GPU.
+Open `http://211.172.247.108:8086/`. The preview server uses no GPU and this port
+can coexist with the previous run's viewer on 8085.

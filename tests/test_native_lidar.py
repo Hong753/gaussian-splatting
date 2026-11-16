@@ -85,8 +85,55 @@ def test_reset_switch_includes_white_background_and_preserves_defaults():
     assert not opacity_reset_due(opt, 3000, soft_surface=True)
 
 
+def test_native_pruning_removes_opacity_or_size_outliers_and_keeps_good_rows():
+    for reason in ('opacity', 'size'):
+        m = model(options())
+        with torch.no_grad(), cpu_allocations():
+            m._scaling[:] = math.log(.01)
+            if reason == 'opacity':
+                m._opacity[0] = -20
+            else:
+                m._scaling[0] = math.log(1.)
+            kept = m.get_xyz[1].clone()
+            m.denom[:] = 1
+            m.densify_and_prune(.0002, .005, 1., 20, torch.ones(2), record_stats=True, prune=True)
+        assert len(m.get_xyz) == 1 and m.last_densification_stats['pruned'] == 1
+        torch.testing.assert_close(m.get_xyz[0], kept)
+
+
 class NativeLidarPlanTests(unittest.TestCase):
     setUp = fixed_tests.FixedLidarPlanTests.setUp
+
+    def test_pruning_only_changes_the_pruning_switch_and_dispatches(self):
+        args = runner.parser().parse_args(self.argv)
+        old = runner.build_plan(args)
+        del args.pruning  # Older saved plans predate this option.
+        assert runner.build_plan(args) == old
+        runner.prepare(self.argv+['--pruning'])
+        data = periodic.load_plan(self.model)
+        command = data['plan']['stages'][0]['argv']
+        assert data['plan']['pruning']
+        assert command == [v for v in old['stages'][0]['argv'] if v != '--disable_pruning']
+        p = argparse.ArgumentParser()
+        op = OptimizationParams(p)
+        parsed, _ = p.parse_known_args(command[1:])
+        opt = op.extract(parsed)
+        assert not opt.disable_pruning and opt.disable_opacity_resets
+        with patch.object(runner, 'execute_plan') as execute:
+            periodic.train(self.model)
+            execute.assert_called_once()
+        # Population reduction is expected with pruning enabled.
+        row = dict(iteration=600, points_before=10, points_after=8,
+                   pruned=4, cloned_parents=1, split_parents=1)
+        (self.model/'densification.jsonl').write_text(json.dumps(row)+'\n')
+        result = periodic.experiment_diagnostics(data, 599, 600)
+        assert result['passed'] and result['pruned'] == 4
+
+    def test_stop_matches_only_exact_native_run(self):
+        from scripts.stop_reconstruction_run import matches
+        command = ['python', '-u', 'scripts/run_native_lidar.py', 'train', '--model', str(self.model)]
+        assert matches(command, self.model, self.root)
+        assert not matches(command, self.root/'different_run', self.root)
 
     def test_native_plan_parses_as_training_and_dispatches_with_all_frames(self):
         runner.prepare(self.argv)

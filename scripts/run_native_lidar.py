@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Native 3DGS + AA from LiDAR, with reduced XYZ LR and native densification.
 
-Scales are unconstrained. Opacity resets and opacity/size pruning stay disabled.
+Scales are unconstrained. Opacity resets stay disabled; native pruning is optional.
 """
 import math
 from pathlib import Path
@@ -18,10 +18,13 @@ def parser():
     p.description = __doc__
     p.set_defaults(gpu='1', iterations=30000, scale_control='off')
     p.add_argument('--position-lr-divisor', type=float, default=50.)
+    p.add_argument('--pruning', action='store_true', help='Enable native opacity/size pruning during densification')
     return p
 
 
 def build_plan(args):
+    # Missing on previously saved no-pruning plans: keep those reproducible.
+    pruning = bool(getattr(args, 'pruning', False))
     if not math.isfinite(args.position_lr_divisor) or args.position_lr_divisor < 1:
         raise ValueError('Position LR divisor must be finite and >= 1')
     if args.scale_control != 'off' or args.distance_weighting or args.local_scale_cache:
@@ -37,13 +40,15 @@ def build_plan(args):
                         ('--densify_until_iter', 15000)):
         command[command.index(name)+1] = str(value)
     command += ['--position_lr_max_steps', str(args.iterations),
-        '--disable_opacity_resets', '--disable_pruning',
+        '--disable_opacity_resets', *([] if pruning else ['--disable_pruning']),
         '--densify_from_iter', '500', '--densification_interval', '100',
         '--densify_grad_threshold', '0.0002']
     for name in ('max_scale_ratio', 'max_scale_world'):
         plan.pop(name)
-    plan.update(positions='optimized from step 1', population='native cloning/splitting; no opacity/size pruning',
-        pruning=False, position_lr=dict(init=initial, final=final, divisor=args.position_lr_divisor,
+    population = ('native cloning/splitting with opacity/size pruning' if pruning else
+                  'native cloning/splitting; no opacity/size pruning')
+    plan.update(positions='optimized from step 1', population=population,
+        pruning=pruning, position_lr=dict(init=initial, final=final, divisor=args.position_lr_divisor,
             max_steps=args.iterations, scene_extent_scaling=True, warmup_steps=0),
         densification=dict(start=500, until=15000, interval=100, gradient_threshold=.0002))
     return plan

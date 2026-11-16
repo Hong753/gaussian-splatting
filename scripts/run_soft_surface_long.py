@@ -258,7 +258,8 @@ def experiment_diagnostics(data, start, end):
                     if cfg['start'] < i < cfg['until'] and i % cfg['interval'] == 0}
         missing = sorted(expected - {r['iteration'] for r in rows})
         bad = [r['iteration'] for r in rows
-               if r['pruned'] != 0 or r['points_after'] < r['points_before']]
+               if not data['plan'].get('pruning', False) and
+               (r['pruned'] != 0 or r['points_after'] < r['points_before'])]
         warnings = []
         if missing:
             warnings.append(f'Missing {len(missing)} native densification events')

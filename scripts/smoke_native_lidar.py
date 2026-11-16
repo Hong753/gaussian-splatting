@@ -78,6 +78,15 @@ def main(argv=None):
     model.optimizer.step()
     model.optimizer.zero_grad(set_to_none=True)
     assert (model.get_xyz.detach() != before).any(dim=1).all()
+    # Native pruning removes the two deliberately transparent rows while
+    # retaining the supported rows. Opacity resets are a separate switch.
+    with torch.no_grad():
+        model.xyz_gradient_accum.zero_()
+        model.denom[:] = 1
+        model.densify_and_prune(.0002, .005, 100., None,
+            torch.ones(len(model.get_xyz), device='cuda'), record_stats=True, prune=True)
+    assert len(model.get_xyz) == 6 and model.last_densification_stats['pruned'] == 2
+    assert (model.get_opacity >= .005).all()
     restored = GaussianModel(0)
     restored._exposure = torch.nn.Parameter(model._exposure.detach().clone())
     restored.restore(model.capture(), opt)
@@ -85,7 +94,8 @@ def main(argv=None):
     assert restored.get_xyz.requires_grad and restored.fixed_lidar_state is None
     result = dict(passed=True, cuda_device=torch.cuda.get_device_name(), torch=torch.__version__,
         native_aa_rgb_xyz_gradients=True, reduced_lr_updates_xyz=True, no_scale_projection=True,
-        clone_and_split=True, no_opacity_size_pruning=True, children_optimized=True,
+        clone_and_split=True, pruning_disabled_path_checked=True, native_opacity_pruning=True,
+        children_optimized=True,
         checkpoint_round_trip=True)
     if args.output:
         from utils.checkpoint_snapshots import atomic_json
