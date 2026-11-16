@@ -89,7 +89,8 @@ class NoCullingPlanTests(unittest.TestCase):
         target = self.root/'gpu1_noculling'
         args = ['--reference-model', str(self.model), '--model', str(target), '--gpu', '1',
             '--ceiling-multiplier', '15', '--target-multiplier', '3', '--schedule-mode', 'joint',
-            '--pose-refinement', '--lidar-offsets', '--fixed-lidar-positions', '--lidar-activation', '--depth-decay']
+            '--pose-refinement', '--lidar-offsets', '--fixed-lidar-positions', '--lidar-activation', '--depth-decay',
+            '--debug-preview-every', '250', '--debug-preview-train', '1', '--debug-preview-test', '3']
         with patch('utils.pose_culling.geometry_inputs', side_effect=AssertionError('No mesh input is allowed')):
             tune_local_scale.prepare(args)
             tune_local_scale.prepare(args)
@@ -108,6 +109,9 @@ class NoCullingPlanTests(unittest.TestCase):
         self.assertEqual(plan['pose_refinement']['every'], 1)
         self.assertEqual(plan['training_schedule']['cap']['final_multiplier'], 15.)
         command = plan['stages'][0]['argv']
+        self.assertEqual(command[command.index('--debug_preview_every')+1], '250')
+        self.assertEqual(command[command.index('--debug_preview_train')+1], '1')
+        self.assertEqual(command[command.index('--debug_preview_test')+1], '3')
         for flag in ('--pose_culling', '--occlusion_geometry', '--train_depth_occlusion_dir'):
             self.assertNotIn(flag, command)
         self.assertEqual(command[command.index('--occlusion_mode')+1], 'off')

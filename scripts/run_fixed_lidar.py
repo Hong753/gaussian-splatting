@@ -52,6 +52,8 @@ def parser():
     p.add_argument('--eval-memory-fraction', type=float, default=.20)
     p.add_argument('--poll-seconds', type=float, default=15.)
     p.add_argument('--dry-run', action='store_true')
+    from utils.training_previews import add_arguments
+    add_arguments(p)
     return p
 
 
@@ -95,6 +97,8 @@ def build_plan(args):
         '--occlusion_mode', 'off', '--occlusion_inference_mode', 'off',
         '--test_iterations', '-1', '--save_iterations', *map(str, steps),
         '--checkpoint_iterations', *map(str, steps), '--publish_checkpoint_snapshots']
+    from utils.training_previews import command_arguments as preview_arguments
+    command += preview_arguments(args)
     policy = {}
     if control in ('regularize', 'hybrid'):
         command += ['--scale_control', control, '--scale_regularization_weight', str(weight)]

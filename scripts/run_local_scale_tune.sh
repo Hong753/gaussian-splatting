@@ -21,6 +21,10 @@ if [[ "$tune_schedule" != off ]]; then tune_suffix="_${tune_schedule}"; fi
 if [[ "${LOCAL_SCALE_TUNE_POSES:-0}" == 1 ]]; then tune_suffix+='_poses'; fi
 tune_model="${LOCAL_SCALE_TUNE_MODEL:-$tune_root/3dgs_stride3_aa_fixed_lidar_local_cap${tune_ceiling}_target${tune_target}${tune_suffix}_${tune_iterations}_v1}"
 tune_schedule_args=(--schedule-mode "$tune_schedule"
+  --debug-preview-every "${DEBUG_PREVIEW_EVERY:-500}"
+  --debug-preview-train "${DEBUG_PREVIEW_TRAIN:-2}"
+  --debug-preview-test "${DEBUG_PREVIEW_TEST:-2}"
+  --debug-preview-seed "${DEBUG_PREVIEW_SEED:-0}"
   --scale-start-multiplier "${LOCAL_SCALE_TUNE_START_CEILING:-1}"
   --scale-ramp-start "${LOCAL_SCALE_TUNE_RAMP_START:-7000}"
   --scale-ramp-end "${LOCAL_SCALE_TUNE_RAMP_END:-20000}"

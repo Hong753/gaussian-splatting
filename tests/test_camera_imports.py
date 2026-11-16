@@ -24,6 +24,34 @@ sys.modules['simple_knn._C'] = extension
 
 
 class CameraImportTests(unittest.TestCase):
+    def test_training_preview_loads_only_two_real_heldout_cameras(self):
+        self.run_fresh("""
+            import tempfile
+            from pathlib import Path
+            from types import SimpleNamespace
+            from unittest.mock import patch
+            import torch
+            from test_view_comparisons import dataset
+            from utils.training_previews import create_previewer, DEFAULTS
+            with tempfile.TemporaryDirectory() as directory:
+                root=Path(directory)
+                source,manifest,names,selected=dataset(root)
+                trains=[SimpleNamespace(image_name=name) for name in selected]
+                scene=SimpleNamespace(model_path=str(root/'model'),getTrainCameras=lambda:trains,
+                                      getTestCameras=lambda:[])
+                args=SimpleNamespace(source_path=str(source),images='images',resolution=-1,
+                                     keyframe_manifest=str(manifest))
+                with patch.object(torch.Tensor,'cuda',lambda tensor,*a,**kw:tensor):
+                    observer=create_previewer(scene,args,DEFAULTS)
+                from scene.cameras import Camera
+                heldout=[c for split,c in observer.frames if split=='held-out']
+                assert len(heldout)==2 and all(isinstance(c,Camera) for c in heldout)
+                assert all(c.original_image.shape==(3,8,16) for c in heldout)
+                assert all(c.original_image.device.type=='cpu' and c.invdepthmap is None for c in heldout)
+                assert not {c.image_name for c in heldout}&set(selected)
+                assert len(trains)==6
+        """)
+
     def test_explicit_lidar_input_does_not_create_or_change_source_files(self):
         self.run_fresh("""
             import tempfile

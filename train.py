@@ -41,7 +41,7 @@ except:
     SPARSE_ADAM_AVAILABLE = False
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from,
-             publish_checkpoint_snapshots=False):
+             publish_checkpoint_snapshots=False, preview_config=None):
     if publish_checkpoint_snapshots and set(saving_iterations) != set(checkpoint_iterations):
         raise ValueError('Published snapshots require matching PLY and optimizer checkpoint iterations')
     from utils.fixed_lidar import configure_training, project_scales, audit as audit_fixed_lidar
@@ -60,6 +60,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     distance_config = distance_policy(opt)
     dataset.antialiasing = pipe.antialiasing
     dataset.optimization_settings = vars(opt).copy()
+    from utils.training_previews import DEFAULTS as PREVIEW_DEFAULTS, create_previewer
+    dataset.debug_preview_options = dict(PREVIEW_DEFAULTS) if preview_config is None else preview_config
     from scripts.occlusion_options import configure_pipeline, prepare_training_geometry, inference_pipeline
     depth_directory = getattr(dataset, "train_depth_occlusion_dir", "")
     soft_surface = bool(opt.soft_surface_geometry)
@@ -218,6 +220,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    previewer = create_previewer(scene, dataset, dataset.debug_preview_options, start_iteration=first_iter)
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -590,6 +593,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
+            if previewer is not None and previewer.due(iteration, opt.iterations):
+                previewer.capture(iteration, gaussians, render, evaluation_pipe, background,
+                                  pose_refiner=pose_refiner, separate_sh=SPARSE_ADAM_AVAILABLE,
+                                  tb_writer=tb_writer)
+
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
@@ -672,7 +680,10 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument('--publish_checkpoint_snapshots', action='store_true',
                         help='Atomically publish matching post-step PLY and optimizer snapshots for external evaluation')
+    from utils.training_previews import add_arguments as add_preview_arguments, options as preview_options
+    add_preview_arguments(parser)
     args = parser.parse_args(sys.argv[1:])
+    preview_config = preview_options(args)
     if args.model_type != "3dgs":
         parser.error("Use scripts/train.py --model-type scaffold for Scaffold-GS")
     args.save_iterations.append(args.iterations)
@@ -687,7 +698,7 @@ if __name__ == "__main__":
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from,
-             publish_checkpoint_snapshots=args.publish_checkpoint_snapshots)
+             publish_checkpoint_snapshots=args.publish_checkpoint_snapshots, preview_config=preview_config)
 
     # All done
     print("\nTraining complete.")

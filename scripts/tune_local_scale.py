@@ -110,7 +110,10 @@ def prepare(argv):
     p.add_argument('--iterations',type=int,default=30000)
     p.add_argument('--dry-run',action='store_true')
     schedule_arguments(p)
+    from utils.training_previews import add_arguments as add_preview_arguments, options as preview_options
+    add_preview_arguments(p)
     request=p.parse_args(argv)
+    previews=preview_options(request)
     if request.fixed_lidar_positions and not (request.lidar_offsets and request.pose_refinement):
         raise ValueError('--fixed-lidar-positions requires the LiDAR-anchor pose experiment')
     schedule=requested_schedule(request)
@@ -127,6 +130,8 @@ def prepare(argv):
     args.gpu=request.gpu
     args.iterations=request.iterations
     args.dry_run=request.dry_run
+    for name,value in previews.items():
+        setattr(args,'debug_preview_'+name,value)
     args.ceiling_multiplier=request.ceiling_multiplier
     args.target_multiplier=request.target_multiplier
     args.training_schedule=schedule

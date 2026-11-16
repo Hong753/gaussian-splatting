@@ -2297,3 +2297,72 @@ previous culling run. Checkpoints and the separate all-frame evaluator retain
 the 10k interval, with original/refined-pose PSNR and matched GT/render/error
 previews. The combined native CUDA preflight verifies fixed positions,
 activation, optimizer state, export and resume before full training.
+
+### Live GT/render/error previews during training
+
+Native `train.py` now writes previews at step 1, every **500** steps, and the
+final step. By default it selects **two training and two held-out images** with
+a private seed, then keeps those exact images throughout the run. With a
+keyframe manifest, held-out means the complement of the actual training image
+names among all registered COLMAP frames. Only the selected extra RGB images
+are loaded; this does not enable `--eval` or change the training split.
+
+The page at `MODEL/debug_previews/index.html` shows actual RGB, rendered RGB,
+absolute error (4x brightness), and per-image PSNR. It refreshes every five
+seconds, offers a step selector and train/held-out filter, and links each image
+at full resolution. Training previews use current refined poses when enabled;
+held-out frames retain their original poses and never update camera parameters.
+The page labels the pose and inference-culling protocol. The culling-free run
+renders with native 3DGS + AA, without any mesh or depth reference. Per-image
+exposure is off, matching the all-frame evaluation protocol. The few-frame
+PSNR is computed before image encoding at the configured training resolution;
+it is not the all-frame score.
+
+Preview inference runs sequentially in the training process under `no_grad`,
+using the live model without copying it or writing another PLY/checkpoint.
+It preserves Python/NumPy/Torch random state and never steps an optimizer or
+accumulates densification statistics. Preview wall time is printed separately.
+GT is written once, each step's renders and error images stay on disk, and an
+atomic history update publishes a complete set. TensorBoard receives the same
+comparisons if it is installed. The separate all-5,009-frame evaluator and
+checkpoints retain their 10k interval.
+
+The existing GPU 1 culling-free launcher enables these previews automatically.
+For a **new run** with previews every 250 steps (use a fresh output directory):
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+DEBUG_PREVIEW_EVERY=250 \
+LOCAL_SCALE_TUNE_MODEL=/data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_fixed_lidar_noculling_debug_v1 \
+bash scripts/run_pose_lidar_fixed_noculling.sh 1
+```
+
+Other launcher overrides: `DEBUG_PREVIEW_TRAIN=2`, `DEBUG_PREVIEW_TEST=2`,
+`DEBUG_PREVIEW_SEED=0`. Set `DEBUG_PREVIEW_EVERY=0` to disable previews.
+Direct Python entry points accept `--debug-preview-every`,
+`--debug-preview-train`, `--debug-preview-test`, and `--debug-preview-seed`
+(underscore spellings work too).
+
+In a second terminal, after the preview path appears in the training log:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+python scripts/serve_training_previews.py \
+  --root /data/3dgs_outputs/orange_4F/1_full --port 8082
+```
+
+Open `http://211.172.247.108:8082/`. `--root` selects the most recently updated
+preview run **once on server startup** and prints its model path. To choose a
+specific run, replace `--root ...` with `--model /absolute/model/path`. This
+server reads only the preview directory and uses no GPU. Pulling the code does
+not add hooks to an already-running Python trainer: previews start with a new
+training process. This launcher does not resume a populated model directory;
+do not rerun it over existing results. When resuming `train.py` from an earlier
+checkpoint, previews from the later trajectory are preserved in a sibling
+`debug_previews_before_restart_*` directory and a fresh live history starts.
+Otherwise, history rejects reusing a step or mixing a different frame selection.
