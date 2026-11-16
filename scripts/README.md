@@ -2639,11 +2639,14 @@ and splitting are disabled, so all surviving centers remain exactly on their
 original LiDAR coordinates. There are no scale clamps/penalties, opacity resets,
 culling, pose refinement, or distance weighting.
 
-Pruning remains enabled on the GPU 0 preset's schedule: every 250 steps after
-2k and before 40k; opacity `<0.005`, plus maximum principal sigma
-`>0.01 * scene_extent` after 5k. Screen-size-only deletion remains disabled.
-The population can decrease, and deleted points are not replaced. The remaining
-160k steps optimize appearance, scale and rotation with the surviving population.
+The v2 preset delays all pruning until after 100k, allowing appearance and
+opacity to fit before any irreversible point deletion. It prunes every 2k
+before 180k (first event 102k, last 178k): opacity `<0.005`, plus maximum
+principal sigma `>0.01 * scene_extent`. Screen-size-only deletion remains
+disabled. The population can decrease, and deleted points are not replaced.
+The final 20k steps optimize appearance, scale and rotation without pruning.
+This is a conservative starting schedule, not a measured optimum; elapsed
+iterations do not guarantee sufficient observations for every point.
 This uses `--freeze-lidar-positions`, which retains pruning, separately from the
 older constant-population `--fixed_lidar` experiment. Pruning and checkpoint
 restore preserve the frozen XYZ state; incompatible position modes cannot resume
@@ -2659,7 +2662,10 @@ bash scripts/run_native_lidar_fixed_200k.sh 1
 ```
 
 The launcher checks GPU 1 is idle and starts a fresh model at
-`/data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/3dgs_stride3_aa_fixed_lidar_large_scene_200k_v1`.
+`/data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/3dgs_stride3_aa_fixed_lidar_large_scene_200k_lateprune_v2`.
+Existing v1 plans/running processes retain their original early-pruning
+schedule; pulling code alone does not change a running experiment. Use a fresh
+v2 run to apply the revised schedule without reusing already-pruned geometry.
 It uses the same `NATIVE_LIDAR_*` path overrides as the large-scene GPU 0 launcher.
 GT/render/error previews run at step 1, every 500 steps, and final. Twenty
 checkpoints at 10k increments are evaluated over all 5,009 frames by the separate
@@ -2672,7 +2678,7 @@ source /opt/anaconda3/etc/profile.d/conda.sh &&
 conda activate 3dgs &&
 cd /home/sequor_vfm/gaussian-splatting &&
 python scripts/serve_training_previews.py \
-  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/3dgs_stride3_aa_fixed_lidar_large_scene_200k_v1 \
+  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/3dgs_stride3_aa_fixed_lidar_large_scene_200k_lateprune_v2 \
   --port 8090
 ```
 

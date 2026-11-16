@@ -84,9 +84,9 @@ class FrozenPlanTests(unittest.TestCase):
     def test_200k_plan_and_all_frame_evaluator(self):
         argv = self.argv+['--gpu','1','--iterations','200000','--resolution','1',
             '--freeze-lidar-positions','--scaling-lr','.001','--pruning',
-            '--densify-from-iter','2000','--densify-until-iter','40000',
-            '--densification-interval','250','--prune-world-scale-ratio','.01',
-            '--prune-screen-size','0','--prune-size-from-iter','5000','--preserve-densification-radii']
+            '--densify-from-iter','100000','--densify-until-iter','180000',
+            '--densification-interval','2000','--prune-world-scale-ratio','.01',
+            '--prune-screen-size','0','--prune-size-from-iter','100000','--preserve-densification-radii']
         runner.prepare(argv)
         data = periodic.load_plan(self.model)
         assert data['gpu']=='1' and data['iterations']==list(range(10000,200001,10000))
@@ -100,6 +100,8 @@ class FrozenPlanTests(unittest.TestCase):
         assert opt.position_lr_init == opt.position_lr_final == 0
         assert opt.scaling_lr == .001 and opt.scale_control == 'off'
         assert not opt.disable_pruning and opt.disable_opacity_resets
+        assert (opt.densify_from_iter,opt.densify_until_iter,opt.densification_interval)==(100000,180000,2000)
+        assert opt.prune_size_from_iter == 100000
         assert parsed.antialiasing and parsed.resolution == 1
         assert not plan['densification']['enabled'] and plan['pruning']
         with patch.object(runner,'execute_plan') as execute:
@@ -110,13 +112,15 @@ class FrozenPlanTests(unittest.TestCase):
             runner.execute_plan(args, plan)
             assert '--freeze-lidar-positions' in smoke.call_args.args[0]
             execute.assert_called_once_with(args, plan, smoke=False)
+        assert periodic.experiment_diagnostics(data,0,100000)['passed']
+        assert not periodic.experiment_diagnostics(data,100000,180000)['passed']
         rows=[dict(iteration=i,points_before=5,points_after=4,pruned=1,
                    cloned_parents=0,split_parents=0,positions_frozen=True)
-              for i in range(2250,10001,250)]
+              for i in range(102000,180000,2000)]
         path=self.model/'densification.jsonl'
         path.write_text(''.join(json.dumps(r)+'\n' for r in rows))
-        assert periodic.experiment_diagnostics(data,0,10000)['passed']
-        assert periodic.experiment_diagnostics(data,40000,200000)['passed']
+        assert periodic.experiment_diagnostics(data,100000,180000)['passed']
+        assert periodic.experiment_diagnostics(data,180000,200000)['passed']
         rows[0]['positions_frozen']=False
         path.write_text(''.join(json.dumps(r)+'\n' for r in rows))
-        assert not periodic.experiment_diagnostics(data,0,10000)['passed']
+        assert not periodic.experiment_diagnostics(data,100000,180000)['passed']
