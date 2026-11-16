@@ -701,8 +701,10 @@ class GaussianModel:
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_surface_refs)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, max_grad_abs=None,
-                         record_stats=False):
+                         record_stats=False, prune=True):
         if self.surface_mode == 'view_tangent':
+            if not prune:
+                raise ValueError('Disabling pruning is currently supported only for native densification')
             return self.densify_view_tangent(max_grad, min_opacity, extent, max_screen_size, radii)
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
@@ -725,12 +727,15 @@ class GaussianModel:
         self.densify_and_split(split_grads, split_threshold, extent)
         if record_stats: after_split = len(self._xyz)
 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
-        if max_screen_size:
-            big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
-        self.prune_points(prune_mask)
+        # Split parents are replaced by their children above. This switch only
+        # disables deleting geometry for low opacity or a large footprint/scale.
+        if prune:
+            prune_mask = (self.get_opacity < min_opacity).squeeze(-1)
+            if max_screen_size:
+                big_points_vs = self.max_radii2D > max_screen_size
+                big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+                prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+            self.prune_points(prune_mask)
         if record_stats:
             self.last_densification_stats = dict(stats, cloned_parents=after_clone-stats['points_before'],
                 split_parents=after_split-after_clone, split_children_per_parent=2,

@@ -2441,3 +2441,57 @@ Open `http://211.172.247.108:8080/`. For GPU 2, use `--model` with its output
 directory and `--port 8084`, leaving the default inference variant (8082 remains
 available for the GPU 1 viewer). The servers
 consume no GPU. Existing Python trainers acquire the hooks only after restart.
+
+### GPU 1: native scales, reduced position LR, native densification
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_native_lidar_densify.sh 1
+```
+
+This is the moving-position counterpart to the GPU 2 unconstrained fixed-LiDAR
+run above. It starts fresh from the same original LiDAR PLY and stride-3
+keyframes, with native 3DGS + AA for 30k steps. The XYZ LR decays exponentially
+from `3.2e-6` to `3.2e-8` (50x below native defaults), **before the usual scene
+extent multiplier**. Position updates start at step 1; there is no fixed-position
+warmup or local offset clamp. Other parameter learning rates remain native.
+
+Native gradient-triggered cloning/splitting runs every 100 steps, with
+`densify_from_iter=500`, `densify_until_iter=15000` and gradient threshold
+`0.0002` (events at steps 600 through 14900). Split children replace their
+parents. Low-opacity, screen-size and world-size pruning are disabled separately,
+as are all opacity resets, including the white-background reset. The population
+can grow. The native scene-extent criterion still decides clone versus split.
+No maximum scale, scale regularizer, culling, camera pose refinement, distance
+weighting, or tangent-surface constraints are enabled.
+
+The launcher runs a tiny native CUDA AA/XYZ/growth check before loading the scene.
+GT/render/error previews use the same fixed random 2 train and 2 held-out frames
+at step 1, every 500 steps and the final step. Checkpoints are published every
+10k; the separate evaluator on GPU 1 processes all 5,009 images and saves train
+and held-out comparisons. `densification.jsonl` records clone/split counts and
+checks that there is no opacity/size pruning. Evaluation after step 15k correctly
+expects no further growth events.
+
+Default output:
+`/data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_unconstrained_lr50_densify_noresets_noprune_30000_v1`.
+Set `NATIVE_LIDAR_MODEL` for a different fresh destination. Optional path overrides
+are `NATIVE_LIDAR_SOURCE`, `NATIVE_LIDAR_BASELINE`, `NATIVE_LIDAR_POINTS` and
+`NATIVE_LIDAR_OUTPUT_ROOT`. The launcher activates conda `3dgs` and refuses an
+occupied GPU; it does not stop the GPU 2 run.
+
+In another terminal, once the first preview is saved:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+python scripts/serve_training_previews.py \
+  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_unconstrained_lr50_densify_noresets_noprune_30000_v1 \
+  --port 8085
+```
+
+Open `http://211.172.247.108:8085/`. The preview server uses no GPU.

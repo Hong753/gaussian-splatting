@@ -469,7 +469,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent,
                                                 size_threshold, radii,
                                                 max_grad_abs=opt.absgs_split_threshold if opt.absgs else None,
-                                                record_stats=True)
+                                                record_stats=True, prune=not getattr(opt, 'disable_pruning', False))
                     if opt.surface_mode != 'view_tangent':
                         import json
                         growth_stats = dict(iteration=iteration, image=viewpoint_cam.image_name,
@@ -486,8 +486,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                 if name != 'iteration':
                                     tb_writer.add_scalar('view_tangent/'+name, value, iteration)
                 
-                if (not soft_surface and (phase_iteration % opt.opacity_reset_interval == 0 or
-                        (dataset.white_background and phase_iteration == opt.densify_from_iter))):
+                from utils.densification_policy import opacity_reset_due
+                if opacity_reset_due(opt, phase_iteration, dataset.white_background, soft_surface):
                     gaussians.reset_opacity()
 
             if soft_stats is not None and (iteration == 1 or iteration % 100 == 0):

@@ -111,6 +111,9 @@ def train(model):
             if data.get('experiment') == 'fixed_lidar':
                 from scripts import run_fixed_lidar
                 launcher = run_fixed_lidar
+            elif data.get('experiment') == 'native_lidar':
+                from scripts import run_native_lidar
+                launcher = run_native_lidar
             elif data.get('experiment') == 'discrete_lidar':
                 from scripts import run_discrete_lidar
                 launcher = run_discrete_lidar
@@ -246,6 +249,25 @@ def evaluate(data, snapshot, start):
 
 
 def experiment_diagnostics(data, start, end):
+    if data.get('experiment') == 'native_lidar':
+        from scripts.tune_local_scale import read_rows
+        rows = [r for r in read_rows(Path(data['model'])/'densification.jsonl')
+                if start < r['iteration'] <= end]
+        cfg = data['plan']['densification']
+        expected = {i for i in range(start+1, end+1)
+                    if cfg['start'] < i < cfg['until'] and i % cfg['interval'] == 0}
+        missing = sorted(expected - {r['iteration'] for r in rows})
+        bad = [r['iteration'] for r in rows
+               if r['pruned'] != 0 or r['points_after'] < r['points_before']]
+        warnings = []
+        if missing:
+            warnings.append(f'Missing {len(missing)} native densification events')
+        if bad:
+            warnings.append(f'Unexpected population loss/pruning at {bad[:5]}')
+        return dict(interval=[start, end], passed=not missing and not bad, warnings=warnings,
+            logged_events=len(rows), cloned_parents=sum(r['cloned_parents'] for r in rows),
+            split_parents=sum(r['split_parents'] for r in rows),
+            pruned=sum(r['pruned'] for r in rows), latest=rows[-1] if rows else None)
     if data.get('experiment') == 'discrete_lidar':
         rows, events = [], []
         for filename, destination in (('discrete_lidar_training.jsonl', rows), ('discrete_lidar_growth.jsonl', events)):
