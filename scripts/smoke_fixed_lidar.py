@@ -15,7 +15,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--gpu', default='0')
     p.add_argument('--output', type=Path)
-    p.add_argument('--scale-control', choices=('clamp', 'regularize'), default='clamp')
+    p.add_argument('--scale-control', choices=('off', 'clamp', 'regularize'), default='clamp')
     args = p.parse_args(argv)
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     import numpy as np
@@ -76,6 +76,13 @@ def main(argv=None):
     if args.scale_control == 'regularize':
         assert not audit(model, 4)['scales_within_bounds'], 'Synthetic outward force must be allowed past soft target'
         assert model.optimizer.state[model._scaling]['exp_avg'][0,0] != 0, 'Soft mode must preserve Adam moments'
+    if args.scale_control == 'off':
+        assert scale_regularization(model).item() == 0
+        assert (model._scaling > model.fixed_lidar_state['log_scale_cap']).any()
+        before = model._scaling.detach().clone()
+        moment = model.optimizer.state[model._scaling]['exp_avg'].clone()
+        project_scales(model, initializing=True)
+        assert torch.equal(before, model._scaling) and torch.equal(moment, model.optimizer.state[model._scaling]['exp_avg'])
     restored = GaussianModel(0)
     # Exposure metadata is separate in native checkpoints; match the real Scene
     # initialization before restoring the Gaussian/optimizer state.

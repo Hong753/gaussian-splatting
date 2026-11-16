@@ -280,11 +280,12 @@ def experiment_diagnostics(data, start, end):
             if start < row['iteration'] <= end:
                 rows.append(row)
     regularize = data['plan'].get('scale_control') == 'regularize'
+    unconstrained = data['plan'].get('scale_control') == 'off'
     hybrid = data['plan'].get('scale_control') == 'hybrid'
     offsets=data['plan'].get('lidar_offsets')
     good = bool(rows) and all((r.get('positions_within_bounds',False) and r.get('anchors_unchanged',False)
         and r.get('lidar_offset_policy')==offsets if offsets else r['positions_unchanged']) and
-        (r.get('scales_finite', False) if regularize else r['scales_within_bounds']) for r in rows)
+        (r.get('scales_finite', False) if regularize or unconstrained else r['scales_within_bounds']) for r in rows)
     loss_rows = []
     loss_path = Path(data['model'])/'scale_regularization_training.jsonl'
     if (regularize or hybrid) and loss_path.is_file():

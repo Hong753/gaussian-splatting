@@ -2366,3 +2366,78 @@ do not rerun it over existing results. When resuming `train.py` from an earlier
 checkpoint, previews from the later trajectory are preserved in a sibling
 `debug_previews_before_restart_*` directory and a fresh live history starts.
 Otherwise, history rejects reusing a step or mixing a different frame selection.
+
+### GPU 2: native scales, fixed LiDAR, no resets or densification
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_fixed_lidar_unconstrained.sh 2
+```
+
+This is a fresh 30k-step native 3DGS + AA run on the same stride-3 keyframes.
+Every original input LiDAR point is present and its XYZ remains fixed. Scale,
+rotation, opacity and SH appearance use the native optimizer learning rates.
+`--scale_control off` bypasses scale projection at initialization, after Adam,
+and after restore; it adds no scale regularizer and does not clear scale moments.
+Native KNN initialization is preserved, including its ordinary numerical floor.
+There is no maximum sigma, local KNN cap, local scale/LR curriculum, pose
+refinement, distance weighting, culling, activation, densification, pruning or
+opacity reset. This isolates the original fixed-cloud rendering setup; it is
+not a matched scale-only ablation of the pose/adaptive/depth-weighted runs.
+The exported PLY contains the actual learned scales.
+
+Previous local-scale runs use a 1x ceiling of
+`min(sigma_init, d10/3, 0.015)`; the cap15 schedule starts there and relaxes it to
+15x by 20k steps (absolute ceiling at most 0.225 scene units, with tighter local
+bounds for many points). The unconstrained run has neither limit. Audits report
+finite scales, fixed XYZ and population size; cap/target statistics are null.
+
+Default output:
+`/data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_fixed_lidar_unconstrained_noresets_30000_v1`.
+Override `FIXED_LIDAR_MODEL` for another fresh output, or
+`FIXED_LIDAR_ITERATIONS` for another duration. Previews are enabled at step 1,
+every 500 steps and the final step; the independent evaluator still processes
+all 5,009 images at each 10k checkpoint. A busy GPU is not stopped by this launcher.
+
+### Restart the GPU 0 culling experiment with live previews
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/restart_culling_previews.sh 0
+```
+
+The wrapper selects the **unique active local-scale mesh-culling experiment**
+whose saved plan is on GPU 0. To specify it explicitly, pass its model directory
+as the second argument. It verifies the input fingerprints and prepares a fresh
+output before stopping the exact named trainer/evaluator, using the existing
+PID identity checks. Other runs are not signaled. This restarts from the original
+LiDAR initialization, preserving the old weights and results. It copies the
+saved training settings (including poses, scale schedule, culling and activation)
+and reuses the existing mesh/KNN/neighbor caches. It never substitutes defaults
+from a different experiment. Ambiguous discovery or changed inputs fail before
+any process is stopped. The new output is printed and has a `_debug500_*` suffix.
+
+All native training runs retain 500-step live debugging by default. For
+train-only mesh-culling runs, **both** inference (culling OFF) and training
+(culling ON) previews now use identical train/held-out names and current poses.
+These are stored separately as `debug_previews` and `debug_previews_training`.
+To view the restarted run's culling-ON images after its preview path appears:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+python scripts/serve_training_previews.py \
+  --root /data/3dgs_outputs/orange_4F/1_full --variant training --port 8080
+```
+
+Open `http://211.172.247.108:8080/`. For GPU 2, use `--model` with its output
+directory and `--port 8084`, leaving the default inference variant (8082 remains
+available for the GPU 1 viewer). The servers
+consume no GPU. Existing Python trainers acquire the hooks only after restart.

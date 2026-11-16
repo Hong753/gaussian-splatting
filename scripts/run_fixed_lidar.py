@@ -30,7 +30,7 @@ def parser():
     p.add_argument('--checkpoint-every', type=int, default=10000)
     p.add_argument('--max-scale-ratio', type=float, default=2., help='Principal sigma reference / initial nearest-neighbor sigma')
     p.add_argument('--max-scale-world', type=float, default=0., help='Optional absolute reference sigma in scene units (0: off)')
-    p.add_argument('--scale-control', choices=('clamp', 'regularize', 'hybrid'), default='clamp',
+    p.add_argument('--scale-control', choices=('off', 'clamp', 'regularize', 'hybrid'), default='clamp',
                    help='Hard cap, soft penalty, or local soft target with a hard ceiling')
     p.add_argument('--scale-regularization-weight', type=float, default=.01)
     p.add_argument('--local-scale-cache', type=Path, help='Precomputed local bounds, required by hybrid mode')
@@ -68,7 +68,7 @@ def build_plan(args):
             args.report_max_views < 1 or args.resolution == 0 or args.resolution < -1 or
             not math.isfinite(args.max_scale_ratio) or args.max_scale_ratio <= 0 or
             not math.isfinite(args.max_scale_world) or args.max_scale_world < 0 or
-            control not in ('clamp', 'regularize', 'hybrid') or not math.isfinite(weight) or weight <= 0 or
+            control not in ('off', 'clamp', 'regularize', 'hybrid') or not math.isfinite(weight) or weight <= 0 or
             not 0 < args.eval_memory_fraction <= 1 or not 0 < args.poll_seconds <= 60):
         raise ValueError('Invalid scale bounds, iteration/frame counts, resolution or evaluator settings')
     for path in (args.keyframes, args.point_cloud):
@@ -100,6 +100,9 @@ def build_plan(args):
     from utils.training_previews import command_arguments as preview_arguments
     command += preview_arguments(args)
     policy = {}
+    if control == 'off':
+        command += ['--scale_control', 'off']
+        policy = dict(scale_control='off', scale_limit_semantics='No scale cap, penalty, reset or initialization projection')
     if control in ('regularize', 'hybrid'):
         command += ['--scale_control', control, '--scale_regularization_weight', str(weight)]
         policy = dict(scale_control=control, scale_regularization_weight=weight,

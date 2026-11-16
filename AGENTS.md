@@ -1,5 +1,10 @@
 # Reconstruction experiments
 
+Keep live GT/render/error debugging enabled for every native 3DGS run: step 1,
+every 500 steps, and the final step, with fixed random train and held-out frames.
+For train-only mesh culling, also produce matching culling-ON training previews.
+Only disable these previews if the user explicitly requests it.
+
 Always produce actual-image versus rendered-image comparisons after training.
 Use `scripts/render.py --split both` for the saved train and held-out eval views;
 the training launcher enables this by default. Include per-view images, PSNR,

@@ -17,8 +17,8 @@ def validate_limits(ratio, world):
 
 
 def validate_control(mode, weight):
-    if mode not in ('clamp', 'regularize', 'hybrid') or not math.isfinite(weight) or weight <= 0:
-        raise ValueError('scale_control must be clamp, regularize or hybrid; regularization weight must be positive and finite')
+    if mode not in ('off', 'clamp', 'regularize', 'hybrid') or not math.isfinite(weight) or weight <= 0:
+        raise ValueError('scale_control must be off, clamp, regularize or hybrid; regularization weight must be positive and finite')
 
 
 def configure_training(opt, dataset):
@@ -49,6 +49,9 @@ def configure_training(opt, dataset):
         return
     validate_limits(opt.max_scale_ratio, opt.max_scale_world)
     validate_control(opt.scale_control, opt.scale_regularization_weight)
+    if opt.scale_control == 'off' and (getattr(opt, 'local_scale_schedule', '') or offset_policy is not None
+                                     or activation_policy is not None):
+        raise ValueError('Unconstrained-scale baseline requires fixed centers and a constant population without local schedules')
     if opt.scale_control == 'hybrid' and not getattr(opt, 'local_scale_cache', ''):
         raise ValueError('Hybrid scale control requires the original LiDAR local_scale_cache')
     if (dataset.model_type != '3dgs' or opt.optimizer_type != 'default' or
@@ -91,7 +94,7 @@ def initialize(model, ratio, world, mode='clamp', weight=.01, cache='', ceiling_
         from utils.lidar_offsets import initialize as initialize_offsets
         # Capture the native initial KNN sigma before any cap relaxation or projection.
         state['position_offsets']=initialize_offsets(model,offset_policy)
-    if mode in ('regularize', 'hybrid'):
+    if mode in ('off', 'regularize', 'hybrid'):
         state.update(scale_control=mode, scale_regularization_weight=weight)
     if mode == 'hybrid':
         if not cache:
@@ -115,6 +118,8 @@ def project_scales(model, chunk=1048576, *, initializing=False):
         return
     if len(model._xyz) != state['count']:
         raise RuntimeError('Fixed LiDAR population changed')
+    if state.get('scale_control') == 'off':
+        return  # Native initialization and Adam updates: never project or reset scale moments.
     if state.get('position_offsets') is not None:
         from utils.lidar_offsets import project
         project(model,chunk)
@@ -184,7 +189,7 @@ def audit(model, iteration):
     finite = bool(torch.isfinite(model._scaling).all() and torch.isfinite(model.get_scaling).all())
     within = bool((model._scaling <= state['log_scale_cap']).all())
     mode = state.get('scale_control', 'clamp')
-    if not same or not finite or (mode != 'regularize' and not within):
+    if not same or not finite or (mode not in ('off', 'regularize') and not within):
         raise RuntimeError('Fixed LiDAR audit failed: changed centers/count or invalid/oversized scales')
     result = dict(iteration=iteration, gaussians=len(model._xyz), positions_unchanged=True,
                 scale_control=mode, scales_finite=finite, scales_within_bounds=within,
@@ -192,6 +197,9 @@ def audit(model, iteration):
                 above_target_fraction=float((model._scaling > state.get('log_scale_target', state['log_scale_cap'])).any(1).float().mean()),
                 at_cap_fraction=float((model._scaling >= state['log_scale_cap']-1e-6).any(1).float().mean()),
                 largest_sigma=float(model.get_scaling.max()))
+    if mode == 'off':
+        result.update(scales_within_bounds=None, max_scale_ratio=None, max_scale_world=None,
+                      above_target_fraction=None, at_cap_fraction=None, scale_constraints_enabled=False)
     result.update(offsets)
     from utils.lidar_activation import audit as activation_audit
     result.update(activation_audit(model,iteration))

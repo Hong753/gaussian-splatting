@@ -199,6 +199,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if gaussians.fixed_lidar_state.get('local_scale_schedule') is not None:
                 import json
                 print('Local scale / LR schedule: ' + json.dumps(gaussians.fixed_lidar_state['local_scale_schedule']['policy'], sort_keys=True))
+        elif opt.scale_control == 'off':
+            print('Scale control OFF: native KNN initialization, unconstrained learned scales, no scale penalty or moment resets.')
         else:
             print(f'Scale {"cap" if opt.scale_control == "clamp" else "penalty target"} = '
                   f'{opt.max_scale_ratio:g} x initialization spacing'
@@ -221,6 +223,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     previewer = create_previewer(scene, dataset, dataset.debug_preview_options, start_iteration=first_iter)
+    training_previewer = (create_previewer(scene, dataset, dataset.debug_preview_options,
+        start_iteration=first_iter, subdirectory='debug_previews_training')
+        if pipe.occlusion_mode == 'mesh' and evaluation_pipe.occlusion_mode != pipe.occlusion_mode else None)
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -597,6 +602,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 previewer.capture(iteration, gaussians, render, evaluation_pipe, background,
                                   pose_refiner=pose_refiner, separate_sh=SPARSE_ADAM_AVAILABLE,
                                   tb_writer=tb_writer)
+                if training_previewer is not None:
+                    training_previewer.capture(iteration, gaussians, render, pipe, background,
+                                               pose_refiner=pose_refiner, separate_sh=SPARSE_ADAM_AVAILABLE)
 
 def prepare_output_and_logger(args):    
     if not args.model_path:

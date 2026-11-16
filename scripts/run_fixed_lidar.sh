@@ -9,6 +9,11 @@ source "${FIXED_LIDAR_CONDA_SH:-/opt/anaconda3/etc/profile.d/conda.sh}"
 conda activate 3dgs
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 lidar_gpu="${1:-0}"
+lidar_device_pids="$(nvidia-smi -i "$lidar_gpu" --query-compute-apps=pid --format=csv,noheader)"
+if [[ -n "$lidar_device_pids" ]]; then
+  echo "GPU $lidar_gpu has an existing compute process; no run was stopped or started." >&2
+  exit 1
+fi
 lidar_root="${FIXED_LIDAR_OUTPUT_ROOT:-/data/3dgs_outputs/orange_4F/1_full}"
 lidar_source="${FIXED_LIDAR_SOURCE:-/data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full}"
 lidar_baseline="${FIXED_LIDAR_BASELINE:-}"
@@ -23,6 +28,10 @@ python -u scripts/run_fixed_lidar.py prepare \
   --max-scale-ratio "${FIXED_LIDAR_MAX_SCALE_RATIO:-2.0}" \
   --max-scale-world "${FIXED_LIDAR_MAX_SCALE_WORLD:-0.0}" \
   --scale-control "${FIXED_LIDAR_SCALE_CONTROL:-clamp}" \
+  --debug-preview-every "${DEBUG_PREVIEW_EVERY:-500}" \
+  --debug-preview-train "${DEBUG_PREVIEW_TRAIN:-2}" \
+  --debug-preview-test "${DEBUG_PREVIEW_TEST:-2}" \
+  --debug-preview-seed "${DEBUG_PREVIEW_SEED:-0}" \
   --scale-regularization-weight "${FIXED_LIDAR_SCALE_REGULARIZATION_WEIGHT:-0.01}" \
   --iterations "${FIXED_LIDAR_ITERATIONS:-100000}" \
   --checkpoint-every "${FIXED_LIDAR_CHECKPOINT_EVERY:-10000}" \

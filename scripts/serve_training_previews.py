@@ -6,11 +6,12 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
-def preview_directory(model=None, root=None):
+def preview_directory(model=None, root=None, variant='inference'):
+    subdirectory = 'debug_previews_training' if variant == 'training' else 'debug_previews'
     if model is not None:
-        folder = Path(model).expanduser().resolve() / 'debug_previews'
+        folder = Path(model).expanduser().resolve() / subdirectory
     else:
-        candidates = list(Path(root).expanduser().resolve().glob('*/debug_previews/history.json'))
+        candidates = list(Path(root).expanduser().resolve().glob(f'*/{subdirectory}/history.json'))
         if not candidates:
             raise FileNotFoundError('No training previews yet. Start the updated trainer and wait for its debug preview path.')
         folder = max(candidates, key=lambda path: path.stat().st_mtime_ns).parent
@@ -26,8 +27,10 @@ def main():
     group.add_argument('--root', type=Path, help='Select the most recently updated preview run under this output root')
     parser.add_argument('--port', type=int, default=8082)
     parser.add_argument('--host', default='0.0.0.0')
+    parser.add_argument('--variant', choices=('inference','training'), default='inference',
+                        help='Training variant shows mesh culling ON for train-only culling runs')
     args = parser.parse_args()
-    folder = preview_directory(args.model, args.root)
+    folder = preview_directory(args.model, args.root, args.variant)
     server = ThreadingHTTPServer((args.host, args.port), partial(SimpleHTTPRequestHandler, directory=str(folder)))
     print(f'Preview model: {folder.parent}\nServing {folder}\n'
           f'Open http://<server-ip>:{server.server_port}/ (Ctrl-C to stop the preview server).', flush=True)

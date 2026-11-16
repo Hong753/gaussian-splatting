@@ -69,7 +69,7 @@ def load_heldout_camera(record, dataset):
     return loadCam(args, 0, info, 1., False, True)
 
 
-def create_previewer(scene, dataset, config, *, start_iteration=0):
+def create_previewer(scene, dataset, config, *, start_iteration=0, subdirectory='debug_previews'):
     if not config['every']:
         return None
     train = {c.image_name: c for c in scene.getTrainCameras()}
@@ -96,13 +96,13 @@ def create_previewer(scene, dataset, config, *, start_iteration=0):
     if not frames:
         print('Debug previews: no requested frames available.', flush=True)
         return None
-    root = Path(scene.model_path) / 'debug_previews'
+    root = Path(scene.model_path) / subdirectory
     history = root / 'history.json'
     if history.exists() and any(s['iteration'] > start_iteration for s in json.loads(history.read_text())['snapshots']):
         # A normal checkpoint resume can rewind past previews saved after that
         # checkpoint. Preserve that old trajectory, rather than reusing its
         # images or crashing training at the first duplicated preview step.
-        archive = root.with_name(f'debug_previews_before_restart_{time.time_ns()}')
+        archive = root.with_name(f'{subdirectory}_before_restart_{time.time_ns()}')
         root.rename(archive)
         print(f'Debug previews: archived the later trajectory to {archive}', flush=True)
     previewer = TrainingPreviewer(root, frames, config,
