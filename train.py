@@ -529,9 +529,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         if distance_stats is not None:
                             distance_stats.update(step_stats)
                         del distance_weights,distance_keep
-                    elif "occlusion_keep" in render_pkg:
+                    elif "occlusion_keep" in render_pkg or opt.lidar_activation:
                         from utils.occlusion_culling import masked_adam_step
-                        masked_adam_step(gaussians.optimizer, render_pkg["occlusion_keep"], pipe.occlusion_chunk_size)
+                        from utils.lidar_activation import optimization_mask
+                        masked_adam_step(gaussians.optimizer, optimization_mask(gaussians,render_pkg), pipe.occlusion_chunk_size)
                     else:
                         gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
@@ -551,8 +552,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # The discrete policy consumes accumulated screen-space gradients,
             # but edits the population only AFTER this iteration's Adam update.
             if opt.lidar_activation:
-                from utils.lidar_activation import adapt as activate_lidar
-                stats=activate_lidar(gaussians,viewpoint_cam,pipe,iteration,render_pkg['occlusion_keep'])
+                from utils.lidar_activation import adapt as activate_lidar, optimization_mask
+                stats=activate_lidar(gaussians,viewpoint_cam,pipe,iteration,optimization_mask(gaussians,render_pkg))
                 if stats is not None:
                     with open(os.path.join(scene.model_path,'lidar_activation_growth.jsonl'),'a') as stream:
                         stream.write(json.dumps(stats,allow_nan=False)+'\n')

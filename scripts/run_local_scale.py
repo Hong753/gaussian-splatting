@@ -98,14 +98,16 @@ def build_plan(args):
             inference_protocol='culling off; original/refined poses; additional matched culling-on previews')
     if getattr(args,'lidar_activation_policy',None) is not None:
         from utils.lidar_activation import validate as validate_activation
-        if not plan.get('pose_culling') or not getattr(args,'lidar_activation_cache',None):
-            raise ValueError('Adaptive LiDAR activation requires pose-aware culling and a candidate cache')
+        if not plan.get('lidar_offsets') or not getattr(args,'lidar_activation_cache',None):
+            raise ValueError('Adaptive LiDAR activation requires an anchor policy and a candidate cache')
         policy=validate_activation(args.lidar_activation_policy,args.iterations)
         plan.update(lidar_activation=policy,lidar_activation_cache=str(args.lidar_activation_cache.resolve()),
             positions='unique discrete original LiDAR anchors with bounded offsets; reserved rows activate adaptively; no pruning',
             population='fixed-size optimizer arrays; inactive rows frozen; only active Gaussians exported')
         plan['stages'][0]['argv'] += ['--lidar_activation',json.dumps(policy,sort_keys=True),
                                     '--lidar_activation_cache',plan['lidar_activation_cache']]
+        if not plan.get('pose_culling'):
+            plan['activation_visibility']='camera frustum only; no mesh or depth-based occlusion test'
     from utils.lidar_offsets import is_fixed
     if is_fixed(plan.get('lidar_offsets')):
         plan['positions']='exact original LiDAR coordinates throughout, including newly activated rows; XYZ LR zero'

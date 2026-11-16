@@ -23,8 +23,6 @@ def main(argv=None):
     p.add_argument('--fixed-positions',action='store_true')
     p.add_argument('--distance-policy',type=json.loads)
     args=p.parse_args(argv)
-    if args.lidar_activation and not args.pose_culling:
-        raise ValueError('Activation smoke requires --pose-culling')
     os.environ['CUDA_VISIBLE_DEVICES']=args.gpu
     import numpy as np
     import torch
@@ -70,7 +68,7 @@ def main(argv=None):
             opt.pose_culling=json.dumps(CULLING)
         if args.lidar_activation:
             from utils.discrete_lidar_cache import prepare as prepare_pool
-            from utils.lidar_activation import DEFAULTS as ACTIVATION,active_mask,adapt
+            from utils.lidar_activation import DEFAULTS as ACTIVATION,active_mask,adapt,optimization_mask
             activation={**ACTIVATION,'start':1,'end':4,'interval':1,'min_observations':1,'gradient_threshold':1e-12,'max_new':2}
             prepare_pool(root/'input.ply',root/'pool',workers=1,
                          **{k:activation[k] for k in ('fraction','voxel','neighbors','seed')})
@@ -110,6 +108,9 @@ def main(argv=None):
                 assert torch.equal(getattr(model,k),value) and getattr(model,k).grad is None
             poses=[p.detach().clone() for p in model.pose_refiner.params[cam.image_name]]
             package=render(model.pose_refiner.camera(cam),model,pipe,bg)
+            if not args.pose_culling:
+                assert 'occlusion_keep' not in package and 'occlusion_fragment_flags' not in package
+                assert not hasattr(pipe,'_occlusion_provider')
             image=package['render']
             loss=(image-cam.original_image.cuda()).square().mean()+scale_regularization(model)+regularization(model)
             assert torch.isfinite(loss)
@@ -132,12 +133,15 @@ def main(argv=None):
             elif args.pose_culling:
                 from utils.occlusion_culling import masked_adam_step
                 masked_adam_step(model.optimizer,package['occlusion_keep'])
+            elif args.lidar_activation:
+                from utils.occlusion_culling import masked_adam_step
+                masked_adam_step(model.optimizer,optimization_mask(model,package))
             else:
                 model.optimizer.step()
             project_scales(model);model.optimizer.zero_grad(set_to_none=True)
             if args.lidar_activation:
                 before_active=active_mask(model).clone()
-                adapt(model,model.pose_refiner.camera(cam),pipe,i,package['occlusion_keep'])
+                adapt(model,model.pose_refiner.camera(cam),pipe,i,optimization_mask(model,package))
                 new=active_mask(model)&~before_active
                 assert torch.equal(model._xyz[new],state(model)['anchors'][new])
                 for group in model.optimizer.param_groups:

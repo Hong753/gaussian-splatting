@@ -2265,3 +2265,35 @@ existing activation policy to isolate position locking. CPU regression tests
 cover exact coordinates through Adam, growth, checkpoint restore and PLY export.
 The launcher's combined CUDA smoke also checks fixed XYZ throughout pose and
 Gaussian updates, growth, reset rejection and resume before loading the scene.
+
+### GPU 1: fixed LiDAR positions with culling completely disabled
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_pose_lidar_fixed_noculling.sh 1
+```
+
+This fresh run uses native 3DGS + AA for both training and rendering. It never
+loads an occluding mesh, mesh-depth cache or DA3 depth reference, and does not
+run culling CUDA checks or culling-on previews. Gaussian XYZ stays exactly at
+the original LiDAR coordinates, opacity resets and pruning remain disabled,
+and cap15/target3, the scale/LR schedule, alternating camera poses, relative-depth
+update weighting and the existing adaptive-activation schedule are retained.
+Use `DEPTH_UPDATE_MODE=rank` for the rank counterpart if that was the comparator.
+
+New LiDAR anchors need only lie within the current camera bounds; they are no
+longer rejected by reference depth. Actual rendering uses native alpha
+compositing. Native projected radii and the active-reserve mask control optimizer
+updates and activation eligibility; radii do not prove surface visibility.
+Inactive parameter rows and their Adam moments stay frozen with or without
+depth weighting. The runtime accepts the native render package without any
+`occlusion_keep` field. Checkpoint restore rejects switching culling policies.
+
+The new output name contains `poses_noculling_adaptive` and does not reuse the
+previous culling run. Checkpoints and the separate all-frame evaluator retain
+the 10k interval, with original/refined-pose PSNR and matched GT/render/error
+previews. The combined native CUDA preflight verifies fixed positions,
+activation, optimizer state, export and resume before full training.

@@ -145,8 +145,8 @@ def prepare(argv):
     args.distance_far_quantile=request.depth_far_quantile
     args.distance_rank_samples=request.depth_rank_samples
     if request.depth_decay:
-        if not (request.pose_refinement and request.lidar_offsets and request.pose_culling and request.lidar_activation):
-            raise ValueError('Depth-decay ablation requires the cap15 pose/culling/adaptive-anchor framework')
+        if not (request.pose_refinement and request.lidar_offsets and request.lidar_activation):
+            raise ValueError('Depth-decay ablation requires the pose/adaptive-anchor framework')
         args.distance_reference=request.depth_reference
         args.distance_min_weight=request.depth_min_weight
     if request.pose_refinement:

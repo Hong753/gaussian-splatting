@@ -33,9 +33,9 @@ def validate(policy, iterations):
 def requested(opt):
     value=getattr(opt,'lidar_activation','')
     cfg=validate(json.loads(value),opt.iterations) if value else None
-    if cfg and (not getattr(opt,'pose_culling','') or not getattr(opt,'lidar_offsets','') or
+    if cfg and (not getattr(opt,'lidar_offsets','') or
                 not getattr(opt,'fixed_lidar',False) or not getattr(opt,'lidar_activation_cache','')):
-        raise ValueError('LiDAR activation requires an anchor policy, pose-aware culling and a candidate cache')
+        raise ValueError('LiDAR activation requires an anchor policy and a candidate cache')
     return cfg
 
 
@@ -46,6 +46,19 @@ def state(model):
 def active_mask(model):
     saved=state(model)
     return saved['active'] if saved is not None else None
+
+
+def optimization_mask(model,package):
+    """Reserve freezing works with either native radii or CUDA clipping flags.
+
+    Native radii only identify projected raster candidates, not visibility
+    behind surfaces. With culling off, native alpha compositing handles those.
+    """
+    keep=package.get('occlusion_keep')
+    if keep is None:
+        keep=package['radii']>0
+    active=active_mask(model)
+    return keep if active is None else keep&active
 
 
 @torch.no_grad()
@@ -112,7 +125,6 @@ def audit(model,iteration):
 
 @torch.no_grad()
 def visible_candidates(model,ids,camera,pipe):
-    from utils.ray_occlusion import pixel_cutoff
     from utils.view_tangent import camera_intrinsics
     xyz=model.fixed_lidar_state['position_offsets']['anchors'][ids]
     view=camera.world_view_transform
@@ -120,6 +132,11 @@ def visible_candidates(model,ids,camera,pipe):
     k=camera_intrinsics(camera,xyz.device)
     uv=points[:,:2]/z.clamp_min(1e-6)[:,None]*k.diag()[:2]+k[:2,2]
     inside=(z>.2)&torch.isfinite(points).all(1)&(uv[:,0]>=-.5)&(uv[:,0]<camera.image_width-.5)&(uv[:,1]>=-.5)&(uv[:,1]<camera.image_height-.5)
+    if getattr(pipe,'occlusion_mode','off') == 'off':
+        # No mesh, depth cache, hidden-point test or synthetic cutoff. This is
+        # only the ordinary camera bounds check for selecting new anchors.
+        return inside
+    from utils.ray_occlusion import pixel_cutoff
     pix=torch.floor(uv+.5).long()
     cutoff=pixel_cutoff(camera,model,pipe)[pix[:,1].clamp(0,camera.image_height-1),pix[:,0].clamp(0,camera.image_width-1)]
     # Growth requires a supported ray; unknown pixels still render normally for
