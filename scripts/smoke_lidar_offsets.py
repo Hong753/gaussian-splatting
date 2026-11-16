@@ -20,6 +20,7 @@ def main(argv=None):
     p.add_argument('--target-multiplier',type=float,default=1.)
     p.add_argument('--pose-culling',action='store_true')
     p.add_argument('--lidar-activation',action='store_true')
+    p.add_argument('--fixed-positions',action='store_true')
     p.add_argument('--distance-policy',type=json.loads)
     args=p.parse_args(argv)
     if args.lidar_activation and not args.pose_culling:
@@ -34,7 +35,7 @@ def main(argv=None):
     from utils.graphics_utils import BasicPointCloud,getProjectionMatrix
     from utils.local_scale import prepare,support_counts
     from utils.fixed_lidar import audit,project_scales,scale_regularization
-    from utils.lidar_offsets import DEFAULTS,regularization,state
+    from utils.lidar_offsets import DEFAULTS,FIXED,regularization,state
     from utils.pose_refinement import PoseRefiner,DEFAULTS as POSES,source_fingerprints,render_pose
     from utils.local_scale_schedule import GROUP_LRS
     if not torch.cuda.is_available():raise RuntimeError('LiDAR offset smoke requires CUDA in the 3dgs environment')
@@ -55,7 +56,7 @@ def main(argv=None):
             '--local_scale_ceiling_multiplier',str(args.ceiling_multiplier),'--position_lr_init','0','--position_lr_final','0',
             '--local_scale_target_multiplier',str(args.target_multiplier),
             '--densify_until_iter','0','--iterations','6']))
-        policy={**DEFAULTS,'warmup':1,'ramp':1,'end':6}
+        policy=dict(FIXED) if args.fixed_positions else {**DEFAULTS,'warmup':1,'ramp':1,'end':6}
         pose_policy={**POSES,'start':1,'end':4,'max_width':64}
         opt.lidar_offsets=json.dumps(policy);opt.pose_refinement=json.dumps(pose_policy)
         if args.distance_policy:
@@ -83,7 +84,8 @@ def main(argv=None):
         initial_sigma=m._scaling[:,:1].detach().exp().clone()
         m.oneupSHdegree();m.training_setup(opt)
         initial_active=int(active_mask(m).sum()) if args.lidar_activation else len(xyz)
-        torch.testing.assert_close(state(m)['radius'],(initial_sigma*.25).clamp_max(.005),rtol=0,atol=0)
+        torch.testing.assert_close(state(m)['radius'],torch.zeros_like(initial_sigma) if args.fixed_positions else
+                                   (initial_sigma*.25).clamp_max(.005),rtol=0,atol=0)
         projection=getProjectionMatrix(.01,100.,math.pi/2,math.pi/2).cuda().T.contiguous()
         cam=SimpleNamespace(image_name='smoke.jpg',image_height=64,image_width=64,FoVx=math.pi/2,FoVy=math.pi/2,
             world_view_transform=torch.eye(4,device='cuda'),projection_matrix=projection,full_proj_transform=projection,
@@ -145,20 +147,33 @@ def main(argv=None):
                             if key in momentum:assert not bool(momentum[key][new].any())
             for a,b in zip(poses,model.pose_refiner.params[cam.image_name]):assert torch.equal(a,b)
             audit(model,i)
+            if args.fixed_positions:
+                assert lr==0. and not model._xyz.requires_grad
+                assert torch.equal(model._xyz,state(model)['anchors'])
+                assert model._xyz not in model.optimizer.state
             return row
 
         rows=[]
         for i in range(1,4):rows.append(step(m,i))
-        assert not torch.equal(m._xyz,state(m)['anchors'])
+        assert torch.equal(m._xyz,state(m)['anchors']) == args.fixed_positions
         assert m.optimizer.param_groups[0]['lr']<=1e-5 # scene extent=1000 must not amplify LR
-        chosen=int(active_mask(m).nonzero()[0]) if args.lidar_activation else 0
-        other_rows=torch.arange(len(xyz),device='cuda')!=chosen
-        with torch.no_grad():m._xyz[chosen].add_(1.)
-        moments=m.optimizer.state[m._xyz]
-        others={k:moments[k][other_rows].clone() for k in ('exp_avg','exp_avg_sq')}
-        project_scales(m)
-        for k,value in others.items():
-            assert (moments[k][chosen]==0).all() and torch.equal(moments[k][other_rows],value)
+        if not args.fixed_positions:
+            chosen=int(active_mask(m).nonzero()[0]) if args.lidar_activation else 0
+            other_rows=torch.arange(len(xyz),device='cuda')!=chosen
+            with torch.no_grad():m._xyz[chosen].add_(1.)
+            moments=m.optimizer.state[m._xyz]
+            others={k:moments[k][other_rows].clone() for k in ('exp_avg','exp_avg_sq')}
+            project_scales(m)
+            for k,value in others.items():
+                assert (moments[k][chosen]==0).all() and torch.equal(moments[k][other_rows],value)
+        opacity_before=m._opacity.detach().clone()
+        try:
+            m.reset_opacity()
+        except RuntimeError as exc:
+            assert 'Opacity resets are disabled' in str(exc)
+        else:
+            raise AssertionError('LiDAR opacity reset was allowed')
+        assert torch.equal(m._opacity,opacity_before)
         audit(m,3)
         buffer=io.BytesIO();torch.save(m.capture(),buffer);buffer.seek(0)
         restored=GaussianModel(1);restored._exposure=torch.nn.Parameter(m._exposure.detach().clone())
@@ -166,7 +181,10 @@ def main(argv=None):
         if args.lidar_activation:
             assert torch.equal(active_mask(m),active_mask(restored))
         restored.pose_refiner=PoseRefiner([cam],pose_policy,root/'source',6,saved=restored.pose_refinement_state)
-        for k in ('exp_avg','exp_avg_sq'):assert torch.equal(restored.optimizer.state[restored._xyz][k],moments[k])
+        if args.fixed_positions:
+            assert not restored._xyz.requires_grad and restored._xyz not in restored.optimizer.state
+        else:
+            for k in ('exp_avg','exp_avg_sq'):assert torch.equal(restored.optimizer.state[restored._xyz][k],moments[k])
         for i in range(4,7):rows.append(step(restored,i))
         ids=restored.local_scale_audit['sample_ids']
         distance=torch.cdist(restored._xyz[ids],restored._xyz,compute_mode='donot_use_mm_for_euclid_dist')
@@ -186,7 +204,9 @@ def main(argv=None):
             pose_aware_culling=args.pose_culling,
             adaptive_lidar_activation=args.lidar_activation,initial_active_gaussians=initial_active,
             native_aa_alternating_updates=True,gaussians_frozen_during_pose_step=True,poses_frozen_during_gaussian_step=True,
-            warmup_has_no_xyz_moments=True,absolute_xyz_lr=True,selective_xyz_moment_projection=True,
+            warmup_has_no_xyz_moments=True,absolute_xyz_lr=True,
+            fixed_positions_throughout=args.fixed_positions,opacity_reset_guard=True,
+            selective_xyz_moment_projection=not args.fixed_positions,
             original_anchors_and_xyz_optimizer_resume=True,overlap_counts_match_all_pairs=True,
             exported_xyz_match=True,source_calibration_unchanged=True,
             **audit(restored,6))

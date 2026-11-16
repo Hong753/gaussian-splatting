@@ -1,4 +1,4 @@
-"""Small, persistent displacement balls around immutable input LiDAR rows."""
+"""Fixed centers or small displacement balls around immutable input LiDAR rows."""
 import json
 import math
 
@@ -7,9 +7,16 @@ import torch
 
 DEFAULTS=dict(schema=1,max_world=.005,sigma_ratio=.25,warmup=7000,ramp=2000,
               end=30000,lr_init=1e-5,lr_final=1e-6,prior_weight=.001)
+FIXED=dict(schema=2,mode='fixed')
+
+
+def is_fixed(policy):
+    return policy == FIXED
 
 
 def validate(policy,iterations):
+    if isinstance(policy,dict) and is_fixed(policy):
+        return dict(FIXED)
     if not isinstance(policy,dict) or set(policy)!=set(DEFAULTS) or policy['schema']!=1:
         raise ValueError('Invalid LiDAR offset policy')
     if (not all(type(policy[k]) is int for k in ('warmup','ramp','end')) or
@@ -36,7 +43,8 @@ def requested(opt):
 def initialize(model,policy):
     from utils.fixed_lidar import xyz_digest
     anchors=model._xyz.detach().clone()
-    radius=(model._scaling[:,:1].detach().exp()*policy['sigma_ratio']).clamp_max(policy['max_world'])
+    radius=(torch.zeros_like(model._scaling[:,:1]) if is_fixed(policy) else
+            (model._scaling[:,:1].detach().exp()*policy['sigma_ratio']).clamp_max(policy['max_world']))
     return dict(policy=policy,anchors=anchors,radius=radius,radius_sha256=xyz_digest(radius),iteration=0)
 
 
@@ -50,24 +58,27 @@ def bind(model,opt):
     if (saved['policy'] if saved else None)!=policy:
         raise ValueError('Checkpoint LiDAR offset policy differs from requested policy')
     if saved is None: return
+    fixed=is_fixed(policy)
     if (saved['anchors'].shape!=model._xyz.shape or saved['radius'].shape!=(len(model._xyz),1) or
             xyz_digest(saved['anchors'])!=model.fixed_lidar_state['xyz_sha256'] or
             xyz_digest(saved['radius'])!=saved['radius_sha256'] or
-            not torch.isfinite(saved['radius']).all() or not (saved['radius']>0).all() or
-            bool((saved['radius']>policy['max_world']).any()) or
+            not torch.isfinite(saved['radius']).all() or
+            (not (saved['radius']==0).all() if fixed else not (saved['radius']>0).all()) or
+            bool((saved['radius']>policy.get('max_world',0.)).any()) or
             type(saved['iteration']) is not int or not 0<=saved['iteration']<=opt.iterations):
         raise ValueError('Invalid original LiDAR anchors, displacement radii or saved iteration')
     padding=model.local_scale_audit['metadata']['config'].get('position_padding',0.)
-    if padding<policy['max_world']:
+    if padding<policy.get('max_world',0.):
         raise ValueError('Local-scale overlap cache must include LiDAR offset padding')
     with torch.no_grad():
         distance=(model._xyz-saved['anchors']).norm(dim=1)
         if (not torch.isfinite(distance).all() or bool((distance>saved['radius'][:,0]).any()) or
-                (saved['iteration']<=policy['warmup'] and bool((distance!=0).any()))):
+                ((fixed or saved['iteration']<=policy['warmup']) and bool((distance!=0).any()))):
             raise ValueError('Saved LiDAR positions violate displacement or warmup bounds')
 
 
 def learning_rate(policy,iteration):
+    if is_fixed(policy): return 0.
     if iteration<=policy['warmup']: return 0.
     phase=min(1.,(iteration-policy['warmup'])/policy['ramp'])
     ramp=.5-.5*math.cos(math.pi*phase)
@@ -94,6 +105,12 @@ def project(model,chunk=1048576):
     saved=state(model)
     if saved is None: return
     if len(model._xyz)!=len(saved['anchors']): raise RuntimeError('LiDAR anchor population changed')
+    if is_fixed(saved['policy']):
+        # Never create XYZ gradients/moments or silently snap displaced rows.
+        # Exact anchor equality is checked on restore and each periodic audit.
+        if model._xyz.requires_grad or model._xyz.grad is not None:
+            raise RuntimeError('Fixed LiDAR positions acquired gradients')
+        return
     momentum=model.optimizer.state.get(model._xyz,{}) if model.optimizer else {}
     for start in range(0,len(model._xyz),chunk):
         part=slice(start,start+chunk)
@@ -114,7 +131,7 @@ def project(model,chunk=1048576):
 
 def regularization(model):
     saved=state(model)
-    if saved is None or not model._xyz.requires_grad: return model._xyz.new_zeros(())
+    if saved is None or is_fixed(saved['policy']) or not model._xyz.requires_grad: return model._xyz.new_zeros(())
     relative=(model._xyz-saved['anchors'])/saved['radius']
     from utils.lidar_activation import active_mask
     active=active_mask(model)
@@ -132,11 +149,11 @@ def audit(model):
     radius=saved['radius'][:,0]
     within=bool(torch.isfinite(d).all() and (d<=radius).all())
     unchanged=bool((d==0).all())
-    if not anchors_ok or not within or (saved['iteration']<=saved['policy']['warmup'] and not unchanged):
+    if not anchors_ok or not within or ((is_fixed(saved['policy']) or saved['iteration']<=saved['policy']['warmup']) and not unchanged):
         raise RuntimeError('LiDAR offset audit failed: original anchor, displacement bound or warmup changed')
     return dict(positions_unchanged=unchanged,positions_within_bounds=within,anchors_unchanged=anchors_ok,
         lidar_offset_policy=saved['policy'],offset_iteration=saved['iteration'],
         offset_max=float(d.max()),offset_mean=float(d.mean()),offset_radius_max=float(radius.max()),
         offset_moved_fraction=float((d>0).float().mean()),
-        offset_near_bound_fraction=float((d>=.99*radius).float().mean()),
+        offset_near_bound_fraction=float(((radius>0)&(d>=.99*radius)).float().mean()),
         offset_xyz_lr=next(g['lr'] for g in model.optimizer.param_groups if g['name']=='xyz'))

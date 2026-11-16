@@ -2215,3 +2215,53 @@ view reference; relative/rank modes ignore that absolute reference. For a
 geometric ratio `q` per distance interval `d`, choose half-life
 `H = -d*log(2)/log(q)`; continuous geometric and exponential depth decay are
 the same family. Distances are in scene units, metres only if the scene is metric.
+
+### Strictly fixed LiDAR centers; opacity resets remain off
+
+The latest local-scale / bounded-offset / adaptive-anchor / depth-decay runs
+already perform **zero opacity resets**. `fixed_lidar` disables the ordinary
+densification/pruning/reset branch; adaptive anchor activation has its own
+schedule. Soft-surface and discrete-LiDAR experiments also skip resets. The
+native 3DGS defaults instead cap opacities at 0.01 at steps 3000, 6000, 9000,
+12000 (four resets while `phase_iteration < 15000`). A densification phase
+offset of 7000 shifts those to 10000, 13000, 16000, 19000. White-background
+training has an additional reset at `densify_from_iter` within that phase.
+Longer training alone does not extend the reset window.
+
+The strict-position counterpart of the latest depth-decay experiment is:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_pose_lidar_fixed_positions.sh 0
+```
+
+Use a free GPU. This creates a new `_fixed_lidar_..._noresets_30000_v1` output,
+does not stop an existing run, and initializes from the original input cloud.
+`DEPTH_UPDATE_MODE=rank` selects the matching rank-weighted counterpart; the
+default is the previous run's relative-depth weighting.
+
+This is a **position-locking ablation, not a newly disabled reset policy**:
+
+- Every allocated and activated center remains exactly on its original LiDAR
+  coordinate for all 30k steps. XYZ learning rate is zero, gradients disabled,
+  and no XYZ Adam moments are created. Camera pose refinement remains enabled.
+- Opacity remains learnable, with zero global resets and no pruning. A direct
+  opacity-reset call now raises before mutating any LiDAR parameters or moments.
+- Cap15/target3, the scale/LR curriculum, depth weighting, pose refinement,
+  CUDA culling and gradient-driven anchor activation are unchanged. Existing
+  checkpoints cannot resume under a different position policy.
+- All-frame PSNR still runs in the separate evaluator every 10k steps. Primary
+  evaluation is culling-free; matching GT/render/error previews include
+  culling ON/OFF and retain the original/refined camera-pose protocols.
+
+The current activation policy uses native screen-space gradients and visible
+unused measured neighbors. It does **not** yet use an explicit GT-versus-render
+blur score or a normal/plane-consistency filter. Residual-driven activation of
+same-surface LiDAR neighbors is a separate future ablation; this run keeps the
+existing activation policy to isolate position locking. CPU regression tests
+cover exact coordinates through Adam, growth, checkpoint restore and PLY export.
+The launcher's combined CUDA smoke also checks fixed XYZ throughout pose and
+Gaussian updates, growth, reset rejection and resume before loading the scene.

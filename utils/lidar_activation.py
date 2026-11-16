@@ -2,7 +2,8 @@
 
 Training keeps fixed-size parameter/Adam arrays. Inactive rows have exactly zero
 rendering opacity and never update; activating a row exposes its untouched LiDAR
-initialization. Each active anchor may learn the existing bounded XYZ offset.
+initialization. Centers remain fixed or learn bounded XYZ offsets, according to
+the saved anchor policy.
 """
 import json
 import math
@@ -34,7 +35,7 @@ def requested(opt):
     cfg=validate(json.loads(value),opt.iterations) if value else None
     if cfg and (not getattr(opt,'pose_culling','') or not getattr(opt,'lidar_offsets','') or
                 not getattr(opt,'fixed_lidar',False) or not getattr(opt,'lidar_activation_cache','')):
-        raise ValueError('LiDAR activation requires bounded offsets, pose-aware culling and a candidate cache')
+        raise ValueError('LiDAR activation requires an anchor policy, pose-aware culling and a candidate cache')
     return cfg
 
 

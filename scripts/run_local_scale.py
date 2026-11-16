@@ -85,7 +85,7 @@ def build_plan(args):
     if getattr(args, 'pose_culling_policy', None) is not None:
         from utils.pose_culling import validate as validate_culling, geometry_inputs
         if not getattr(args, 'lidar_offset_policy', None) or not getattr(args, 'scene_geometry', None):
-            raise ValueError('Pose culling requires bounded LiDAR offsets and the scene mesh')
+            raise ValueError('Pose culling requires a LiDAR anchor policy and the scene mesh')
         policy=validate_culling(args.pose_culling_policy)
         geometry_inputs(args.scene_geometry, args.point_cloud, args.source)
         command=plan['stages'][0]['argv']
@@ -106,6 +106,10 @@ def build_plan(args):
             population='fixed-size optimizer arrays; inactive rows frozen; only active Gaussians exported')
         plan['stages'][0]['argv'] += ['--lidar_activation',json.dumps(policy,sort_keys=True),
                                     '--lidar_activation_cache',plan['lidar_activation_cache']]
+    from utils.lidar_offsets import is_fixed
+    if is_fixed(plan.get('lidar_offsets')):
+        plan['positions']='exact original LiDAR coordinates throughout, including newly activated rows; XYZ LR zero'
+        plan['position_mode']='fixed'
     return plan
 
 
@@ -147,6 +151,7 @@ def execute_plan(args, plan):
                 '--ceiling-multiplier',str(getattr(args,'ceiling_multiplier',1.)),
                 '--target-multiplier',str(getattr(args,'target_multiplier',1.)),
                 '--output',str(model/'lidar_offsets_cuda_smoke.json')]+
+                (['--fixed-positions'] if plan.get('position_mode')=='fixed' else [])+
                 (['--pose-culling'] if getattr(args,'pose_culling_policy',None) is not None else [])+
                 (['--lidar-activation'] if getattr(args,'lidar_activation_policy',None) is not None else [])+
                 (['--distance-policy',json.dumps(plan['distance_updates'],sort_keys=True)] if plan.get('distance_updates') else []))

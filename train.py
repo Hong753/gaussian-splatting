@@ -173,8 +173,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             from utils.lidar_activation import audit as audit_activation
             print('Adaptive LiDAR activation (fixed-size reserved optimizer arrays): '+json.dumps(audit_activation(gaussians,first_iter)))
         if gaussians.fixed_lidar_state.get('position_offsets') is not None:
-            print(f'Bounded LiDAR offsets: {len(gaussians.get_xyz):,} original anchors; '
-                  'no cloning, splitting, pruning or opacity resets. Absolute XYZ LR without scene-extent scaling.')
+            from utils.lidar_offsets import is_fixed
+            if is_fixed(gaussians.fixed_lidar_state['position_offsets']['policy']):
+                print(f'Fixed LiDAR positions: {len(gaussians.get_xyz):,} reserved original anchors; '
+                      'XYZ LR = 0 throughout; no XYZ gradients, pruning or opacity resets. '
+                      'Adaptive activation, if enabled, uses untouched original LiDAR coordinates.')
+            else:
+                print(f'Bounded LiDAR offsets: {len(gaussians.get_xyz):,} original anchors; '
+                      'no cloning, splitting, pruning or opacity resets. Absolute XYZ LR without scene-extent scaling.')
             print(json.dumps(gaussians.fixed_lidar_state['position_offsets']['policy'],indent=2))
         else:
             print(f'Fixed LiDAR: {len(gaussians.get_xyz):,} immutable centers; no cloning, splitting, pruning or opacity resets.')

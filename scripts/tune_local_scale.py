@@ -33,6 +33,8 @@ def schedule_arguments(parser):
     parser.add_argument('--pose-prior-weight',type=float,default=.001)
     parser.add_argument('--pose-max-width',type=int,default=960)
     parser.add_argument('--lidar-offsets',action='store_true')
+    parser.add_argument('--fixed-lidar-positions',action='store_true',
+                        help='Lock every original and activated LiDAR center for the entire run')
     parser.add_argument('--pose-culling',action='store_true')
     parser.add_argument('--lidar-activation',action='store_true')
     parser.add_argument('--scene-geometry',type=Path)
@@ -109,6 +111,8 @@ def prepare(argv):
     p.add_argument('--dry-run',action='store_true')
     schedule_arguments(p)
     request=p.parse_args(argv)
+    if request.fixed_lidar_positions and not (request.lidar_offsets and request.pose_refinement):
+        raise ValueError('--fixed-lidar-positions requires the LiDAR-anchor pose experiment')
     schedule=requested_schedule(request)
     reference=request.reference_model.expanduser().resolve()
     old=periodic.load_plan(reference)
@@ -150,8 +154,9 @@ def prepare(argv):
         args.pose_policy=validate_pose({**DEFAULTS,**{key:getattr(request,'pose_'+key) for key in
             ('start','end','every','max_translation','max_rotation_degrees','translation_lr','rotation_lr','prior_weight','max_width')}},request.iterations)
     if request.lidar_offsets:
-        from utils.lidar_offsets import DEFAULTS as OFFSET_DEFAULTS, validate as validate_offsets
-        args.lidar_offset_policy=validate_offsets({**OFFSET_DEFAULTS,'end':request.iterations,
+        from utils.lidar_offsets import DEFAULTS as OFFSET_DEFAULTS, FIXED, validate as validate_offsets
+        args.lidar_offset_policy=validate_offsets(dict(FIXED) if request.fixed_lidar_positions else
+            {**OFFSET_DEFAULTS,'end':request.iterations,
             **{key:getattr(request,'offset_'+key) for key in
                ('max_world','sigma_ratio','warmup','ramp','lr_init','lr_final','prior_weight')}},request.iterations)
     args.reuse_cache=Path(old['plan']['local_scale_cache'])

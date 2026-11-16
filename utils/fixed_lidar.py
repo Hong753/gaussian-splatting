@@ -38,7 +38,7 @@ def configure_training(opt, dataset):
                 not getattr(opt, 'pose_refinement', '') or dataset.occlusion_mode != 'mesh' or
                 dataset.occlusion_backend != 'ray' or dataset.occlusion_inference_mode != 'off' or
                 dataset.occlusion_margin != 0):
-            raise ValueError('Pose culling requires bounded LiDAR offsets, poses, ray mesh training and culling-free inference')
+            raise ValueError('Pose culling requires a LiDAR anchor policy, poses, ray mesh training and culling-free inference')
         dataset.pose_culling=culling_policy
         from utils.pose_culling import geometry_inputs
         from utils.lidar_occlusion import file_digest

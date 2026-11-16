@@ -347,12 +347,12 @@ class GaussianModel:
             bind_policy(self, training_args, fresh=fresh_fixed)
             from utils.pose_culling import bind_policy as bind_culling
             bind_culling(self, training_args, fresh=fresh_fixed)
-            from utils.lidar_offsets import bind as bind_offsets, state as offset_state
+            from utils.lidar_offsets import bind as bind_offsets, state as offset_state, learning_rate as offset_lr
             bind_offsets(self,training_args)
             from utils.lidar_activation import bind as bind_activation
             bind_activation(self, training_args, fresh=fresh_fixed)
             offsets=offset_state(self)
-            self._xyz.requires_grad_(offsets is not None and offsets['iteration']>offsets['policy']['warmup'])
+            self._xyz.requires_grad_(offsets is not None and offset_lr(offsets['policy'],offsets['iteration'])>0)
             self._xyz.grad = None
         self.surface_mode = training_args.surface_mode
         if self.surface_mode == 'view_tangent':
@@ -466,6 +466,8 @@ class GaussianModel:
         PlyData([el]).write(path)
 
     def reset_opacity(self):
+        if self.fixed_lidar_state is not None or self.discrete_lidar_state is not None:
+            raise RuntimeError('Opacity resets are disabled for LiDAR-anchor training')
         opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
