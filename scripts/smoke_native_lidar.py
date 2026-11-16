@@ -15,7 +15,10 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--gpu', default='1')
     p.add_argument('--output', type=Path)
+    p.add_argument('--percent-dense', type=float, default=.01)
     args = p.parse_args(argv)
+    if not math.isfinite(args.percent_dense) or not 0 < args.percent_dense <= 1:
+        p.error('percent-dense must be finite and in (0, 1]')
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     import numpy as np
     import torch
@@ -30,7 +33,7 @@ def main(argv=None):
     params = OptimizationParams(opt_parser)
     opt = params.extract(opt_parser.parse_args(['--scale_control', 'off',
         '--position_lr_init', '3.2e-6', '--position_lr_final', '3.2e-8',
-        '--disable_opacity_resets', '--disable_pruning']))
+        '--disable_opacity_resets', '--disable_pruning', '--percent_dense', str(args.percent_dense)]))
     cloud = BasicPointCloud(points=np.array([[-.15,-.1,2],[.15,-.1,2],[-.15,.1,2],[.15,.1,2]], np.float32),
         colors=np.array([[.7,.2,.1],[.2,.6,.2],[.2,.3,.8],[.8,.7,.2]], np.float32),
         normals=np.zeros((4,3), np.float32))
@@ -57,8 +60,8 @@ def main(argv=None):
     assert not torch.equal(original, model.get_xyz)
     # Force both native growth branches and an opacity that would be pruned.
     with torch.no_grad():
-        model._scaling[:2] = math.log(.001)
-        model._scaling[2:] = math.log(.1)
+        model._scaling[:2] = math.log(opt.percent_dense*.1)
+        model._scaling[2:] = math.log(opt.percent_dense*10.)
         model._opacity[0] = -20.
         before_scale = model._scaling.clone()
         project_scales(model)
@@ -95,7 +98,7 @@ def main(argv=None):
     result = dict(passed=True, cuda_device=torch.cuda.get_device_name(), torch=torch.__version__,
         native_aa_rgb_xyz_gradients=True, reduced_lr_updates_xyz=True, no_scale_projection=True,
         clone_and_split=True, pruning_disabled_path_checked=True, native_opacity_pruning=True,
-        children_optimized=True,
+        children_optimized=True, percent_dense=opt.percent_dense,
         checkpoint_round_trip=True)
     if args.output:
         from utils.checkpoint_snapshots import atomic_json

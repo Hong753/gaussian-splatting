@@ -19,12 +19,17 @@ def parser():
     p.set_defaults(gpu='1', iterations=30000, scale_control='off')
     p.add_argument('--position-lr-divisor', type=float, default=50.)
     p.add_argument('--pruning', action='store_true', help='Enable native opacity/size pruning during densification')
+    p.add_argument('--percent-dense', type=float, default=None,
+                   help='Clone/split sigma boundary as a fraction of scene extent (native default: 0.01)')
     return p
 
 
 def build_plan(args):
     # Missing on previously saved no-pruning plans: keep those reproducible.
     pruning = bool(getattr(args, 'pruning', False))
+    percent_dense = getattr(args, 'percent_dense', None)
+    if percent_dense is not None and (not math.isfinite(percent_dense) or not 0 < percent_dense <= 1):
+        raise ValueError('percent-dense must be finite and in (0, 1]')
     if not math.isfinite(args.position_lr_divisor) or args.position_lr_divisor < 1:
         raise ValueError('Position LR divisor must be finite and >= 1')
     if args.scale_control != 'off' or args.distance_weighting or args.local_scale_cache:
@@ -51,6 +56,11 @@ def build_plan(args):
         pruning=pruning, position_lr=dict(init=initial, final=final, divisor=args.position_lr_divisor,
             max_steps=args.iterations, scene_extent_scaling=True, warmup_steps=0),
         densification=dict(start=500, until=15000, interval=100, gradient_threshold=.0002))
+    # Only explicit overrides alter the command/metadata, so old saved plans
+    # reproduce exactly when training is launched after a code update.
+    if percent_dense is not None:
+        command += ['--percent_dense', str(percent_dense)]
+        plan['densification']['percent_dense'] = percent_dense
     return plan
 
 
@@ -66,6 +76,7 @@ def prepare(argv):
 def execute_plan(args, plan):
     # Direct in-process CUDA check, then the shared native trainer invocation.
     invoke(['scripts/smoke_native_lidar.py', '--gpu', args.gpu,
+            '--percent-dense', str(plan['densification'].get('percent_dense', .01)),
             '--output', str(Path(plan['model'])/'native_lidar_cuda_smoke.json')])
     return fixed.execute_plan(args, plan, smoke=False)
 

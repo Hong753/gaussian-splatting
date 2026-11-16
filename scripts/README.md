@@ -2515,3 +2515,46 @@ python scripts/serve_training_previews.py \
 
 Open `http://211.172.247.108:8086/`. The preview server uses no GPU and this port
 can coexist with the previous run's viewer on 8085.
+
+### GPU 0: lower the native clone/split boundary by 100x
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_native_lidar_fine_split.sh 0
+```
+
+This fresh 30k run matches the GPU 1 pruning-enabled run, changing only
+`percent_dense` from `0.01` to `0.0001`. The split rule requires both accumulated
+gradient >= `0.0002` and largest sigma > `0.0001 * scene_extent`; smaller eligible
+Gaussians are cloned. This is not a scale cap. Native two-child splitting shrinks
+each child's sigma by 1.6 and displaces its center. Low-gradient points are not
+split solely because of size. The position LR remains 50x below native defaults;
+AA and native pruning remain enabled, opacity resets/culling/scale constraints
+remain disabled, and every other LR and training schedule remains unchanged.
+
+The existing screen-radius pruning bookkeeping behavior is intentionally
+unchanged in both compared runs; this experiment isolates the split threshold.
+`densification.jsonl` records actual `scene_extent`, `percent_dense`,
+`split_sigma_threshold` in scene units, and clone/split/prune counts beginning
+at step 600. The CUDA startup check uses the requested boundary. The launcher
+refuses an occupied GPU or existing trained output without stopping other runs.
+
+GT/render/error previews remain enabled every 500 steps, plus step 1 and final.
+The separate same-GPU evaluator processes all 5,009 frames at 10k/20k/30k and
+saves train/held-out comparisons. To view this run after its first preview:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+python scripts/serve_training_previews.py \
+  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_unconstrained_lr50_split1e-4_noresets_prune_30000_v1 \
+  --port 8088
+```
+
+Open `http://211.172.247.108:8088/`. For other explicit thresholds, the base
+launcher accepts `NATIVE_LIDAR_PERCENT_DENSE`; also set `NATIVE_LIDAR_MODEL` to
+a fresh directory. Existing prepared plans keep their original thresholds.

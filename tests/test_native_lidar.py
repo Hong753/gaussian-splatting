@@ -101,8 +101,57 @@ def test_native_pruning_removes_opacity_or_size_outliers_and_keeps_good_rows():
         torch.testing.assert_close(m.get_xyz[0], kept)
 
 
+def test_fine_threshold_splits_instead_of_cloning_and_keeps_gradient_gate():
+    for fraction, clones, splits in ((.01, 1, 0), (.0001, 0, 1)):
+        opt = options()
+        opt.percent_dense = fraction
+        m = model(opt)
+        before = m.get_xyz.detach().clone()
+        with torch.no_grad(), cpu_allocations():
+            # R=100, sigma=.02: old boundary is 1, new boundary is .01.
+            m._scaling[:] = math.log(.02)
+            m.xyz_gradient_accum[:] = torch.tensor([[.001], [0.]])
+            m.denom[:] = 1
+            torch.manual_seed(0)
+            m.densify_and_prune(.0002, .005, 100., 20, torch.ones(2), record_stats=True, prune=True)
+        stats = m.last_densification_stats
+        assert (stats['cloned_parents'], stats['split_parents'], stats['pruned']) == (clones, splits, 0)
+        assert math.isclose(stats['split_sigma_threshold'], fraction*100.)
+        assert len(m.get_xyz) == 3
+        # The zero-gradient row is preserved even above the new size threshold.
+        unchanged = (m.get_xyz.detach() == before[1]).all(dim=1)
+        assert unchanged.sum() == 1
+        torch.testing.assert_close(m.get_scaling[unchanged], torch.full((1, 3), .02))
+        if splits:
+            torch.testing.assert_close(m.get_scaling[~unchanged], torch.full((2, 3), .02/1.6))
+            assert not (m.get_xyz.detach() == before[0]).all(dim=1).any()
+
+
 class NativeLidarPlanTests(unittest.TestCase):
     setUp = fixed_tests.FixedLidarPlanTests.setUp
+
+    def test_fine_split_plan_only_changes_boundary_and_preserves_periodic_workflow(self):
+        args = runner.parser().parse_args(self.argv+['--pruning', '--gpu', '0'])
+        native = runner.build_plan(args)
+        del args.percent_dense  # Existing prepared GPU 1 plans lack this option.
+        assert runner.build_plan(args) == native
+        runner.prepare(self.argv+['--pruning', '--gpu', '0', '--percent-dense', '0.0001'])
+        data = periodic.load_plan(self.model)
+        fine = data['plan']
+        assert fine['stages'][0]['argv'] == native['stages'][0]['argv']+['--percent_dense', '0.0001']
+        assert fine['densification']['percent_dense'] == .0001
+        assert data['gpu'] == '0' and data['iterations'] == [10000, 20000, 30000]
+        assert data['frames'] == sorted(self.names)
+        with patch.object(runner, 'execute_plan') as execute:
+            periodic.train(self.model)
+            execute.assert_called_once()
+
+    def test_invalid_split_fractions_fail_before_preparing_output(self):
+        for value in ('0', '-1', 'nan', 'inf', '1.1'):
+            args = runner.parser().parse_args(self.argv+['--percent-dense', value])
+            with self.assertRaisesRegex(ValueError, 'percent-dense'):
+                runner.build_plan(args)
+        assert not self.model.exists()
 
     def test_pruning_only_changes_the_pruning_switch_and_dispatches(self):
         args = runner.parser().parse_args(self.argv)
