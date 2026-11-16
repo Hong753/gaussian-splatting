@@ -21,6 +21,12 @@ def parser():
     p.add_argument('--pruning', action='store_true', help='Enable native opacity/size pruning during densification')
     p.add_argument('--percent-dense', type=float, default=None,
                    help='Clone/split sigma boundary as a fraction of scene extent (native default: 0.01)')
+    for name in ('scaling-lr', 'densify-grad-threshold', 'prune-world-scale-ratio', 'prune-screen-size'):
+        p.add_argument('--'+name, type=float, default=None)
+    for name in ('densify-from-iter', 'densify-until-iter', 'densification-interval', 'prune-size-from-iter'):
+        p.add_argument('--'+name, type=int, default=None)
+    p.add_argument('--preserve-densification-radii', action='store_true',
+                   help='Keep measured radius history through native growth until the pruning check')
     return p
 
 
@@ -34,6 +40,22 @@ def build_plan(args):
         raise ValueError('Position LR divisor must be finite and >= 1')
     if args.scale_control != 'off' or args.distance_weighting or args.local_scale_cache:
         raise ValueError('This ablation requires unconstrained scales and no distance/local-scale policies')
+    for name in ('scaling_lr', 'densify_grad_threshold', 'prune_world_scale_ratio', 'prune_screen_size'):
+        value = getattr(args, name, None)
+        if value is not None and (not math.isfinite(value) or value < 0 or
+                (name in ('scaling_lr', 'densify_grad_threshold') and value == 0)):
+            raise ValueError(f'Invalid {name}: {value}')
+    for name in ('densify_from_iter', 'densify_until_iter', 'densification_interval', 'prune_size_from_iter'):
+        value = getattr(args, name, None)
+        if value is not None and (value < 0 or
+                (name in ('densify_until_iter', 'densification_interval') and value == 0)):
+            raise ValueError(f'Invalid {name}: {value}')
+    start = getattr(args, 'densify_from_iter', None)
+    end = getattr(args, 'densify_until_iter', None)
+    if (500 if start is None else start) >= (15000 if end is None else end):
+        raise ValueError('Densification start must precede its end')
+    if end is not None and end > args.iterations:
+        raise ValueError('Explicit densification end must not exceed training iterations')
     plan = fixed.build_plan(args)  # Shared input/manifest validation, checkpoint and preview settings.
     command = plan['stages'][0]['argv']
     command.remove('--fixed_lidar')
@@ -61,6 +83,20 @@ def build_plan(args):
     if percent_dense is not None:
         command += ['--percent_dense', str(percent_dense)]
         plan['densification']['percent_dense'] = percent_dense
+    for field, key in (('densify_from_iter', 'start'), ('densify_until_iter', 'until'),
+                       ('densification_interval', 'interval'), ('densify_grad_threshold', 'gradient_threshold')):
+        value = getattr(args, field, None)
+        if value is not None:
+            command[command.index('--'+field)+1] = str(value)
+            plan['densification'][key] = value
+    for field in ('scaling_lr', 'prune_world_scale_ratio', 'prune_screen_size', 'prune_size_from_iter'):
+        value = getattr(args, field, None)
+        if value is not None:
+            command += ['--'+field, str(value)]
+            plan[field] = value
+    if getattr(args, 'preserve_densification_radii', False):
+        command.append('--preserve_densification_radii')
+        plan['preserve_densification_radii'] = True
     return plan
 
 
@@ -75,9 +111,14 @@ def prepare(argv):
 
 def execute_plan(args, plan):
     # Direct in-process CUDA check, then the shared native trainer invocation.
-    invoke(['scripts/smoke_native_lidar.py', '--gpu', args.gpu,
+    smoke = ['scripts/smoke_native_lidar.py', '--gpu', args.gpu,
             '--percent-dense', str(plan['densification'].get('percent_dense', .01)),
-            '--output', str(Path(plan['model'])/'native_lidar_cuda_smoke.json')])
+            '--position-lr-divisor', str(args.position_lr_divisor),
+            '--scaling-lr', str(plan.get('scaling_lr', .005)), '--iterations', str(args.iterations),
+            '--output', str(Path(plan['model'])/'native_lidar_cuda_smoke.json')]
+    if plan.get('preserve_densification_radii'):
+        smoke.append('--preserve-densification-radii')
+    invoke(smoke)
     return fixed.execute_plan(args, plan, smoke=False)
 
 

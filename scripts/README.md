@@ -2558,3 +2558,74 @@ python scripts/serve_training_previews.py \
 Open `http://211.172.247.108:8088/`. For other explicit thresholds, the base
 launcher accepts `NATIVE_LIDAR_PERCENT_DENSE`; also set `NATIVE_LIDAR_MODEL` to
 a fresh directory. Existing prepared plans keep their original thresholds.
+
+### GPU 0: joint large-scene preset, 100k steps
+
+This is a proposed combined configuration, not a completed hyperparameter search.
+It starts from the original LiDAR initialization and keeps native 3DGS + AA,
+unconstrained exponential scales, trainable XYZ, native cloning/splitting,
+and opacity pruning. There is no scale penalty/clamp, culling, pose refinement,
+distance weighting or opacity reset. Color/opacity/rotation LRs stay native.
+
+| Setting | This preset |
+| --- | --- |
+| Iterations / position LR decay duration | 100,000 |
+| XYZ LR endpoints before scene-extent multiplication | `1.6e-6` to `1.6e-8` (native x0.01) |
+| Scale LR | `0.001` (native x0.2) |
+| Clone/split boundary | `0.0001 * scene_extent` (native x0.01) |
+| Densification gradient threshold | `0.0001` (native x0.5) |
+| Densification window / interval | after 2,000, before 40,000 / every 250 steps |
+| Opacity pruning | `< 0.005` at each densification event |
+| World-size pruning | sigma `> 0.01 * scene_extent`, after step 5,000 (native ratio x0.1) |
+| Screen-size-only deletion | explicitly disabled; nearby valid surfaces may cover many pixels |
+| Image resolution | `1`: original dimensions, no automatic 1600px reduction |
+| Previews / checkpoints and all-frame PSNR | every 500 / every 10,000 steps |
+
+Position updates start immediately, with no fixed warmup. First densification
+is at 2250 and last at 39750; world-size pruning begins at 5250. Each split
+replaces its parent with children. World-size pruning is deletion at those
+events, not a continuously enforced scale bound. The initial KNN scale floor
+is unchanged; all original LiDAR points are used for initialization.
+
+The new preset enables corrected radius history: existing points and identical
+clones retain their measured maxima until pruning, split children are measured
+on subsequent renders, and the window resets after pruning. Existing saved
+presets retain their prior bookkeeping for reproducibility. The CUDA startup
+check verifies radius preservation and independent world/screen pruning.
+`densification.jsonl` reports the actual split and world-prune thresholds in
+scene units along with clone/split/prune counts.
+
+To replace the preceding GPU 0 fine-split experiment, preserving its saved outputs:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+python scripts/stop_reconstruction_run.py --gpu 0 --stop \
+  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_unconstrained_lr50_split1e-4_noresets_prune_30000_v1 &&
+bash scripts/run_native_lidar_large_scene.sh 0
+```
+
+For an already idle GPU, run only `bash scripts/run_native_lidar_large_scene.sh 0`
+after activating conda and pulling. The launcher refuses occupied GPUs and
+existing trained output. The output defaults to
+`/data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_large_scene_100k_v1`;
+override `NATIVE_LIDAR_MODEL` to choose another fresh directory. It publishes
+ten checkpoints, evaluated sequentially by a separate GPU 0 worker over all
+5,009 frames, with train/held-out image comparisons at each checkpoint.
+
+After the first preview is saved, start its CPU-only viewer in another terminal:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+python scripts/serve_training_previews.py \
+  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_large_scene_100k_v1 \
+  --port 8089
+```
+
+Open `http://211.172.247.108:8089/`. The same two train and two held-out frame
+names are used with the default seed; full-resolution GT/render/error previews
+appear at step 1, every 500 steps, and final.

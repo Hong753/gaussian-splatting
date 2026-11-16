@@ -465,11 +465,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.add_densification_stats(viewspace_point_tensor, growth_filter)
 
                 if phase_iteration > opt.densify_from_iter and phase_iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if phase_iteration > opt.opacity_reset_interval else None
+                    from utils.densification_policy import size_pruning_thresholds
+                    size_threshold, world_threshold = size_pruning_thresholds(opt, phase_iteration, scene.cameras_extent)
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent,
                                                 size_threshold, radii,
                                                 max_grad_abs=opt.absgs_split_threshold if opt.absgs else None,
-                                                record_stats=True, prune=not getattr(opt, 'disable_pruning', False))
+                                                record_stats=True, prune=not getattr(opt, 'disable_pruning', False),
+                                                max_world_size=world_threshold,
+                                                preserve_radii=getattr(opt, 'preserve_densification_radii', False))
                     if opt.surface_mode != 'view_tangent':
                         import json
                         growth_stats = dict(iteration=iteration, image=viewpoint_cam.image_name,

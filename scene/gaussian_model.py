@@ -603,7 +603,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_surface_refs=None):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_surface_refs=None, new_max_radii=None):
         if self.fixed_lidar_state is not None:
             raise RuntimeError('Cloning/splitting is disabled for fixed LiDAR')
         if self.discrete_lidar_state is not None and not getattr(self, '_discrete_population_edit', False):
@@ -630,9 +630,12 @@ class GaussianModel:
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 2 if self.use_absgs else 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        if new_max_radii is None:
+            self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        else:
+            self.max_radii2D = torch.cat((self.max_radii2D, new_max_radii))
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, preserve_radii=False):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -675,12 +678,15 @@ class GaussianModel:
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii, new_surface_refs)
+        # Split children have new positions/covariances: measure their projected
+        # footprint on future renders instead of inheriting the parent's maximum.
+        new_max = torch.zeros_like(new_tmp_radii) if preserve_radii else None
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii, new_surface_refs, new_max)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+    def densify_and_clone(self, grads, grad_threshold, scene_extent, preserve_radii=False):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
@@ -698,10 +704,12 @@ class GaussianModel:
         # The upstream clone is colocated, so its displacement is already tangent.
         new_surface_refs = ({k: v[selected_pts_mask] for k, v in self.surface_refs.items()}
                             if self.surface_refs is not None else None)
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_surface_refs)
+        # Colocated identical clones have the same measured footprint.
+        new_max = self.max_radii2D[selected_pts_mask] if preserve_radii else None
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_surface_refs, new_max)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, max_grad_abs=None,
-                         record_stats=False, prune=True):
+                         record_stats=False, prune=True, max_world_size=None, preserve_radii=False):
         if self.surface_mode == 'view_tangent':
             if not prune:
                 raise ValueError('Disabling pruning is currently supported only for native densification')
@@ -722,9 +730,9 @@ class GaussianModel:
                                         extent, self.percent_dense, max_grad, split_threshold)
             stats['points_before'] = len(self._xyz)
         self.tmp_radii = radii
-        self.densify_and_clone(clone_grads, max_grad, extent)
+        self.densify_and_clone(clone_grads, max_grad, extent, preserve_radii=preserve_radii)
         if record_stats: after_clone = len(self._xyz)
-        self.densify_and_split(split_grads, split_threshold, extent)
+        self.densify_and_split(split_grads, split_threshold, extent, preserve_radii=preserve_radii)
         if record_stats: after_split = len(self._xyz)
 
         # Split parents are replaced by their children above. This switch only
@@ -733,8 +741,16 @@ class GaussianModel:
             prune_mask = (self.get_opacity < min_opacity).squeeze(-1)
             if max_screen_size:
                 big_points_vs = self.max_radii2D > max_screen_size
-                big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-                prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+                prune_mask = torch.logical_or(prune_mask, big_points_vs)
+            # None preserves legacy callers' coupled world/screen activation.
+            # An explicit zero disables world-size pruning independently.
+            world_limit = max_world_size if max_world_size is not None else (0.1 * extent if max_screen_size else 0.)
+            if record_stats and preserve_radii:
+                stats.update(prune_opacity_threshold=float(min_opacity),
+                             prune_screen_radius=float(max_screen_size or 0.),
+                             prune_world_sigma=float(world_limit), radius_history_preserved=True)
+            if world_limit > 0:
+                prune_mask = torch.logical_or(prune_mask, self.get_scaling.max(dim=1).values > world_limit)
             self.prune_points(prune_mask)
         if record_stats:
             self.last_densification_stats = dict(stats, cloned_parents=after_clone-stats['points_before'],
@@ -742,6 +758,9 @@ class GaussianModel:
                 pruned=after_split-len(self._xyz), points_after=len(self._xyz))
         tmp_radii = self.tmp_radii
         self.tmp_radii = None
+        if preserve_radii:
+            # Start the next observation window only after the pruning check.
+            self.max_radii2D.zero_()
 
         torch.cuda.empty_cache()
 

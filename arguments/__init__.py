@@ -152,6 +152,10 @@ class OptimizationParams(ParamGroup):
         self.opacity_reset_interval = 3000
         self.disable_opacity_resets = False
         self.disable_pruning = False
+        self.prune_world_scale_ratio = 0.1
+        self.prune_screen_size = 20.0
+        self.prune_size_from_iter = -1  # Legacy default: opacity_reset_interval.
+        self.preserve_densification_radii = False
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002

@@ -16,9 +16,16 @@ def main(argv=None):
     p.add_argument('--gpu', default='1')
     p.add_argument('--output', type=Path)
     p.add_argument('--percent-dense', type=float, default=.01)
+    p.add_argument('--position-lr-divisor', type=float, default=50.)
+    p.add_argument('--scaling-lr', type=float, default=.005)
+    p.add_argument('--iterations', type=int, default=30000)
+    p.add_argument('--preserve-densification-radii', action='store_true')
     args = p.parse_args(argv)
     if not math.isfinite(args.percent_dense) or not 0 < args.percent_dense <= 1:
         p.error('percent-dense must be finite and in (0, 1]')
+    if (not math.isfinite(args.position_lr_divisor) or args.position_lr_divisor < 1 or
+            not math.isfinite(args.scaling_lr) or args.scaling_lr <= 0 or args.iterations < 1):
+        p.error('Invalid learning rate or duration')
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     import numpy as np
     import torch
@@ -32,7 +39,10 @@ def main(argv=None):
     opt_parser = argparse.ArgumentParser()
     params = OptimizationParams(opt_parser)
     opt = params.extract(opt_parser.parse_args(['--scale_control', 'off',
-        '--position_lr_init', '3.2e-6', '--position_lr_final', '3.2e-8',
+        '--position_lr_init', str(.00016/args.position_lr_divisor),
+        '--position_lr_final', str(.0000016/args.position_lr_divisor),
+        '--scaling_lr', str(args.scaling_lr), '--iterations', str(args.iterations),
+        '--position_lr_max_steps', str(args.iterations),
         '--disable_opacity_resets', '--disable_pruning', '--percent_dense', str(args.percent_dense)]))
     cloud = BasicPointCloud(points=np.array([[-.15,-.1,2],[.15,-.1,2],[-.15,.1,2],[.15,.1,2]], np.float32),
         colors=np.array([[.7,.2,.1],[.2,.6,.2],[.2,.3,.8],[.8,.7,.2]], np.float32),
@@ -69,7 +79,7 @@ def main(argv=None):
         model.xyz_gradient_accum[:] = 1
         model.denom[:] = 1
         model.densify_and_prune(.0002, .005, 1., 20, torch.ones(4, device='cuda'),
-                               record_stats=True, prune=False)
+                               record_stats=True, prune=False, preserve_radii=args.preserve_densification_radii)
     assert len(model.get_xyz) == 8
     assert model.last_densification_stats['cloned_parents'] == 2
     assert model.last_densification_stats['split_parents'] == 2
@@ -87,7 +97,8 @@ def main(argv=None):
         model.xyz_gradient_accum.zero_()
         model.denom[:] = 1
         model.densify_and_prune(.0002, .005, 100., None,
-            torch.ones(len(model.get_xyz), device='cuda'), record_stats=True, prune=True)
+            torch.ones(len(model.get_xyz), device='cuda'), record_stats=True, prune=True,
+            preserve_radii=args.preserve_densification_radii)
     assert len(model.get_xyz) == 6 and model.last_densification_stats['pruned'] == 2
     assert (model.get_opacity >= .005).all()
     restored = GaussianModel(0)
@@ -95,10 +106,34 @@ def main(argv=None):
     restored.restore(model.capture(), opt)
     torch.testing.assert_close(restored.get_xyz, model.get_xyz, atol=0, rtol=0)
     assert restored.get_xyz.requires_grad and restored.fixed_lidar_state is None
+    if args.preserve_densification_radii:
+        with torch.no_grad():
+            # Regression: a 100px measured radius must survive bookkeeping until
+            # the 20px screen check, while supported small rows remain present.
+            model._scaling[:] = math.log(.001)
+            model._opacity[:] = 0
+            model.xyz_gradient_accum.zero_()
+            model.denom[:] = 1
+            model.max_radii2D[:] = 2
+            model.max_radii2D[0] = 100
+            model.densify_and_prune(.0002, .005, 1., 20, torch.ones(6, device='cuda'),
+                record_stats=True, max_world_size=0., preserve_radii=True)
+            assert len(model.get_xyz) == 5 and model.last_densification_stats['pruned'] == 1
+            assert not model.max_radii2D.any()
+            # Disable screen deletion independently; a world-size outlier is
+            # still pruned, while other large screen footprints are kept.
+            model._scaling[0] = math.log(.02)
+            model.denom[:] = 1
+            model.max_radii2D[:] = 100
+            model.densify_and_prune(.0002, .005, 1., 0., torch.ones(5, device='cuda'),
+                record_stats=True, max_world_size=.01, preserve_radii=True)
+            assert len(model.get_xyz) == 4 and model.last_densification_stats['pruned'] == 1
     result = dict(passed=True, cuda_device=torch.cuda.get_device_name(), torch=torch.__version__,
         native_aa_rgb_xyz_gradients=True, reduced_lr_updates_xyz=True, no_scale_projection=True,
         clone_and_split=True, pruning_disabled_path_checked=True, native_opacity_pruning=True,
         children_optimized=True, percent_dense=opt.percent_dense,
+        position_lr_divisor=args.position_lr_divisor, scaling_lr=opt.scaling_lr,
+        radius_history_regression_checked=args.preserve_densification_radii,
         checkpoint_round_trip=True)
     if args.output:
         from utils.checkpoint_snapshots import atomic_json
