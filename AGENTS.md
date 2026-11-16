@@ -1,5 +1,10 @@
 # Reconstruction experiments
 
+Place new fine-tuning experiment outputs under the scene's `3dgs_finetuning/`
+directory, with a separate model directory for each experiment. Keep baseline
+lookup at the original scene root. Fresh-run commands must not require a saved
+plan from a previous run; stop an older run only when it is known to exist.
+
 Keep live GT/render/error debugging enabled for every native 3DGS run: step 1,
 every 500 steps, and the final step, with fixed random train and held-out frames.
 For train-only mesh culling, also produce matching culling-ON training previews.

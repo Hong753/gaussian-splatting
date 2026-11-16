@@ -2595,23 +2595,23 @@ check verifies radius preservation and independent world/screen pruning.
 `densification.jsonl` reports the actual split and world-prune thresholds in
 scene units along with clone/split/prune counts.
 
-To replace the preceding GPU 0 fine-split experiment, preserving its saved outputs:
+To start a fresh GPU 0 experiment (no previous run or saved plan is required):
 
 ```bash
 source /opt/anaconda3/etc/profile.d/conda.sh &&
 conda activate 3dgs &&
 cd /home/sequor_vfm/gaussian-splatting &&
 git pull --ff-only &&
-python scripts/stop_reconstruction_run.py --gpu 0 --stop \
-  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_unconstrained_lr50_split1e-4_noresets_prune_30000_v1 &&
 bash scripts/run_native_lidar_large_scene.sh 0
 ```
 
-For an already idle GPU, run only `bash scripts/run_native_lidar_large_scene.sh 0`
-after activating conda and pulling. The launcher refuses occupied GPUs and
-existing trained output. The output defaults to
-`/data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_large_scene_100k_v1`;
-override `NATIVE_LIDAR_MODEL` to choose another fresh directory. It publishes
+The launcher refuses occupied GPUs and existing trained output. New experiments
+live under the scene's `3dgs_finetuning/` directory. The output defaults to
+`/data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/3dgs_stride3_aa_lidar_large_scene_100k_v1`;
+override `NATIVE_LIDAR_FINETUNING_ROOT` to change the experiment root, or
+`NATIVE_LIDAR_MODEL` to choose another fresh model directory. Baseline discovery
+still uses the original scene root, so the existing keyframes and initialization
+cloud remain available. It publishes
 ten checkpoints, evaluated sequentially by a separate GPU 0 worker over all
 5,009 frames, with train/held-out image comparisons at each checkpoint.
 
@@ -2622,7 +2622,7 @@ source /opt/anaconda3/etc/profile.d/conda.sh &&
 conda activate 3dgs &&
 cd /home/sequor_vfm/gaussian-splatting &&
 python scripts/serve_training_previews.py \
-  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_stride3_aa_lidar_large_scene_100k_v1 \
+  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/3dgs_stride3_aa_lidar_large_scene_100k_v1 \
   --port 8089
 ```
 

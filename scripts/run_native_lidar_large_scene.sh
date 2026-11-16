@@ -10,12 +10,13 @@ if [[ -n "$(nvidia-smi -i "$large_gpu" --query-compute-apps=pid --format=csv,noh
   echo "GPU $large_gpu is occupied; stop the exact previous run before starting this one." >&2; exit 1
 fi
 large_root="${NATIVE_LIDAR_OUTPUT_ROOT:-/data/3dgs_outputs/orange_4F/1_full}"
+large_experiments="${NATIVE_LIDAR_FINETUNING_ROOT:-$large_root/3dgs_finetuning}"
 large_source="${NATIVE_LIDAR_SOURCE:-/data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full}"
 large_baseline="${NATIVE_LIDAR_BASELINE:-}"
 if [[ -z "$large_baseline" ]]; then
   large_baseline="$(python -c 'from scripts.render import resolve_models; import sys; print(resolve_models(None, sys.argv[1], ["sharp_keyframes_stride3_aa"])[0])' "$large_root")"
 fi
-large_model="${NATIVE_LIDAR_MODEL:-$large_root/3dgs_stride3_aa_lidar_large_scene_100k_v1}"
+large_model="${NATIVE_LIDAR_MODEL:-$large_experiments/3dgs_stride3_aa_lidar_large_scene_100k_v1}"
 python -u scripts/run_native_lidar.py prepare \
   --source "$large_source" --baseline "$large_baseline" \
   --point-cloud "${NATIVE_LIDAR_POINTS:-$large_baseline/input.ply}" \
