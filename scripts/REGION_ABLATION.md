@@ -133,6 +133,24 @@ or ground-truth visibility. Inspect RGB overlays, particularly near depth edges
 and sparse returns. `--sample-points 2000000` can increase sampling density.
 Training itself uses no such depth buffer or ray clipping.
 
+Projection uses a direct three-coordinate NumPy contraction rather than a
+multithreaded BLAS matrix multiply. Packed per-view masks are saved immediately
+under `OUTPUT.projection_cache/`, outside the final export directory. The cache
+is keyed by the original cloud/pose file stamps, sampling, and box geometry;
+changing these does not reuse stale masks. A matching restart reuses completed
+masks. Selection, export validation and overlay generation share these masks;
+an unchanged selection is also reused within the running process. Masks are
+loaded one view at a time, not all into RAM or VRAM. No extra package is needed.
+
+The terminal prints the exact destination and cache paths before loading the
+cloud, then camera counts, projected/cached counts and elapsed time during the
+search. Export reports its temporary directory, image count, LiDAR crop and
+completion. The viewer receives export progress too. The final region directory
+still appears only on successful completion; its parent and cache appear early.
+If an older selector is running, pulling changes does not update that process;
+restart it to use this implementation. The old process's elapsed lifetime is
+not necessarily time spent exporting (it also serves the interactive viewer).
+
 Exports:
 
 - `images/`: symlinks to original RGB, without resampling.

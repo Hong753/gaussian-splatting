@@ -29,6 +29,7 @@ def parser():
     p.add_argument('--frame-end', default='')
     p.add_argument('--exclude', nargs='*', default=[])
     p.add_argument('--sample-points', type=int, default=1000000)
+    p.add_argument('--cache-dir',type=Path,help='Packed projection masks; defaults to OUTPUT.projection_cache')
     p.add_argument('--port', type=int, default=8091)
     p.add_argument('--review-file', type=Path, help='Autosaved review; defaults to OUTPUT.review.json')
     p.add_argument('--export', action='store_true', help='Headless export of kept review images, or all candidates with --automatic')
@@ -73,7 +74,15 @@ def main(argv=None):
         raise ValueError('Supply --baseline or both --point-cloud and --keyframes')
     if args.output.exists() and not args.reuse:
         raise FileExistsError(f'Use a new region directory: {args.output}')
-    data = RegionData(args.source, args.point_cloud, args.keyframes, args.sample_points)
+    output=args.output.expanduser().resolve()
+    cache=(args.cache_dir or output.with_name(output.name+'.projection_cache')).expanduser().resolve()
+    if cache==output or output in cache.parents:
+        raise ValueError('Keep projection cache outside the final export directory')
+    cache.mkdir(parents=True,exist_ok=True)
+    print(f'Region destination: {output}\nProjection cache: {cache}\nLoading cameras and LiDAR sample...',flush=True)
+    data = RegionData(args.source, args.point_cloud, args.keyframes, args.sample_points,cache_dir=cache)
+    print(f'Loaded {len(data.images)} cameras; {data.sample_count:,} projection points '
+          f'from {len(data.vertices):,} original LiDAR points.',flush=True)
     settings = dict(halo=args.halo,min_overlap=args.min_overlap,max_camera_distance=args.max_camera_distance,
                     frame_start=args.frame_start,frame_end=args.frame_end,exclude=args.exclude)
     if args.automatic:

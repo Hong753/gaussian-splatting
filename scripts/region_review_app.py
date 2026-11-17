@@ -208,7 +208,8 @@ def create_app(server, data, output, review_file, identity, initial, session=Non
                 if s.counts()['train']<2: raise ValueError('Keep at least two training views')
                 status.content='Exporting only kept images and their original poses, plus regional LiDAR…'
                 s.save(review_file)
-                data.export(output,rows=s.rows,review=s.decisions,**s.config)
+                data.export(output,rows=s.rows,review=s.decisions,
+                            progress=lambda message: setattr(status,'content',message),**s.config)
                 state['completed']=True
                 status.content=f'**Export complete:** `{output}`. Only kept images were exported. Review decisions are in `review.json`; original source files are unchanged.'
             except Exception as exc: status.content=f'Export failed: {exc}'
