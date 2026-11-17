@@ -31,10 +31,26 @@ python -u scripts/select_region.py \
 Open `http://211.172.247.108:8091`. Adjust **Box center / Box XYZ size** to
 include the textured wall and floor. Yellow points are inside the core; blue
 points form the surrounding LiDAR halo. Gray points show the rest of the scene.
-Use **Find overlapping views**, then **Selected image review**. Bright image
-pixels are supervised; dim ones are excluded. Exclude unwanted images by name
-(e.g. displays with changing contents). **Export region** writes the dataset.
-Changing the box/filter invalidates the selection until it is recalculated.
+Use **Find candidate views**, then review the **actual unmasked RGB**:
+
+- **Keep and next** includes the image; **Reject and next** excludes it, for
+  occlusion or any other reason. **Previous image / Next image** only navigate.
+- **Review filter** shows all, unreviewed, kept or rejected images. Select a
+  rejected image and use **Keep and next** to restore it. **Mark unreviewed**
+  clears a decision.
+- **Export kept images** exports only explicitly kept cameras and RGB images.
+  Rejected and unreviewed frames are excluded from **both** train and evaluation;
+  kept frames retain their original training/held-out assignment. At least two
+  kept training views are needed. Counts update after every decision.
+- The optional **Show approximate ROI mask** overlay is separate from the actual
+  RGB. Keeping an image does not certify that every point-derived mask pixel has
+  correct visibility. Review the mask too before using it for supervision.
+
+Decisions and box/search settings autosave to `OUTPUT.review.json` outside the
+fresh export directory. Restart with the same command/output to resume. The
+export also contains `review.json` with candidate names and all decisions.
+Changing the box or search bounds invalidates the review; finding candidates
+again starts a new one. Repeating an unchanged search preserves decisions.
 The source files are never overwritten. The output must be a fresh directory.
 
 By default a view needs at least 2% region overlap and its camera must be within
@@ -59,11 +75,12 @@ Exports:
   are omitted because initialization uses the LiDAR PLY.
 - `input.ply`: **every original point** inside box + halo, in original order and
   coordinates; `original_lidar_indices.npy` maps to the input cloud rows.
-- `keyframes.json`: geometric view selection intersected with the original
-  training manifest. Other overlapping frames remain held-out.
+- `keyframes.json`: manually kept candidates intersected with the original
+  training manifest. Other **kept** frames remain held-out.
 - `masks/`, `overlays/`, `index.html`: loss/metric masks and review gallery.
 - `selection.json`, `poses.json`: provenance, camera audit, counts, per-view
   mask fractions and exact box/filter settings.
+- `review.json`: kept/rejected/unreviewed decisions for every automatic candidate.
 
 RGB aspect mismatches fail export. Same-aspect pre-resized images are accepted
 and their dimensions recorded. Principal-point offsets from the image center
@@ -71,7 +88,10 @@ are reported: native 3DGS's centered-FOV projection does not incorporate these
 offsets. Large offsets need a separate camera-model correction experiment.
 
 For reproducibility or a second temporal-window ablation, use explicit box
-coordinates with `--center X Y Z --size SX SY SZ --export`. Optional
+coordinates with `--center X Y Z --size SX SY SZ` and a fresh output, then review
+the resulting candidates. `--export` now requires a saved manual review and
+exports its kept images using the saved box/search settings without starting
+Viser. Use `--review-file PATH` to explicitly select a saved review. Optional
 `--frame-start NAME --frame-end NAME` restricts the lexical image-name range
 (appropriate for this scene's zero-padded names). Keep the same box and halo
 when comparing all local visits with one contiguous visit.

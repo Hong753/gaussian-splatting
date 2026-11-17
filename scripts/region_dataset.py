@@ -138,7 +138,14 @@ class RegionData:
         overlay = (rgb*(.2+.8*mask[...,None])).astype(np.uint8)
         return mask, overlay, info
 
-    def export(self, output, center, size, rows, **settings):
+    def rgb(self, name, max_side=1200):
+        """Unmasked RGB for human review; the projection mask cannot hide content."""
+        with PILImage.open(image_path(self.source, self.folder, name)) as raw:
+            raw = raw.convert('RGB')
+            raw.thumbnail((max_side,max_side), PILImage.Resampling.LANCZOS)
+            return np.asarray(raw).copy()
+
+    def export(self, output, center, size, rows, review=None, **settings):
         output = Path(output).expanduser().resolve()
         validate_box(center, size, settings.get('halo', 1.))
         if output.exists():
@@ -147,6 +154,10 @@ class RegionData:
         verified = self.find(center, size, **settings)
         if rows != verified:
             raise ValueError('Selection changed; rerun Find overlapping views before export')
+        candidates = rows
+        if review is not None:
+            from scripts.region_review import reviewed_rows
+            rows = reviewed_rows(candidates, review)
         names = {r['name'] for r in rows}
         selected = [r['name'] for r in rows if r['split'] == 'train']
         if len(selected) < 2:
@@ -219,6 +230,13 @@ class RegionData:
                         image_audit=image_audit,
                         protocol='Original world coordinates and calibration; all crop+halo LiDAR rows; original training manifest intersection; ROI-only loss and PSNR; no culling.',
                         mask_caveat='Approximate nearest measured LiDAR at 256px; inspect overlays for holes/occlusion/alignment. Not dense ground-truth visibility.')
+            if review is not None:
+                info['manual_review'] = dict(decisions=dict(review),candidates=candidates,
+                    kept=[r['name'] for r in rows],
+                    rejected=[n for n,v in review.items() if v == 'reject'],
+                    unreviewed=[n for n,v in review.items() if v == 'unreviewed'],
+                    policy='Only explicitly kept images exported. Rejected/unreviewed images excluded from both train and evaluation. Image approval does not validate every ROI mask pixel.')
+                (stage/'review.json').write_text(json.dumps(info['manual_review'],indent=2)+'\n')
             for filename, data in [('selection.json',info),('poses.json',poses),('keyframes.json',dict(selected_images=selected,source_path=str(output),image_directory='images',eval=False))]:
                 (stage/filename).write_text(json.dumps(data,indent=2)+'\n')
             cards = ''.join('<figure><img loading="lazy" src="overlays/'+mask_path('',r['name']).name+'"><figcaption>'+html.escape(r['name'])+f" · {r['split']} · ROI {r['overlap']:.1%}</figcaption></figure>" for r in rows)
