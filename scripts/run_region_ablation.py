@@ -28,6 +28,8 @@ def prepare_args(argv=None):
     p.add_argument('--position-lr-multiplier',type=float,default=.05,
                    help='Adaptive XYZ LR multiplier relative to native 3DGS, before scene-extent scaling')
     p.add_argument('--dry-run',action='store_true')
+    p.add_argument('--lidar-scp-cache',type=Path)
+    p.add_argument('--lidar-scp-policy',default='')
     args=p.parse_args(argv)
     if not math.isfinite(args.position_lr_multiplier) or not 0 < args.position_lr_multiplier <= 1:
         raise ValueError('Position LR multiplier must be finite and in (0, 1]')
@@ -70,6 +72,10 @@ def prepare_args(argv=None):
                   '--densify-grad-threshold','.0002']
         geometry=('optimized XYZ from step 1; native cloning/splitting and opacity/size pruning; '
                   'learned color/opacity/rotation/scale; no scale limits or opacity resets')
+    if args.lidar_scp_cache:
+        if args.geometry!='adaptive': raise ValueError('LiDAR SCP requires adaptive geometry')
+        command+=['--lidar-scp-cache',str(args.lidar_scp_cache.expanduser().resolve()),
+                  '--lidar-scp-policy',args.lidar_scp_policy]
     if args.dry_run: command.append('--dry-run')
     training=native.parser().parse_args(command)
     protocol=dict(region=str(region),context=args.context,model=str(model),
@@ -94,9 +100,12 @@ def prepare_args(argv=None):
 def main(argv=None):
     args, protocol=prepare_args(argv)
     plan=native.build_plan(args)
-    print(json.dumps(protocol,indent=2),flush=True)
     region=Path(protocol['region'])
     inputs=[args.keyframes,args.point_cloud,region/'selection.json',*mask_inputs(args)]
+    if args.lidar_scp_cache:
+        inputs += [args.lidar_scp_cache/name for name in ('metadata.json','field.npz')]
+        protocol['lidar_surface_prior']='GSPrior-inspired opacity and bounded sampled pull from an immutable LiDAR local plane field; no hard culling'
+    print(json.dumps(protocol,indent=2),flush=True)
     if (region/'colmap_rerun.json').is_file():
         from scripts.keyframe_pipeline.common import read_model
         _,_,_,pose_files=read_model(region)

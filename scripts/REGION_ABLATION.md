@@ -115,6 +115,99 @@ It does not start before that export exists. Camera poses stay fixed within each
 GS run; the learnable positions here are **Gaussian centers**, not camera poses.
 Set `COLMAP_VERSION`/`COLMAP_SEQUENTIAL_OVERLAP` if using another COLMAP workspace.
 
+### Fifth run: LiDAR adaptation of the self-constrained prior (GPU 4)
+
+The five comparisons are:
+
+| Run | GPU | Camera poses | Gaussian geometry | Extra LiDAR prior |
+| --- | --- | --- | --- | --- |
+| 1 | 0 | Original | Fixed centers, constant population | None |
+| 2 | 1 | SuperPoint/SuperGlue + COLMAP | Fixed centers, constant population | None |
+| 3 | 2 | Original | Learnable centers, densification and pruning | None |
+| 4 | 3 | SuperPoint/SuperGlue + COLMAP | Learnable centers, densification and pruning | None |
+| 5 | 4 | Original | Same adaptive settings as run 3 | Distance-conditioned opacity and periodic surface pull |
+
+All initialize from the same cropped LiDAR. Runs 2 and 4 use the accepted COLMAP
+export; held-out poses remain original. Run 5 is independent of that export.
+
+GSPrior ([paper](https://arxiv.org/abs/2603.19682)) builds a periodically updated
+TSDF from rendered depths, penalizes opacity according to surface distance, and
+projects Gaussian centers onto the estimated surface. **This run is a LiDAR
+adaptation, not a reproduction of the complete method.** It replaces the
+self-generated TSDF with a fixed, measured-LiDAR local plane field. It retains
+native volumetric 3D Gaussians and omits the paper's depth/NCC/normal losses and
+hard prior-based outlier deletion.
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_region_scp.sh 4 \
+  /data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/regions/wall_06663_v1
+```
+
+Output: `$REGION/runs/crop_original_adaptive_lr005_lidar_scp_v1`. Supply a third
+argument, e.g. `v2`, for a fresh model; the fixed prior cache is reused. The
+launcher refuses to overwrite a model or stop another GPU process.
+
+Preprocessing uses eight CPU workers and saves `$REGION/lidar_scp_v1/field.npz`
+and `metadata.json`. It computes the median RMS distance to three nearest
+neighbors on a deterministic sample, sets cell width `h = 2 * median`, and
+retains an actual measured point per occupied voxel. Local PCA estimates normals
+with 24 neighbors and rejects unreliable or distant support. Source and cache
+hashes prevent reuse with different LiDAR. This cache is a surface reference;
+it does not downsample or replace Gaussian initialization. Training loads its
+sparse constants into GPU memory once; neighborhood queries use CUDA PyTorch
+operations in bounded batches. Preprocessing itself uses CPU SciPy, not CUDA.
+
+For a currently supported Gaussian, signed local plane distance is
+`d = dot(x - anchor, normal)`. With band width `b`, normalized distance is
+`s = min(abs(d)/b, 1)`. The opacity target is 1 when `s <= 0.3` and 0 otherwise,
+weighted by PCA confidence and `1/(1+s)^2`. A uniform 16,384-point sample
+estimates the scene-wide opacity penalty each step; unknown/unreliable
+neighborhoods contribute zero. No gradient through the discrete correspondence
+or opacity target is used to move XYZ.
+
+The prior starts after 5k steps and ramps to opacity weight 0.01 over 2k steps.
+The physical band shrinks from `2h` to `h` by 20k, without scene-extent scaling.
+For illustration only, median spacing 0.018 in meter-valued inputs gives
+`h=0.036 m`, band 0.072 -> 0.036 m, and on-surface band 0.0216 -> 0.0108 m.
+These are distances for the prior, **not Gaussian scale caps**.
+
+After each 100-step interval, a cycling sample of up to 262,144 centers receives
+a normal-direction pull of at most 25% of its supported surface distance,
+bounded to 25% of the current band per update. It runs after Adam and population
+changes. Adam moments are cleared only for moved XYZ rows. Correspondences are
+recomputed at current positions, including newly cloned/split children.
+Centers outside reliable local support are unchanged; this is not a global
+nearest-surface attraction or a guarantee of recovering distant floaters.
+
+Training stays at 90k for this export, with position LR 0.05x native,
+unconstrained scales, native densification/pruning, AA, and opacity resets off.
+There is no ray culling during training or inference. RGB evaluation renders
+the saved Gaussians normally and needs no prior lookup. Previews are saved at
+step 1/every 500/final; snapshots and all **4,039 regional frames' ROI PSNR** run
+every 10k in the existing parallel evaluator, plus the matched checkpoint.
+
+`lidar_scp_training.jsonl` records sample support, surface distance, opacity
+gradient strength relative to RGB, pull count and maximum displacement.
+`lidar_scp_cuda_smoke.json` records the startup CUDA checks for tilted-plane
+pulls, opacity gradients, unknown geometry, Adam state and densified children.
+CPU tests do not substitute for this CUDA check or demonstrate real-scene
+quality. Inspect these diagnostics and the unchanged 500-step GT/render/error
+previews before attributing any quality change to the prior.
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh && conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+python scripts/serve_training_previews.py \
+  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/regions/wall_06663_v1/runs/crop_original_adaptive_lr005_lidar_scp_v1 \
+  --port 8095
+```
+
+Open `http://211.172.247.108:8095` after the first preview is saved.
+
 Once Gaussian training starts, open its live preview in another terminal:
 
 ```bash

@@ -4,6 +4,7 @@
 Scales are unconstrained. Opacity resets stay disabled; native pruning is optional.
 """
 import math
+import json
 from pathlib import Path
 import sys
 
@@ -29,6 +30,8 @@ def parser():
         p.add_argument('--'+name, type=int, default=None)
     p.add_argument('--preserve-densification-radii', action='store_true',
                    help='Keep measured radius history through native growth until the pruning check')
+    p.add_argument('--lidar-scp-cache',type=Path)
+    p.add_argument('--lidar-scp-policy',default='',help='JSON overrides for the LiDAR adaptation of GSPrior')
     return p
 
 
@@ -108,6 +111,19 @@ def build_plan(args):
                     population='pruning only; no cloning/splitting' if pruning else 'constant',
                     position_lr=dict(init=0., final=0., max_steps=args.iterations, warmup_steps=0))
         plan['densification']['enabled'] = False
+    if getattr(args,'lidar_scp_cache',None):
+        from utils.lidar_scp import policy
+        from utils.checkpoint_snapshots import digest
+        if getattr(args,'freeze_lidar_positions',False):
+            raise ValueError('LiDAR SCP pull requires learnable Gaussian centers')
+        cache=Path(args.lidar_scp_cache).resolve()
+        meta=json.loads((cache/'metadata.json').read_text())
+        if meta['source_sha256']!=digest(args.point_cloud) or meta['field_sha256']!=digest(cache/'field.npz'):
+            raise ValueError('LiDAR prior cache does not match this initialization')
+        cfg=policy(getattr(args,'lidar_scp_policy',''))
+        if cfg['start']>=args.iterations: raise ValueError('LiDAR SCP must start before training ends')
+        command+=['--lidar_scp_cache',str(cache),'--lidar_scp_policy',json.dumps(cfg,sort_keys=True)]
+        plan['lidar_scp']=dict(cache=str(cache),policy=cfg,metadata=meta)
     return plan
 
 
@@ -117,7 +133,9 @@ def prepare(argv):
         args.keyframes = args.keyframes or args.baseline/'keyframes.json'
         args.point_cloud = args.point_cloud or args.baseline/'input.ply'
     plan = build_plan(args)
-    return periodic.prepare_experiment(args, plan, 'native_lidar', [args.keyframes, args.point_cloud, *fixed.mask_inputs(args)])
+    inputs=[args.keyframes,args.point_cloud,*fixed.mask_inputs(args)]
+    if args.lidar_scp_cache: inputs += [args.lidar_scp_cache/name for name in ('metadata.json','field.npz')]
+    return periodic.prepare_experiment(args, plan, 'native_lidar', inputs)
 
 
 def execute_plan(args, plan):
@@ -134,6 +152,9 @@ def execute_plan(args, plan):
     if getattr(args,'loss_mask_dir',None):
         smoke.append('--region-loss')
     invoke(smoke)
+    if plan.get('lidar_scp'):
+        invoke(['scripts/smoke_lidar_scp.py','--gpu',args.gpu,
+                '--output',str(Path(plan['model'])/'lidar_scp_cuda_smoke.json')])
     return fixed.execute_plan(args, plan, smoke=False)
 
 

@@ -171,6 +171,8 @@ class OptimizationParams(ParamGroup):
         self.surface_normal_weight = 0.01
         self.surface_thickness_weight = 0.01
         self.surface_loss_samples = 100000
+        self.lidar_scp_cache = ""
+        self.lidar_scp_policy = ""
         self.view_tangent_radius_pixels = 3
         self.view_tangent_max_radius = 0.1
         self.view_tangent_depth_abs = 0.03

@@ -65,6 +65,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     from scripts.occlusion_options import configure_pipeline, prepare_training_geometry, inference_pipeline
     depth_directory = getattr(dataset, "train_depth_occlusion_dir", "")
     soft_surface = bool(opt.soft_surface_geometry)
+    if opt.lidar_scp_cache:
+        from utils.lidar_scp import policy as scp_policy
+        if (soft_surface or dataset.occlusion_mode!='off' or depth_directory or opt.surface_mode!='off' or
+            opt.fixed_lidar or opt.discrete_lidar or opt.freeze_lidar_positions or opt.optimizer_type!='default'):
+            raise ValueError('LiDAR SCP uses native learnable geometry without hard culling or other surface policies')
+        dataset.lidar_scp_cache=opt.lidar_scp_cache
+        dataset.lidar_scp_policy=scp_policy(opt.lidar_scp_policy)
     if soft_surface:
         from utils.soft_surface import options as soft_surface_options
         if (dataset.occlusion_mode != 'off' or depth_directory or opt.surface_mode != 'off' or
@@ -149,6 +156,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.initialize_surface(opt.surface_patches, opt.surface_mode, opt.surface_confidence, opt.surface_thickness)
     gaussians.training_setup(opt)
     soft_regularizer = None
+    lidar_scp=None
+    if opt.lidar_scp_cache:
+        from utils.lidar_scp import LiDARSCP
+        lidar_scp=LiDARSCP(opt.lidar_scp_cache,opt.lidar_scp_policy,
+                          device=gaussians.get_xyz.device,point_cloud=os.path.join(dataset.model_path,'input.ply'))
+        print('LiDAR SCP: distance-conditioned opacity and sampled normal projection on CUDA; '
+              'fixed measured prior, no ray culling, no extra scale cap or hard prior pruning.')
     if soft_surface:
         from utils.soft_surface import SoftSurfaceRegularizer
         soft_regularizer = SoftSurfaceRegularizer(opt, dataset, scene.getTrainCameras())
@@ -408,6 +422,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Do not accumulate Adam moments while the positions are frozen.
             gaussians._xyz.grad = None
 
+        scp_stats=None
+        if lidar_scp is not None:
+            scp_loss,scp_stats=lidar_scp.loss(gaussians,iteration)
+            if scp_loss.requires_grad: scp_loss.backward()
+            scp_stats.update(lidar_scp.gradient_stats(gaussians))
+            loss=loss.detach()+scp_loss.detach()
+            del scp_loss
+
         iter_end.record()
 
         with torch.no_grad():
@@ -558,6 +580,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
                 project_scales(gaussians)
+
+            if lidar_scp is not None:
+                # Query current coordinates after Adam and densification: new
+                # children never inherit stale surface associations.
+                pull_stats=lidar_scp.pull(gaussians,iteration)
+                if pull_stats is not None: scp_stats.update(pull_stats)
+                if iteration==1 or iteration%100==0:
+                    import json
+                    stats={k:float(v) if torch.is_tensor(v) else v for k,v in scp_stats.items()}
+                    stats.update(iteration=iteration,gaussians=len(gaussians.get_xyz))
+                    with open(os.path.join(scene.model_path,'lidar_scp_training.jsonl'),'a') as stream:
+                        stream.write(json.dumps(stats,allow_nan=False)+'\n')
 
             if distance_stats is not None:
                 import json

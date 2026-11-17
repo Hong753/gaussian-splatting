@@ -105,7 +105,7 @@ def train(model):
                 if digest(path) != expected:
                     raise ValueError(f'Input changed after preparation: {path}')
             args = SimpleNamespace(**data['training_args'])
-            for name in ('source', 'model', 'keyframes', 'baseline', 'video_output', 'scene_geometry', 'point_cloud', 'cache', 'local_scale_cache', 'lidar_activation_cache', 'loss_mask_dir'):
+            for name in ('source', 'model', 'keyframes', 'baseline', 'video_output', 'scene_geometry', 'point_cloud', 'cache', 'local_scale_cache', 'lidar_activation_cache', 'loss_mask_dir', 'lidar_scp_cache'):
                 if getattr(args, name, None) is not None:
                     setattr(args, name, Path(getattr(args, name)))
             launcher = run_occlusion
