@@ -1,7 +1,10 @@
 # Reconstruction experiments
 
-Place new fine-tuning experiment outputs under the scene's `3dgs_finetuning/`
-directory, with a separate model directory for each experiment. Keep baseline
+Place new fine-tuning experiment outputs under
+`/data/3dgs_outputs/<scene>/3dgs_finetuning/`, with a separate model directory
+for each experiment. Dataset directories are inputs, not output roots; they may
+be read-only or symlink to read-only storage. For orange4f, use
+`/data/3dgs_outputs/orange4f/3dgs_finetuning/`. Keep baseline
 lookup at the original scene root. Fresh-run commands must not require a saved
 plan from a previous run; stop an older run only when it is known to exist.
 

@@ -3,6 +3,7 @@
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 import shutil
 import struct
@@ -17,6 +18,7 @@ from utils.colmap_paths import colmap_model_dir
 from utils.checkpoint_snapshots import atomic_json, digest
 
 RUNS = ('3dgs', '3dgs_fixed_lidar', 'gsprior', 'gsprior_fixed_lidar')
+DEFAULT_OUTPUT_ROOT = '/data/3dgs_outputs/orange4f/3dgs_finetuning'
 
 
 def point_records(path):
@@ -100,13 +102,16 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--source', type=Path, default=Path('/workspace/colmap_scenes/orange4f'))
     p.add_argument('--output', type=Path)
+    p.add_argument('--output-root', type=Path,
+                   default=Path(os.environ.get('ORANGE4F_OUTPUT_ROOT', DEFAULT_OUTPUT_ROOT)),
+                   help='Experiment parent directory, independent of the read-only dataset')
     p.add_argument('--point-cloud', type=Path)
     p.add_argument('--version', default='v1')
     p.add_argument('--prior-voxel-size', type=float, default=.02)
     p.add_argument('--prior-max-voxels', type=int, default=64000000)
     args = p.parse_args(argv)
     source = args.source.expanduser().resolve()
-    output = (args.output or source/'3dgs_finetuning'/f'stride3_noaa_{args.version}').resolve()
+    output = (args.output or args.output_root/f'stride3_noaa_{args.version}').expanduser().resolve()
     if args.prior_voxel_size <= 0 or args.prior_max_voxels < 1000: p.error('Invalid TSDF limits')
     if (output/'suite.json').exists():
         old = json.loads((output/'suite.json').read_text())

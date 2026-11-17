@@ -9,14 +9,18 @@ case "$orange_gpu" in 0|1|2|3) ;; *) echo 'GPU must be 0, 1, 2 or 3' >&2; exit 2
 orange_source="${2:-/workspace/colmap_scenes/orange4f}"
 orange_version="${3:-v1}"
 [[ "$orange_version" != *[!a-zA-Z0-9_-]* ]] || { echo 'Invalid version' >&2; exit 2; }
-orange_root="$(realpath -e "$orange_source")/3dgs_finetuning/stride3_noaa_$orange_version"
+orange_source="$(realpath -e "$orange_source")"
+orange_output_root="${ORANGE4F_OUTPUT_ROOT:-/data/3dgs_outputs/orange4f/3dgs_finetuning}"
+orange_root="$(realpath -m "$orange_output_root/stride3_noaa_$orange_version")"
+echo "Dataset: $orange_source"
+echo "Outputs: $orange_root"
 mkdir -p "$(dirname "$orange_root")"
 # Multiple terminal commands can safely prepare the shared scene concurrently.
 exec 9>"$orange_root.lock"
 flock 9
 orange_extra=()
 if [[ -n "${ORANGE4F_POINT_CLOUD:-}" ]]; then orange_extra+=(--point-cloud "$ORANGE4F_POINT_CLOUD"); fi
-python -u scripts/prepare_orange4f.py --source "$orange_source" --version "$orange_version" "${orange_extra[@]}"
+python -u scripts/prepare_orange4f.py --source "$orange_source" --output "$orange_root" --version "$orange_version" "${orange_extra[@]}"
 flock -u 9
 orange_names=(3dgs 3dgs_fixed_lidar gsprior gsprior_fixed_lidar)
 orange_model="$orange_root/${orange_names[$orange_gpu]}"

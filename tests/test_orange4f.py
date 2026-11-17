@@ -1,8 +1,12 @@
 """Real shared-selection preparation, no-AA propagation and source preservation."""
 import argparse
 import json
+import os
 from pathlib import Path
+import shutil
 import struct
+import subprocess
+import sys
 from unittest.mock import patch
 
 import numpy as np
@@ -23,9 +27,10 @@ def test_four_runs_share_full_resolution_sharp_stride3_and_cloud(region_source):
     pixels[:32,:32]=((np.indices((32,32)).sum(0)%2)*255)[...,None]
     Image.fromarray(pixels).save(source/'images/00001.png')
     before={str(p):digest(p) for p in source.rglob('*') if p.is_file()}
-    args=['--source',str(source),'--point-cloud',str(cloud)]
+    output_root=source.parent/'outputs/3dgs_finetuning'
+    args=['--source',str(source),'--point-cloud',str(cloud),'--output-root',str(output_root)]
     main(args)
-    root=source/'3dgs_finetuning/stride3_noaa_v1'
+    root=output_root/'stride3_noaa_v1'
     suite=json.loads((root/'suite.json').read_text())
     selection=json.loads(Path(suite['selection']).read_text())
     assert selection['selected_images']==['00001.png','00003.png']
@@ -64,11 +69,49 @@ def test_four_runs_share_full_resolution_sharp_stride3_and_cloud(region_source):
     split=json.loads((root/'shared/gsprior_data/split.json').read_text())
     assert split['train']==selection['selected_images'] and len(split['test'])==4
     assert all(digest(Path(p))==v for p,v in before.items())
+    assert not (source/'3dgs_finetuning').exists()
     main(args)  # Cached selection is reused, never recomputed differently per run.
     with pytest.raises(ValueError,match='configuration changed'):
         main(args+['--prior-voxel-size','.03'])
     with (source/'sparse/0/cameras.txt').open('a') as f: f.write('# changed\n')
     with pytest.raises(ValueError,match='input changed'): main(args)
+
+
+@pytest.mark.parametrize('gpu',[0,1])
+def test_launcher_with_readonly_symlink_source_places_all_runs_outside_dataset(tmp_path,region_source,gpu):
+    source,cloud,_=region_source
+    alias=tmp_path/'mounted_orange4f';alias.symlink_to(source,target_is_directory=True)
+    root=Path(__file__).resolve().parents[1]
+    scripts=tmp_path/'checkout/scripts';scripts.mkdir(parents=True)
+    shutil.copyfile(root/'scripts/run_orange4f.sh',scripts/'run_orange4f.sh')
+    (scripts/'prepare_orange4f.py').symlink_to(root/'scripts/prepare_orange4f.py')
+    (scripts/'run_prepared_reconstruction.sh').write_text(
+        'set -eu\ntest -f "$1/periodic_evaluation/plan.json"\nprintf "%s" "$1" > "$HANDOFF"\n')
+    conda=tmp_path/'conda.sh'
+    conda.write_text('conda() { test "$1" = activate && test "$2" = 3dgs; }\n')
+    bindir=tmp_path/'bin';bindir.mkdir()
+    (bindir/'python').write_text('#!'+sys.executable+'\nimport os,sys\nos.execv(sys.executable,[sys.executable,*sys.argv[1:]])\n')
+    (bindir/'python').chmod(0o755)
+    output=tmp_path/'separate_outputs/orange4f/3dgs_finetuning'
+    before={str(p.relative_to(source)):digest(p) for p in source.rglob('*') if p.is_file()}
+    previous_mode=source.stat().st_mode
+    source.chmod(0o555)
+    try:
+        result=subprocess.run(['bash',str(scripts/'run_orange4f.sh'),str(gpu),str(alias)],
+            env={**os.environ,'PATH':str(bindir)+os.pathsep+os.environ['PATH'],
+                 'RECONSTRUCTION_CONDA_SH':str(conda),'ORANGE4F_OUTPUT_ROOT':str(output),
+                 'ORANGE4F_POINT_CLOUD':str(cloud),'HANDOFF':str(tmp_path/'handoff')},
+            text=True,capture_output=True,timeout=60)
+    finally:
+        source.chmod(previous_mode)
+    assert result.returncode==0,result.stdout+result.stderr
+    suite_root=output/'stride3_noaa_v1'
+    suite=json.loads((suite_root/'suite.json').read_text())
+    assert suite['source']==str(source.resolve()) and suite['output']==str(suite_root)
+    assert all(Path(r['model']).parent==suite_root for r in suite['runs'])
+    assert (tmp_path/'handoff').read_text()==suite['runs'][gpu]['model']
+    assert not (source/'3dgs_finetuning').exists()
+    assert {str(p.relative_to(source)):digest(p) for p in source.rglob('*') if p.is_file()}==before
 
 
 @pytest.mark.parametrize('binary',[False,True])

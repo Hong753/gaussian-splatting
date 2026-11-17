@@ -11,7 +11,7 @@ does this under a lock), then launch one job in each terminal.
 | 3 | `gsprior_fixed_lidar` | Fixed; both Adam and prior pull disabled | Disabled | 40,000 |
 
 All outputs go under:
-`/workspace/colmap_scenes/orange4f/3dgs_finetuning/stride3_noaa_v1/`.
+`/data/3dgs_outputs/orange4f/3dgs_finetuning/stride3_noaa_v1/`.
 
 ## Inputs and baseline controls
 
@@ -69,6 +69,12 @@ bash scripts/run_orange4f.sh 0 /workspace/colmap_scenes/orange4f v2
 All four commands must use the same version. Preparation is shared and locked.
 A completed preparation is reused; conflicting cached inputs fail rather than
 silently changing the experiment. An incomplete preparation needs a new version.
+Outputs and shared caches are stored outside the dataset, including when the
+source path is a symlink to read-only storage. To choose another output parent,
+set `ORANGE4F_OUTPUT_ROOT` in every terminal, or pass `--output-root` to the
+Python preparation script. The default parent is
+`/data/3dgs_outputs/orange4f/3dgs_finetuning`.
+
 Existing GPU processes are not killed. Training refuses to overwrite a run
 already started.
 
@@ -148,7 +154,7 @@ Serve the four-run index without using a GPU:
 source /opt/anaconda3/etc/profile.d/conda.sh &&
 conda activate 3dgs &&
 python -m http.server 8098 --bind 0.0.0.0 \
-  --directory /workspace/colmap_scenes/orange4f/3dgs_finetuning/stride3_noaa_v1
+  --directory /data/3dgs_outputs/orange4f/3dgs_finetuning/stride3_noaa_v1
 ```
 
 Open `http://SERVER_IP:8098/`. Links populate when each run saves its first
@@ -161,6 +167,6 @@ conda activate 3dgs &&
 cd ~/gaussian-splatting &&
 "$HOME/.venvs/gsprior-orange4f/bin/python" scripts/gsprior_entry.py eval \
   --repo "$HOME/.cache/3dgs/GSPrior-dcb7c89-orange4f-v1" \
-  --model /workspace/colmap_scenes/orange4f/3dgs_finetuning/stride3_noaa_v1/gsprior \
+  --model /data/3dgs_outputs/orange4f/3dgs_finetuning/stride3_noaa_v1/gsprior \
   --iteration 30000
 ```
