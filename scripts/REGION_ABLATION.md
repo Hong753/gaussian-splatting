@@ -1,5 +1,83 @@
 # Regional blur ablation
 
+## Headless SuperPoint + SuperGlue with sequential overlap (GPU 1)
+
+For the video sequence, use SuperPoint features and the official indoor
+SuperGlue model on GPU 1. Each selected training image is paired with the next
+20 selected images in natural filename order. For 1,349 images this is 26,770
+pairs, rather than 909,226 exhaustive pairs. The overlap counts **selected
+frames**, not raw video frame numbers. There is no automatic loop-closure
+retrieval or geometry-based pairing in this experiment.
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_region_superglue.sh 1 \
+  /data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/regions/wall_06663_v1
+```
+
+The first invocation caches the official
+`magicleap/SuperGluePretrainedNetwork` code/weights at commit
+`ddcf11f42e7e0732a0c4607648f9448ea8d73590` under
+`~/.cache/3dgs/SuperGluePretrainedNetwork-ddcf11f` (or `SUPERGLUE_REPO`).
+It uses the current `3dgs` environment and does not install packages or change
+PyTorch. The models use CUDA without any display, Qt window, or OpenGL context.
+The native COLMAP executable may be a CPU-only build.
+
+Defaults are a maximum image side of 1,600 pixels (no upscaling), at most 4,096
+SuperPoint keypoints, NMS radius 4, keypoint threshold 0.005, indoor SuperGlue
+weights, 100 Sinkhorn iterations, and match threshold 0.2. The script converts
+resized integer-centered SuperPoint coordinates into original-resolution
+COLMAP half-pixel coordinates before geometric verification. RGB training
+resolution and the original camera calibration are unchanged.
+
+COLMAP's `feature_importer` first creates its native image/camera/rig records
+using empty feature placeholders; these are replaced with SuperPoint keypoints.
+The float SuperPoint descriptors stay in the disk cache. They are not converted
+into fake SIFT descriptors. `matches_importer --match_type raw` then runs CPU
+geometric verification on the **SuperGlue correspondences**, with GPU SIFT
+disabled. Neither the SIFT extractor nor the exhaustive/sequential SIFT matcher
+is invoked. Mapping, fixed-intrinsics BA, LiDAR-frame alignment and Gaussian
+training follow automatically. A disconnected verified match graph or missing
+registrations stops the run with a report instead of silently dropping images.
+
+New outputs (the failed SIFT workspace is left available):
+
+- `$REGION/colmap_superpoint_superglue_seq20_v1/`: `superglue.json` records model
+  hashes/settings; `pairs.txt` records the exact temporal pairs. Per-image
+  `superpoint/` and per-pair `superglue_matches/` caches are written atomically
+  as they finish. CPU memory holds at most 32 feature sets; GPU memory holds
+  the current network/pair. Restarting the same command reuses completed work.
+- `superglue_matching_report.json`: raw correspondence counts;
+  `verification_report.json`: verified pair counts, connected components and
+  isolated images. Inspect this before increasing overlap if connectivity fails.
+- `$REGION/runs/crop_colmap_superglue_seq20_fixed_v1/`: the same fixed-LiDAR
+  3DGS + AA control, 90k steps for this export, no culling or scale cap, previews
+  every 500 steps and parallel regional ROI evaluation every 10k. Only training
+  poses are replaced; held-out poses and LiDAR initialization remain unchanged.
+
+For a different overlap, prefix the command with e.g.
+`COLMAP_SEQUENTIAL_OVERLAP=30`; the output names then contain `seq30`.
+`SUPERPOINT_MAX_SIZE` and `SUPERPOINT_MAX_KEYPOINTS` override feature extraction
+limits. Changing those requires a fresh VERSION (third positional argument).
+
+Once Gaussian training starts, open its live preview in another terminal:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+python scripts/serve_training_previews.py \
+  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/regions/wall_06663_v1/runs/crop_colmap_superglue_seq20_fixed_v1 \
+  --port 8094
+```
+
+Browse `http://211.172.247.108:8094`. For comparison with the original-pose
+control, use `compare_region.py --different-poses` as below, replacing the
+second model with `crop_colmap_superglue_seq20_fixed_v1`.
+
 ## Rerun COLMAP on the selected training images (GPU 1)
 
 This ablation reruns feature extraction, exhaustive matching, incremental SfM,
@@ -18,9 +96,14 @@ bash scripts/run_region_colmap.sh 1 \
   /data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/regions/wall_06663_v1
 ```
 
-The GPU argument limits SIFT extraction/matching to physical GPU 1 (logical
-device 0 inside COLMAP), then trains/evaluates GS on physical GPU 1. Mapping and
-bundle adjustment use COLMAP's default CPU solver. CLI option names are read
+For this older SIFT workflow, `COLMAP_SIFT_DEVICE=auto` uses GPU SIFT only if the
+installed COLMAP build banner says `with CUDA`; otherwise extraction/matching
+use CPU, capped at eight threads where supported. `QT_QPA_PLATFORM=offscreen`
+alone does not supply the OpenGL context required by non-CUDA GPU SIFT.
+`COLMAP_SIFT_DEVICE=cpu` explicitly forces CPU; `cuda` requires an advertised
+CUDA build. GPU SIFT is limited to physical GPU 1 (logical device 0 inside
+COLMAP). GS still trains/evaluates on physical GPU 1. Mapping and bundle
+adjustment use COLMAP's default CPU solver. CLI option names are read
 from the installed COLMAP help, supporting the older `SiftExtraction` /
 `SiftMatching` and newer `FeatureExtraction` / `FeatureMatching` option groups.
 Alignment likewise selects the installed `alignment_max_error` or legacy

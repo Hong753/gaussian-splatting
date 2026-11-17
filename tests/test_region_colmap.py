@@ -197,6 +197,8 @@ def opt(name): return args[args.index('--'+name)+1]
 legacy=os.environ['LEGACY_ALIGNMENT']=='1'
 alignment_options=['robust_alignment','robust_alignment_max_error'] if legacy else ['alignment_max_error']
 if os.environ.get('MISSING_ALIGNMENT')=='1': alignment_options=[]
+if args==['-h']:
+    print('COLMAP build with CUDA' if os.environ['MODERN']=='1' else 'COLMAP build without CUDA');sys.exit(0)
 if '-h' in args:
     prefix='Feature' if os.environ['MODERN']=='1' else 'Sift'
     groups={'feature_extractor':[prefix+'Extraction.'+v for v in ['use_gpu','gpu_index','max_image_size']]+['image_list_path','ImageReader.existing_camera_id'],
@@ -210,8 +212,13 @@ with open(os.environ['CALLS'],'a') as f: f.write(json.dumps(args)+'\\n')
 if command=='database_creator':
     with sqlite3.connect(opt('database_path')) as db: db.execute('CREATE TABLE cameras(camera_id INTEGER PRIMARY KEY,model INTEGER,width INTEGER,height INTEGER,params BLOB,prior_focal_length INTEGER)')
 elif command=='feature_extractor':
+    prefix='FeatureExtraction' if os.environ['MODERN']=='1' else 'SiftExtraction'
+    assert opt(prefix+'.use_gpu')==os.environ['MODERN']
     names=Path(opt('image_list_path')).read_text().splitlines();assert names==['00000.png','00001.png','00002.png']
     assert sorted(p.name for p in Path(opt('image_path')).iterdir())==names
+elif command=='exhaustive_matcher':
+    prefix='FeatureMatching' if os.environ['MODERN']=='1' else 'SiftMatching'
+    assert opt(prefix+'.use_gpu')==os.environ['MODERN']
 elif command in ['mapper','bundle_adjuster','model_aligner']:
     output=Path(opt('output_path'));output=output/'0' if command=='mapper' else output
     shutil.copytree(os.environ['FIXTURE'],output,dirs_exist_ok=True)

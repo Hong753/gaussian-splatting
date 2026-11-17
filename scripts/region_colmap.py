@@ -28,7 +28,7 @@ def load_job(workspace):
     return job
 
 
-def prepare(region,workspace,alignment_error=None):
+def prepare(region,workspace,alignment_error=None,frontend='sift',overlap=20):
     region,workspace=region.resolve(),workspace.resolve()
     meta=json.loads((region/'selection.json').read_text())
     _,cameras,images,stamps=read_model(region)
@@ -68,6 +68,10 @@ def prepare(region,workspace,alignment_error=None):
              input_stamps={str(p.resolve()):file_stamp(p) for p in paths},
              cameras=calibrated,groups=groups,alignment_max_error=error,
              policy='Fresh SIFT/exhaustive matching/incremental SfM/BA on selected train images only; fixed intrinsics; similarity alignment to original train centers; unchanged LiDAR and held-out poses')
+    if frontend=='superglue':
+        if overlap<1: raise ValueError('Sequential overlap must be positive')
+        job.update(frontend='superpoint-superglue',sequential_overlap=overlap,
+                   policy='SuperPoint/SuperGlue sequential matching/incremental SfM/BA on selected train images only; fixed intrinsics; similarity alignment to original train centers; unchanged LiDAR and held-out poses')
     # Normalize JSON integer keys before comparing a resumed job.
     job=json.loads(json.dumps(job))
     if (workspace/'job.json').is_file():
@@ -178,6 +182,8 @@ def export(workspace):
                  gaussian_initialization='Same original regional input.ply; new COLMAP sparse points are not used for GS initialization',
                  heldout_used_in_colmap=False,intrinsics_fixed=True,
                  evaluation='Identical images and original ROI masks; training render poses differ from the control')
+    if job.get('frontend')=='superpoint-superglue':
+        audit['feature_matching']=json.loads((workspace/'superglue.json').read_text())
     atomic_json(workspace/'alignment_report.json',audit)
     if not audit['accepted']:
         raise ValueError('COLMAP-to-LiDAR alignment failed sanity checks; inspect alignment_report.json before training')
@@ -221,10 +227,12 @@ def main(argv=None):
     parser.add_argument('--region',type=Path)
     parser.add_argument('--mapping-root',type=Path)
     parser.add_argument('--alignment-max-error',type=float)
+    parser.add_argument('--frontend',choices=('sift','superglue'),default='sift')
+    parser.add_argument('--sequential-overlap',type=int,default=20)
     args=parser.parse_args(argv);workspace=args.workspace.expanduser().resolve()
     if args.stage=='prepare':
         if args.region is None: parser.error('prepare requires --region')
-        prepare(args.region,workspace,args.alignment_max_error)
+        prepare(args.region,workspace,args.alignment_max_error,args.frontend,args.sequential_overlap)
     elif args.stage=='seed-cameras': seed_cameras(workspace)
     elif args.stage=='choose-model':
         if args.mapping_root is None: parser.error('choose-model requires --mapping-root')
