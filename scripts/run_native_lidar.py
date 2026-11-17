@@ -117,7 +117,7 @@ def prepare(argv):
         args.keyframes = args.keyframes or args.baseline/'keyframes.json'
         args.point_cloud = args.point_cloud or args.baseline/'input.ply'
     plan = build_plan(args)
-    return periodic.prepare_experiment(args, plan, 'native_lidar', [args.keyframes, args.point_cloud])
+    return periodic.prepare_experiment(args, plan, 'native_lidar', [args.keyframes, args.point_cloud, *fixed.mask_inputs(args)])
 
 
 def execute_plan(args, plan):
@@ -131,6 +131,8 @@ def execute_plan(args, plan):
         smoke.append('--preserve-densification-radii')
     if plan.get('freeze_lidar_positions'):
         smoke.append('--freeze-lidar-positions')
+    if getattr(args,'loss_mask_dir',None):
+        smoke.append('--region-loss')
     invoke(smoke)
     return fixed.execute_plan(args, plan, smoke=False)
 

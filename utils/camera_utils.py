@@ -65,11 +65,15 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
     if is_nerf_synthetic and invdepthmap is not None and depth_params is None:
         # Synthetic inverse-depth inputs are already aligned to the scene.
         depth_params = {"scale": 1.0, "offset": 0.0, "reliable": True}
-    return Camera(resolution, colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
+    camera = Camera(resolution, colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, depth_params=depth_params,
                   image=image, invdepthmap=invdepthmap,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device,
                   train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test)
+    if getattr(args, 'loss_mask_dir', ''):
+        from utils.region_loss import load_mask
+        camera.loss_mask = load_mask(args.loss_mask_dir, cam_info.image_name, resolution)
+    return camera
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_synthetic, is_test_dataset):
     camera_list = []

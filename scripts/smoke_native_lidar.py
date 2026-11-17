@@ -21,6 +21,7 @@ def main(argv=None):
     p.add_argument('--iterations', type=int, default=30000)
     p.add_argument('--preserve-densification-radii', action='store_true')
     p.add_argument('--freeze-lidar-positions', action='store_true')
+    p.add_argument('--region-loss', action='store_true')
     args = p.parse_args(argv)
     if not math.isfinite(args.percent_dense) or not 0 < args.percent_dense <= 1:
         p.error('percent-dense must be finite and in (0, 1]')
@@ -65,7 +66,17 @@ def main(argv=None):
         assert (lr == 0) if args.freeze_lidar_positions else (lr > 0)
         image = render(camera, model, pipe, torch.zeros(3, device='cuda'))['render']
         assert torch.isfinite(image).all()
-        (image-.6).square().mean().backward()
+        if args.region_loss:
+            from utils.region_loss import photometric_terms
+            mask=torch.zeros(1,48,48,device='cuda',dtype=torch.bool)
+            mask[:,12:36,12:36]=True
+            l1, similarity=photometric_terms(image,torch.full_like(image,.6),mask)
+            loss=.8*l1+.2*(1-similarity)
+            pixels=torch.autograd.grad(loss,image,retain_graph=True)[0]
+            assert (pixels[:,~mask[0]]==0).all() and pixels[:,mask[0]].abs().sum()>0
+            loss.backward()
+        else:
+            (image-.6).square().mean().backward()
         if args.freeze_lidar_positions:
             assert model._xyz.grad is None and not model._xyz.requires_grad
         else:
@@ -101,6 +112,8 @@ def main(argv=None):
             native_aa_rgb_gradients=True, fixed_centers=True, appearance_updated=True,
             opacity_and_world_pruning=True, no_cloning_or_splitting=True,
             checkpoint_round_trip=True, scaling_lr=opt.scaling_lr)
+        if args.region_loss:
+            result['regional_rgb_loss_gradients_zero_outside_mask']=True
         if args.output:
             from utils.checkpoint_snapshots import atomic_json
             atomic_json(args.output, result)

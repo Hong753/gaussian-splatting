@@ -59,7 +59,8 @@ def prepare_experiment(args, plan, experiment, input_paths):
     selected = json.loads(args.keyframes.read_text())['selected_images']
     if not selected or len(selected) != len(set(selected)) or not set(selected) <= set(records):
         raise ValueError('Training manifest is empty, duplicated or outside the source cameras')
-    steps = sorted(set(range(args.checkpoint_every, args.iterations+1, args.checkpoint_every)) | {args.iterations})
+    from scripts.run_fixed_lidar import checkpoint_steps
+    steps = checkpoint_steps(args)
     data = dict(schema=1, experiment=experiment, model=plan['model'], source=plan['source'], gpu=args.gpu,
         iterations=steps, frames=sorted(records), selected=sorted(selected),
         expected_frames=args.expected_frames, report_max_views=args.report_max_views,
@@ -104,7 +105,7 @@ def train(model):
                 if digest(path) != expected:
                     raise ValueError(f'Input changed after preparation: {path}')
             args = SimpleNamespace(**data['training_args'])
-            for name in ('source', 'model', 'keyframes', 'baseline', 'video_output', 'scene_geometry', 'point_cloud', 'cache', 'local_scale_cache', 'lidar_activation_cache'):
+            for name in ('source', 'model', 'keyframes', 'baseline', 'video_output', 'scene_geometry', 'point_cloud', 'cache', 'local_scale_cache', 'lidar_activation_cache', 'loss_mask_dir'):
                 if getattr(args, name, None) is not None:
                     setattr(args, name, Path(getattr(args, name)))
             launcher = run_occlusion
@@ -412,12 +413,13 @@ def write_history(data, results):
                  **{k+'_psnr_db': r['mean_psnr_db'][k] for k in ('all', 'selected', 'unselected')},
                  frames=r['counts']['all'], snapshot_id=r['snapshot_id']) for r in results]
     poses=bool(data['plan'].get('pose_refinement'))
+    regional=bool(data.get('training_args',{}).get('loss_mask_dir'))
     if poses:
         for row,result in zip(rows,results):
             row['refined_all_psnr_db']=result['refined_poses']['mean_psnr_db']['all']
             row['refined_selected_psnr_db']=result['refined_poses']['mean_psnr_db']['selected']
     atomic_json(folder/'history.json', dict(expected_iterations=data['iterations'], completed=rows,
-        complete=len(rows)==len(data['iterations']), render_protocol='3DGS + AA; no mesh/culling; no exposure; primary metrics use original poses'))
+        complete=len(rows)==len(data['iterations']), render_protocol='3DGS + AA; no mesh/culling; no exposure; primary metrics use original poses'+('; ROI-only PSNR on regional export' if regional else '')))
     def save_csv(temp):
         with temp.open('w', newline='') as stream:
             writer = csv.DictWriter(stream, fieldnames=['iteration', 'gaussians', 'all_psnr_db', 'selected_psnr_db',
@@ -438,12 +440,15 @@ def write_history(data, results):
             links+=f' <a href="{html.escape(os.path.relpath(result["culling_comparison"],folder))}">GT / culling OFF / culling ON</a>'
         body.append('<tr>'+''.join(f'<td>{html.escape(str(v))}</td>' for v in cells)+f'<td>{links}</td></tr>')
     title = {'local_scale':'Local KNN scale checkpoints', 'fixed_lidar':'Fixed LiDAR checkpoints',
+             'native_lidar':'Native LiDAR checkpoints',
              'discrete_lidar':'Discrete LiDAR checkpoints',
              'distance_weighted':'Distance-weighted LiDAR checkpoints'}.get(data.get('experiment'), 'Soft surface checkpoints')
     if poses: title='Bounded pose refinement checkpoints'
+    if regional: title='Regional reconstruction — ROI PSNR'
     page = ('<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="30">'
         f'<title>{title}</title><style>body{{font:16px sans-serif;margin:2em}}td,th{{padding:.6em;text-align:left}}</style>'
-        f'<h1>{title}</h1><p>All registered frames; AA on; mesh-free inference. '
+        f'<h1>{title}</h1>'+('<p>ROI-only PSNR on all frames in the regional export; not the full 5,009-frame scene. Bright preview pixels are scored; dim pixels are excluded.</p>' if regional else '')+
+        '<p>All registered frames in this run’s source; AA on; mesh-free inference. '
         'Selected = training keyframes. Unselected = all remaining frames. Image galleries are sampled.</p>'
         '<table><tr><th>Step</th><th>Gaussians</th><th>Frames</th><th>All PSNR</th><th>Selected PSNR</th>'
         '<th>Unselected PSNR</th>'+('<th>Cached-pose all PSNR</th><th>Cached-pose train PSNR</th>' if poses else '')+

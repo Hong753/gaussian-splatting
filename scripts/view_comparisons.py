@@ -147,6 +147,10 @@ def write_all_frame_metrics(spec, rows, iteration, antialiasing=None):
     from scripts import pose_options
     summary['camera_poses']=spec.get('camera_poses','original')
     summary['pose_protocol']=pose_options.protocol(spec)
+    if cfg.get('loss_mask_dir'):
+        summary['metric']='ROI-only per-channel PSNR, then arithmetic mean over images'
+        summary['coverage']='all registered frames in the regional export, not all frames of the original full scene'
+        summary['loss_mask_dir']=cfg['loss_mask_dir']
     cache=pose_options.load_cache(spec,iteration)
     if cache is not None: summary['pose_cache']=dict(path=cache['_path'],sha256=cache['_sha256'])
     output = metric_directory(spec["path"], iteration, spec.get("render_variant", ""))

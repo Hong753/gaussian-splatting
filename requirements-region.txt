@@ -1,0 +1,5 @@
+# Regional selection viewer; training remains in the existing 3dgs environment.
+viser==1.0.30
+plyfile
+scipy>=1.11
+Pillow

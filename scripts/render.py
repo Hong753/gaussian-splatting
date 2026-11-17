@@ -148,6 +148,9 @@ def main(argv=None):
                 model["mean_psnr_db"] = round(mean, 5) if math.isfinite(mean) else "inf"
             for model, spec in zip(models, specs):
                 model["occlusion"] = settings(spec["cfg"])
+                model['metric']='ROI PSNR' if spec['cfg'].get('loss_mask_dir') else 'full-image PSNR'
+                if spec['cfg'].get('loss_mask_dir'):
+                    model['label'] += ' | ROI PSNR (outside dimmed)'
                 model["render_variant"] = spec.get("render_variant", "")
                 model['pose_protocol']=pose_options.protocol(spec)
             if split_name == "all":
@@ -163,7 +166,7 @@ def main(argv=None):
                                excluded_nonshared_views=[len(s)-total for s in sets],
                                pose_protocol=[pose_options.protocol(s) for s in specs],
                                exposure_protocol="base appearance, no per-image exposure",
-                               metric="mean per-channel PSNR, matching scripts/eval_all_frames.py"))
+                               metric="mean per-channel PSNR; ROI-only for models labeled ROI, matching scripts/eval_all_frames.py"))
             completed.append(folder / "index.html")
             print(f"Open {folder / 'index.html'}", flush=True)
         if completed:

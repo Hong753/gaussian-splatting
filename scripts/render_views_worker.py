@@ -38,7 +38,8 @@ def render_views(spec, names, iteration, output, antialiasing=None):
         filename = "textured.pt" if spec["type"] == "textured" else "point_cloud.ply"
         runtime = {**spec, "ply": spec["path"] / f"point_cloud/iteration_{iteration}" / filename}
         render = load_renderer(runtime, aa)
-        camera_args = SimpleNamespace(resolution=cfg.get("resolution", -1), data_device="cpu", train_test_exp=False)
+        camera_args = SimpleNamespace(resolution=cfg.get("resolution", -1), data_device="cpu", train_test_exp=False,
+                                      loss_mask_dir=cfg.get('loss_mask_dir',''))
         def make_camera(record, index):
             info = SimpleNamespace(uid=index, image_path=record["image_path"],
                     image_name=record["name"], R=np.array(record["R"]), T=np.array(record["T"]),
@@ -56,23 +57,29 @@ def render_views(spec, names, iteration, output, antialiasing=None):
             target = camera.original_image[:3].to(pred.device).clamp(0, 1)
             if pred.shape != target.shape or not torch.isfinite(pred).all():
                 raise ValueError(f"Invalid rendered image for {name}")
-            mse = (pred-target).square().flatten(1).mean(1)
-            psnr = (10 * torch.log10(1 / mse)).mean().item()
+            from utils.region_loss import score, display
+            mask = getattr(camera, 'loss_mask', None)
+            psnr = score(pred, target, mask).item()
             def rgb(tensor):
                 return (tensor.detach().cpu().permute(1, 2, 0).numpy() * 255).round().clip(0, 255).astype(np.uint8)
-            gt_array, pred_array = rgb(target), rgb(pred)
+            target_hash_array = rgb(target)
+            gt_array, pred_array = rgb(display(target, mask)), rgb(display(pred, mask))
             gt, rendered = Image.fromarray(gt_array), Image.fromarray(pred_array)
             key = image_id(name)
             gt.save(output / "gt" / f"{key}.png")
             rendered.save(output / "renders" / f"{key}.png")
-            Image.fromarray(rgb((pred-target).abs().mul(4).clamp(0, 1))).save(output / "errors" / f"{key}.png")
+            Image.fromarray(rgb(display((pred-target).abs().mul(4).clamp(0, 1),mask))).save(output / "errors" / f"{key}.png")
             label=spec['path'].name+(' | cached train pose' if pose_cache is not None and name in pose_cache['frames'] else ' | original pose')
+            if mask is not None:
+                label += ' | ROI only'
             save_panel(gt, rendered, output / "comparisons" / f"{key}.jpg", label, psnr)
             records[name] = dict(gt=f"gt/{key}.png", image=f"renders/{key}.png",
                                  error=f"errors/{key}.png", comparison=f"comparisons/{key}.jpg",
                                  psnr_db=psnr if math.isfinite(psnr) else "inf",
+                                 metric='ROI PSNR' if mask is not None else 'full-image PSNR',
+                                 mask_fraction=mask.float().mean().item() if mask is not None else 1.,
                                  camera_pose='refined' if pose_cache is not None and name in pose_cache['frames'] else 'original',
-                                 target_sha256=hashlib.sha256(str(gt_array.shape).encode() + gt_array.tobytes()).hexdigest())
+                                 target_sha256=hashlib.sha256(str(target_hash_array.shape).encode() + target_hash_array.tobytes()).hexdigest())
             del camera, pred, target
     atomic_json(output / "frames.json", records)
 

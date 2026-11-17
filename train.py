@@ -318,10 +318,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        if FUSED_SSIM_AVAILABLE:
+        if getattr(viewpoint_cam, 'loss_mask', None) is not None:
+            from utils.region_loss import photometric_terms
+            Ll1, ssim_value = photometric_terms(image, gt_image, viewpoint_cam.loss_mask)
+        elif FUSED_SSIM_AVAILABLE:
+            Ll1 = l1_loss(image, gt_image)
             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         else:
+            Ll1 = l1_loss(image, gt_image)
             ssim_value = ssim(image, gt_image)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
@@ -664,11 +668,19 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
+                    mask=getattr(viewpoint,'loss_mask',None)
+                    if mask is not None:
+                        from utils.region_loss import score as region_score
+                        mask=mask.to(image.device)
+                        if train_test_exp: mask=mask[...,mask.shape[-1]//2:]
+                        l1_test += ((image-gt_image).abs()*mask).sum().double()/(mask.sum()*image.shape[0])
+                        psnr_test += region_score(image,gt_image,mask).double()
+                    else:
+                        l1_test += l1_loss(image, gt_image).mean().double()
+                        psnr_test += psnr(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                print("\n[ITER {}] Evaluating {}: L1 {} {} {}".format(iteration, config['name'], l1_test, 'ROI PSNR' if mask is not None else 'PSNR', psnr_test))
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)

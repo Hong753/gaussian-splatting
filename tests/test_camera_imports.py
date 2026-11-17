@@ -24,6 +24,44 @@ sys.modules['simple_knn._C'] = extension
 
 
 class CameraImportTests(unittest.TestCase):
+    def test_region_mask_loads_through_real_camera_and_reports_roi_metrics(self):
+        self.run_fresh("""
+            import json, tempfile
+            from pathlib import Path
+            from unittest.mock import patch
+            import numpy as np
+            from PIL import Image
+            import torch
+            from scripts import render, render_model_comparison
+            from test_view_comparisons import dataset, checkpoint
+            from utils.region_loss import mask_path
+            with tempfile.TemporaryDirectory() as directory:
+                root=Path(directory)
+                source,manifest,names,selected=dataset(root)
+                masks=root/'masks'; masks.mkdir()
+                mask=np.zeros((8,16),np.uint8);mask[:,:8]=255
+                for name in names: Image.fromarray(mask).save(mask_path(masks,name))
+                model=root/'model';model.mkdir();checkpoint(model,30000)
+                (model/'keyframes.json').write_bytes(manifest.read_bytes())
+                (model/'cfg_args').write_text(f"Namespace(source_path={str(source)!r},eval=False,keyframe_manifest='keyframes.json',antialiasing=True,loss_mask_dir={str(masks)!r})")
+                def renderer(spec,aa):
+                    def predict(camera):
+                        assert camera.loss_mask.shape==(1,8,16)
+                        assert camera.loss_mask.sum()==64
+                        assert camera.alpha_mask.sum()==128  # Loss mask never changes rendering alpha.
+                        error=torch.full_like(camera.original_image,.4)
+                        error[:,:,:8]=.1
+                        return camera.original_image+error
+                    return predict
+                with patch.object(torch.Tensor,'cuda',lambda t,*a,**kw:t), patch.object(render_model_comparison,'load_renderer',side_effect=renderer):
+                    assert render.main(['--model',str(model),'--iteration','30000','--split','all','--in-process','--output',str(root/'report')])==0
+                rows=json.loads((root/'report/all/model_0/frames.json').read_text())
+                assert all(abs(r['psnr_db']-20)<.001 and r['mask_fraction']==.5 and r['metric']=='ROI PSNR' for r in rows.values())
+                summary=json.loads((model/'psnr_all_frames/iteration_30000/summary.json').read_text())
+                assert summary['metric'].startswith('ROI-only')
+                assert 'not all frames' in summary['coverage']
+        """)
+
     def test_training_preview_loads_only_two_real_heldout_cameras(self):
         self.run_fresh("""
             import tempfile

@@ -1,5 +1,9 @@
 # Training
 
+For a spatial image/pose/LiDAR subset, interactive selection, and a controlled
+regional blur ablation with matching GT/render previews, see
+[REGION_ABLATION.md](REGION_ABLATION.md).
+
 For CUDA per-pixel surface clipping and the all-points/frustum/surface/culling
 viewer, see [RAY_OCCLUSION.md](RAY_OCCLUSION.md).
 

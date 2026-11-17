@@ -28,6 +28,9 @@ def parser():
     p.add_argument('--gpu', default='0')
     p.add_argument('--iterations', type=int, default=100000)
     p.add_argument('--checkpoint-every', type=int, default=10000)
+    p.add_argument('--extra-checkpoints', type=int, nargs='+', default=None)
+    p.add_argument('--loss-mask-dir', type=Path, default=None,
+                   help='Optional per-image region masks; changes loss/PSNR, not rendering visibility')
     p.add_argument('--max-scale-ratio', type=float, default=2., help='Principal sigma reference / initial nearest-neighbor sigma')
     p.add_argument('--max-scale-world', type=float, default=0., help='Optional absolute reference sigma in scene units (0: off)')
     p.add_argument('--scale-control', choices=('off', 'clamp', 'regularize', 'hybrid'), default='clamp',
@@ -55,6 +58,26 @@ def parser():
     from utils.training_previews import add_arguments
     add_arguments(p)
     return p
+
+
+def checkpoint_steps(args):
+    extra = getattr(args, 'extra_checkpoints', None) or []
+    if any(step < 1 or step > args.iterations for step in extra):
+        raise ValueError('Extra checkpoint steps must lie inside the training schedule')
+    return sorted(set(range(args.checkpoint_every, args.iterations+1, args.checkpoint_every)) | {args.iterations} | set(extra))
+
+
+def mask_inputs(args):
+    directory = getattr(args, 'loss_mask_dir', None)
+    if not directory:
+        return []
+    from scripts.view_comparisons import read_colmap_records
+    from utils.region_loss import mask_path, load_mask
+    paths = []
+    for name, record in read_colmap_records(args.source).items():
+        load_mask(directory, name, (record['width'],record['height']))
+        paths.append(mask_path(directory, name))
+    return paths
 
 
 def build_plan(args):
@@ -85,7 +108,7 @@ def build_plan(args):
         raise ValueError('Need original colored LiDAR PLY with x/y/z, RGB and normal fields (BASELINE/input.ply)')
     if 'f_dc_0' in fields or 'scale_0' in fields:
         raise ValueError('Pass original input.ply, not a learned Gaussian checkpoint')
-    steps = sorted(set(range(args.checkpoint_every, args.iterations+1, args.checkpoint_every)) | {args.iterations})
+    steps = checkpoint_steps(args)
     command = ['train.py', '-s', str(source), '-m', str(model),
         '--initial_point_cloud', str(args.point_cloud.expanduser().resolve()),
         '--keyframe_manifest', str(model/'keyframes.json'),
@@ -99,6 +122,8 @@ def build_plan(args):
         '--checkpoint_iterations', *map(str, steps), '--publish_checkpoint_snapshots']
     from utils.training_previews import command_arguments as preview_arguments
     command += preview_arguments(args)
+    if getattr(args, 'loss_mask_dir', None):
+        command += ['--loss_mask_dir', str(Path(args.loss_mask_dir).expanduser().resolve())]
     policy = {}
     if control == 'off':
         command += ['--scale_control', 'off']
@@ -140,7 +165,7 @@ def prepare(argv):
         args.keyframes = args.keyframes or args.baseline/'keyframes.json'
         args.point_cloud = args.point_cloud or args.baseline/'input.ply'
     plan = build_plan(args)
-    return periodic.prepare_experiment(args, plan, 'fixed_lidar', [args.keyframes, args.point_cloud])
+    return periodic.prepare_experiment(args, plan, 'fixed_lidar', [args.keyframes, args.point_cloud, *mask_inputs(args)])
 
 
 def execute_plan(args, plan, *, smoke=True):

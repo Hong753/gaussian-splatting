@@ -65,7 +65,8 @@ def load_heldout_camera(record, dataset):
         R=np.array(record['R']), T=np.array(record['T']), FovX=record['fov_x'], FovY=record['fov_y'],
         depth_path='', depth_params=None, is_test=True)
     # Preserve native image resolution, but keep the few extra RGB tensors on CPU.
-    args = SimpleNamespace(resolution=dataset.resolution, data_device='cpu', train_test_exp=False)
+    args = SimpleNamespace(resolution=dataset.resolution, data_device='cpu', train_test_exp=False,
+                           loss_mask_dir=getattr(dataset,'loss_mask_dir',''))
     return loadCam(args, 0, info, 1., False, True)
 
 
@@ -167,9 +168,11 @@ class TrainingPreviewer:
                     pred, target = pred.clamp(0, 1), target.clamp(0, 1)
                     # Match scripts/render_views_worker.py / all-frame evaluation:
                     # PSNR per RGB channel, then the mean over channels.
-                    mse = (pred - target).square().flatten(1).mean(1)
-                    score = (-10 * torch.log10(mse)).mean().item()
+                    from utils.region_loss import score as image_score, display
+                    mask = getattr(original_camera, 'loss_mask', None)
+                    score = image_score(pred, target, mask).item()
                     error = (pred - target).abs().mul(4).clamp(0, 1)
+                    pred, target, error = [display(x, mask) for x in (pred,target,error)]
                     key = hashlib.sha256((split + '/' + original_camera.image_name).encode()).hexdigest()[:24]
                     gt_path = self.root / 'gt' / f'{key}.png'
                     if not gt_path.exists():
@@ -179,6 +182,7 @@ class TrainingPreviewer:
                     row = dict(name=original_camera.image_name, split=split,
                         pose='current refined training pose' if refined else 'original pose',
                         psnr_db=score if math.isfinite(score) else 'inf',
+                        metric='ROI PSNR' if mask is not None else 'full-image PSNR',
                         gt=f'gt/{key}.png', render=f'{folder.name}/{key}.png',
                         error=f'{folder.name}/{key}_error.jpg', width=pred.shape[-1], height=pred.shape[-2])
                     rows.append(row)
@@ -187,12 +191,12 @@ class TrainingPreviewer:
                         tb_writer.add_image(tag + '/gt_render_error_x4', torch.cat((target, pred, error), dim=2), iteration)
                         if math.isfinite(score):
                             tb_writer.add_scalar(tag + '/psnr', score, iteration)
-                    del pred, target, error, mse, camera
+                    del pred, target, error, camera
             snapshot = dict(iteration=iteration, frames=rows, seconds=time.monotonic() - started,
                 created_unix=time.time(), antialiasing=bool(getattr(pipe, 'antialiasing', False)),
                 occlusion_mode=getattr(pipe, 'occlusion_mode', 'off'),
                 exposure='base appearance; per-image exposure off',
-                metric='mean per-channel PSNR, then mean over selected frames; not all-frame evaluation',
+                metric='mean per-channel PSNR (ROI-only when frame.metric says ROI); not all-frame evaluation',
                 state_timing='end of training iteration')
             atomic_json(temporary / 'frames.json', snapshot)
             os.replace(temporary, folder)
@@ -242,7 +246,7 @@ function show(){
     if($('split').value!=='both'&&frame.split!==$('split').value)continue;
     const card=elem('section',undefined,'card'),head=elem('div',undefined,'title');
     head.append(elem('strong',frame.split+' · '+frame.name),elem('span',
-      (typeof frame.psnr_db==='number'?frame.psnr_db.toFixed(3):frame.psnr_db)+' dB · '+frame.pose,'meta'));
+      (typeof frame.psnr_db==='number'?frame.psnr_db.toFixed(3):frame.psnr_db)+' dB · '+(frame.metric||'PSNR')+' · '+frame.pose,'meta'));
     const images=elem('div',undefined,'images');
     for(const [key,label] of [['gt','Actual image'],['render','Rendered image'],['error','Absolute error ×4']]){
       const f=elem('figure'),link=elem('a'),im=elem('img');link.href=frame[key];link.target='_blank';link.rel='noopener';

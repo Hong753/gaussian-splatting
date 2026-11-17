@@ -128,7 +128,8 @@ def main():
     pipeline = SimpleNamespace(convert_SHs_python=False, compute_cov3D_python=False,
                                debug=False, antialiasing=args.antialiasing)
     configure_pipeline(pipeline, cfg)
-    camera_args = SimpleNamespace(resolution=cfg.get("resolution", -1), data_device="cpu", train_test_exp=False)
+    camera_args = SimpleNamespace(resolution=cfg.get("resolution", -1), data_device="cpu", train_test_exp=False,
+                                  loss_mask_dir=cfg.get('loss_mask_dir',''))
     color = [1, 1, 1] if cfg.get("white_background", False) else [0, 0, 0]
     background = torch.tensor(color, dtype=torch.float32, device="cuda")
     output = metric_directory(model, iteration, spec.get("render_variant", ""))
@@ -158,7 +159,11 @@ def main():
                     culled_sum += culled_fraction
                     culled_views += 1
             target = camera.original_image.to("cuda").clamp(0, 1)
-            value = psnr(pred, target).mean().item()
+            if getattr(camera, 'loss_mask', None) is not None:
+                from utils.region_loss import score
+                value = score(pred, target, camera.loss_mask).item()
+            else:
+                value = psnr(pred, target).mean().item()
             is_selected = (info.image_name in selected) if selected is not None else None
             writer.writerow([info.image_name, "" if is_selected is None else int(is_selected), value, culled_fraction])
             sums["all"] += value
@@ -182,6 +187,10 @@ def main():
                "counts": counts, "mean_psnr_db": means}
     summary['metric'] = 'mean per-channel PSNR, then arithmetic mean over images'
     summary['coverage'] = 'all original registered COLMAP frames'
+    if cfg.get('loss_mask_dir'):
+        summary['metric'] = 'ROI-only per-channel PSNR, then arithmetic mean over images'
+        summary['coverage'] = 'all registered frames in the regional export, not all frames of the original full scene'
+        summary['loss_mask_dir'] = cfg['loss_mask_dir']
     summary['camera_poses']=spec['camera_poses']
     summary['pose_protocol']=pose_options.protocol(spec)
     if pose_cache is not None:
