@@ -261,6 +261,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
+        if len(gaussians.get_xyz)==0:
+            raise RuntimeError(f'Iteration {iteration}: the entire Gaussian model is empty. '
+                'Training cannot continue; inspect densification.jsonl or pruning_failure.json. '
+                'This is not a camera-frustum visibility result.')
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -441,7 +445,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 tb_writer.add_scalar("train/position_lr", position_lr, iteration)
 
             if iteration % 10 == 0:
-                progress = {"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"}
+                progress = {"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}",
+                            "Gaussians": f"{len(gaussians.get_xyz):,}"}
                 if scale_stats is not None:
                     progress['scale reg'] = f"{scale_stats['scale_regularization_loss']:.3g}"
                 if opt.lidar_depth_weight > 0:
@@ -459,7 +464,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     progress['surface match'] = f'{100*surface_match_fraction:.1f}%'
                 if soft_stats is not None:
                     progress['surface alpha'] = f"{soft_stats['surface_opacity_mean'].item():.3f}"
-                    progress['Gaussians'] = f'{len(gaussians.get_xyz):,}'
                 progress_bar.set_postfix(progress)
                 progress_bar.update(10)
             if iteration == opt.iterations:
@@ -496,14 +500,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.add_densification_stats(viewspace_point_tensor, growth_filter)
 
                 if phase_iteration > opt.densify_from_iter and phase_iteration % opt.densification_interval == 0:
-                    from utils.densification_policy import size_pruning_thresholds
+                    from utils.densification_policy import size_pruning_thresholds, PruningWouldEmptyScene
                     size_threshold, world_threshold = size_pruning_thresholds(opt, phase_iteration, scene.cameras_extent)
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent,
+                    try:
+                        gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent,
                                                 size_threshold, radii,
                                                 max_grad_abs=opt.absgs_split_threshold if opt.absgs else None,
                                                 record_stats=True, prune=not getattr(opt, 'disable_pruning', False),
                                                 max_world_size=world_threshold,
-                                                preserve_radii=getattr(opt, 'preserve_densification_radii', False))
+                                                preserve_radii=getattr(opt, 'preserve_densification_radii', False),
+                                                protect_nonempty=True)
+                    except PruningWouldEmptyScene as exc:
+                        from pathlib import Path
+                        from utils.checkpoint_snapshots import atomic_json, atomic_write
+                        rescue=Path(scene.model_path)/'pruning_recovery.pth'
+                        report=dict(iteration=iteration,image=viewpoint_cam.image_name,
+                            gaussians_retained=len(gaussians.get_xyz),**exc.report,
+                            state_timing='before rejected pruning and optimizer step; not a completed evaluation snapshot',
+                            recovery_checkpoint=str(rescue))
+                        atomic_json(Path(scene.model_path)/'pruning_failure.json',report)
+                        atomic_write(rescue,lambda path:torch.save((gaussians.capture(),iteration-1),path))
+                        raise RuntimeError(f'{exc} Details: {scene.model_path}/pruning_failure.json; '
+                                           f'nonempty recovery state: {rescue}') from exc
                     if opt.surface_mode != 'view_tangent':
                         import json
                         growth_stats = dict(iteration=iteration, image=viewpoint_cam.image_name,

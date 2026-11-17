@@ -1,5 +1,51 @@
 # Regional blur ablation
 
+## Empty-population crash and fresh retry
+
+The native rasterizer error `got [0, 0, 3] ... expected [0, 16, 3]` means
+zero Gaussian rows reached its SH backward. With culling disabled, an invisible
+view still passes the full nonempty model and returns zero visibility/radii;
+it does not remove the model's rows. Inspect the failed run's actual history:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh && conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting && git pull --ff-only &&
+python scripts/audit_pruning.py --model \
+  /data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/regions/wall_06663_v1/runs/stride3_fullimage_fixed_lidar_native_lr_resets_v1
+```
+
+The frozen-XYZ path previously skipped the native clone/split bookkeeping that
+clears projected-radius history before size pruning. That accidentally retained
+a lifetime maximum across views. It now follows native reset behavior unless
+`preserve_densification_radii` is explicitly requested. Opacity resets, opacity
+pruning, world-size pruning and learning rates are unchanged. This fixes a code
+discrepancy; the old log may identify the population collapse but cannot recover
+pruning-reason counts that were not recorded.
+
+New pruning events record separate opacity, screen and world-size candidate
+counts (which can overlap). Native training rejects an event that would delete
+the entire model and writes `pruning_failure.json` plus `pruning_recovery.pth`
+before stopping. The recovery state precedes that iteration's optimizer step
+and is not published as a completed evaluation snapshot. An empty render also
+has shape-correct zero gradients instead of entering the native CUDA backward.
+Every training progress bar now shows `Gaussians` immediately after `Depth Loss`.
+
+Restart in a fresh directory; the failed run and its diagnostics are retained:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh && conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting && git pull --ff-only &&
+bash scripts/run_region_full_image.sh 0 \
+  /data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/regions/wall_06663_v1 v2 \
+  /data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/regions/wall_06663_v1/runs/stride3_fullimage_fixed_lidar_native_lr_resets_v1
+```
+
+This uses the unmasked regional stride-3 protocol below. CUDA startup checks
+separately exercise a globally empty cloud and a nonempty cloud outside the
+camera, fixed-position radius bookkeeping, and rejection of last-row pruning.
+For previews, use the viewer command below with the model suffix `v2` and an
+unused port, e.g. `8097`.
+
 ## GPU 0 restart: unmasked images, regional stride 3, original LRs and resets
 
 This is a fresh 30k run on the already exported original-pose region. It uses

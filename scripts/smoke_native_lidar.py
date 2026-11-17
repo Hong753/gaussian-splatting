@@ -11,6 +11,34 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
+def check_empty_rendering(render, device='cuda'):
+    """A globally empty model differs from a nonempty, invisible camera view."""
+    import torch
+    from utils.graphics_utils import getProjectionMatrix
+    camera=SimpleNamespace(image_width=8,image_height=8,FoVx=math.pi/2,FoVy=math.pi/2,
+        world_view_transform=torch.eye(4,device=device),
+        full_proj_transform=getProjectionMatrix(.01,100.,math.pi/2,math.pi/2).to(device).T,
+        camera_center=torch.zeros(3,device=device))
+    pipe=SimpleNamespace(compute_cov3D_python=False,convert_SHs_python=False,antialiasing=True,
+                         debug=True,occlusion_mode='off')
+    for n in (0,2):
+        xyz=torch.tensor([[0.,0.,-2.]]*n,device=device).reshape(n,3).requires_grad_()
+        values=dict(get_xyz=xyz,get_features=torch.zeros(n,16,3,device=device,requires_grad=True),
+            get_opacity=torch.full((n,1),.1,device=device,requires_grad=True),
+            get_scaling=torch.full((n,3),.01,device=device,requires_grad=True),
+            get_rotation=torch.tensor([[1.,0.,0.,0.]]*n,device=device).reshape(n,4).requires_grad_())
+        pc=SimpleNamespace(**values,active_sh_degree=3,max_sh_degree=3)
+        bg=torch.tensor([.1,.2,.3],device=device)
+        output=render(camera,pc,pipe,bg)
+        assert output['radii'].shape==(n,) and not output['radii'].any()
+        torch.testing.assert_close(output['render'],bg[:,None,None].expand(3,8,8))
+        output['render'].sum().backward()
+        for value in values.values():
+            assert value.grad is not None and value.grad.shape==value.shape
+            assert torch.isfinite(value.grad).all() and not value.grad.any()
+    return dict(empty_cloud_sh_backward=True,nonempty_invisible_view_backward=True)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--gpu', default='1')
@@ -42,6 +70,7 @@ def main(argv=None):
     from utils.graphics_utils import BasicPointCloud, getProjectionMatrix
     if not torch.cuda.is_available():
         raise RuntimeError('Native LiDAR smoke requires the CUDA-enabled 3dgs environment')
+    empty_checks=check_empty_rendering(render)
     opt_parser = argparse.ArgumentParser()
     params = OptimizationParams(opt_parser)
     opt = params.extract(opt_parser.parse_args(['--scale_control', 'off',
@@ -130,12 +159,30 @@ def main(argv=None):
             restored.optimizer.zero_grad(set_to_none=True)
             restored._opacity.sum().backward();restored.optimizer.step()
             assert torch.isfinite(restored.get_opacity).all() and not restored._xyz.requires_grad
+        with torch.no_grad():
+            from utils.densification_policy import PruningWouldEmptyScene
+            restored._scaling[:]=math.log(.001)
+            restored._opacity[:]=0
+            restored.max_radii2D[:]=100
+            before=restored.get_xyz.clone()
+            restored.densify_and_prune(.0002,.005,1.,20,torch.ones(2,device='cuda'),
+                record_stats=True,protect_nonempty=True)
+            assert torch.equal(before,restored.get_xyz) and not restored.max_radii2D.any()
+            restored._opacity[:]=-20
+            try:
+                restored.densify_and_prune(.0002,.005,1.,20,torch.ones(2,device='cuda'),
+                    record_stats=True,protect_nonempty=True)
+            except PruningWouldEmptyScene as exc:
+                assert exc.report['prune_opacity_candidates']==2
+                assert torch.equal(before,restored.get_xyz)
+            else: raise AssertionError('Pruning deleted the entire fixed cloud')
         result = dict(passed=True, cuda_device=torch.cuda.get_device_name(), torch=torch.__version__,
             native_aa_rgb_gradients=True, fixed_centers=True, appearance_updated=True,
             opacity_and_world_pruning=True, no_cloning_or_splitting=True,
             checkpoint_round_trip=True, scaling_lr=opt.scaling_lr)
         result['learning_rates']=expected_rates
         result['opacity_reset_checked']=args.opacity_resets
+        result.update(empty_checks,frozen_radius_reset_matches_native=True,empty_pruning_rejected=True)
         if args.region_loss:
             result['regional_rgb_loss_gradients_zero_outside_mask']=True
         if args.output:
@@ -211,6 +258,7 @@ def main(argv=None):
         position_lr_divisor=args.position_lr_divisor, scaling_lr=opt.scaling_lr,
         radius_history_regression_checked=args.preserve_densification_radii,
         checkpoint_round_trip=True)
+    result.update(empty_checks)
     if args.output:
         from utils.checkpoint_snapshots import atomic_json
         atomic_json(args.output, result)

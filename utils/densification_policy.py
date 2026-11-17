@@ -1,6 +1,16 @@
 """Independent opacity-reset switch for runs with native densification."""
 
 
+class PruningWouldEmptyScene(RuntimeError):
+    """Reject a destructive pruning transaction before replacing parameters."""
+    def __init__(self,report):
+        self.report=dict(report)
+        super().__init__(f"Pruning would delete all {report['prune_candidates']:,} Gaussians "
+            f"(opacity={report['prune_opacity_candidates']:,}, "
+            f"screen={report['prune_screen_candidates']:,}, world={report['prune_world_candidates']:,}; "
+            "counts can overlap). Deletion was rejected; this is a scene-population collapse, not an empty viewpoint.")
+
+
 def opacity_reset_due(opt, phase_iteration, white_background=False, soft_surface=False):
     # Called inside the active native densification phase by train.py.
     if getattr(opt, 'disable_opacity_resets', False) or soft_surface:

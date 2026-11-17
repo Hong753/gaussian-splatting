@@ -728,7 +728,8 @@ class GaussianModel:
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_surface_refs, new_max)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, max_grad_abs=None,
-                         record_stats=False, prune=True, max_world_size=None, preserve_radii=False):
+                         record_stats=False, prune=True, max_world_size=None, preserve_radii=False,
+                         protect_nonempty=False):
         if self.surface_mode == 'view_tangent':
             if not prune:
                 raise ValueError('Disabling pruning is currently supported only for native densification')
@@ -756,22 +757,40 @@ class GaussianModel:
             self.densify_and_split(split_grads, split_threshold, extent, preserve_radii=preserve_radii)
         if record_stats: after_split = len(self._xyz)
 
+        if self.freeze_lidar_positions and not preserve_radii:
+            # Native clone/split calls densification_postfix even when no rows
+            # are added; that resets max_radii2D BEFORE size pruning. Skipping
+            # growth must not accidentally turn it into a lifetime maximum.
+            # Explicit preserve_radii=True retains the window through pruning.
+            self.max_radii2D.zero_()
+
         # Split parents are replaced by their children above. This switch only
         # disables deleting geometry for low opacity or a large footprint/scale.
         if prune:
-            prune_mask = (self.get_opacity < min_opacity).squeeze(-1)
+            opacity_mask = (self.get_opacity < min_opacity).squeeze(-1)
+            screen_mask = torch.zeros_like(opacity_mask)
             if max_screen_size:
-                big_points_vs = self.max_radii2D > max_screen_size
-                prune_mask = torch.logical_or(prune_mask, big_points_vs)
+                screen_mask = self.max_radii2D > max_screen_size
             # None preserves legacy callers' coupled world/screen activation.
             # An explicit zero disables world-size pruning independently.
             world_limit = max_world_size if max_world_size is not None else (0.1 * extent if max_screen_size else 0.)
-            if record_stats and preserve_radii:
-                stats.update(prune_opacity_threshold=float(min_opacity),
-                             prune_screen_radius=float(max_screen_size or 0.),
-                             prune_world_sigma=float(world_limit), radius_history_preserved=True)
+            world_mask = torch.zeros_like(opacity_mask)
             if world_limit > 0:
-                prune_mask = torch.logical_or(prune_mask, self.get_scaling.max(dim=1).values > world_limit)
+                world_mask = self.get_scaling.max(dim=1).values > world_limit
+            prune_mask = opacity_mask | screen_mask | world_mask
+            if record_stats or protect_nonempty:
+                reasons=dict(prune_opacity_threshold=float(min_opacity),
+                    prune_screen_radius=float(max_screen_size or 0.),prune_world_sigma=float(world_limit),
+                    radius_history_preserved=bool(preserve_radii),
+                    prune_opacity_candidates=int(opacity_mask.sum()),
+                    prune_screen_candidates=int(screen_mask.sum()),
+                    prune_world_candidates=int(world_mask.sum()),prune_candidates=int(prune_mask.sum()),
+                    prune_population=len(prune_mask))
+                if record_stats: stats.update(reasons)
+                if protect_nonempty and len(prune_mask)>0 and reasons['prune_candidates']==len(prune_mask):
+                    from utils.densification_policy import PruningWouldEmptyScene
+                    self.tmp_radii=None
+                    raise PruningWouldEmptyScene(reasons)
             self.prune_points(prune_mask)
         if record_stats:
             if self.freeze_lidar_positions:

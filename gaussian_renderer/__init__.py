@@ -137,13 +137,21 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         if separate_sh:
             dc = selected(dc)
 
-    # Handle a fully culled view without passing an empty batch to CUDA. The
-    # zero link preserves backward and zero screen gradients for densification.
-    if occlusion_keep is not None and len(means3D) == 0:
+    # An empty model or fully culled subset must not enter the native CUDA
+    # backward, which can lose the SH coefficient dimension for N=0. Keep
+    # exact-shaped zero gradients for every supplied differentiable input.
+    if len(means3D) == 0:
         zero = means3D.sum()*0 + means2D.sum()*0 + opacity.sum()*0
+        for value in (shs, dc, colors_precomp, scales, rotations, cov3D_precomp):
+            if value is not None:
+                zero = zero + value.sum()*0
         rendered_image = bg_color[:, None, None].expand(3, int(viewpoint_camera.image_height), int(viewpoint_camera.image_width)) + zero
         depth_image = rendered_image[:1]*0
         radii = torch.zeros(0, dtype=torch.int32, device=pc.get_xyz.device)
+        if ray_mode:
+            fragment_flags = torch.zeros_like(radii)
+            raster_radii = radii
+            occlusion_keep = torch.zeros(0,dtype=torch.bool,device=pc.get_xyz.device)
     elif separate_sh:
         rendered_image, radii, depth_image = rasterizer(
             means3D = means3D,
