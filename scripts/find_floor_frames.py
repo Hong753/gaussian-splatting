@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import shlex
 import sys
+from time import monotonic
 
 import cv2
 import numpy as np
@@ -44,9 +45,22 @@ def best_window(gray, mask):
     return best
 
 
+def progress_rows(rows, phase):
+    total = len(rows)
+    start = last_update = monotonic()
+    print(f"{phase} 0/{total}, starting with {rows[0]['name']}", flush=True)
+    for count, row in enumerate(rows, 1):
+        yield row
+        now = monotonic()
+        if count in (1, total) or now - last_update >= 2:
+            print(f"{phase} {count}/{total} ({count / total:.0%}) in {now - start:.1f}s, "
+                  f"latest {row['name']}", flush=True)
+            last_update = now
+
+
 def ranked_frames(region, selection):
     ranked = []
-    for row in selection:
+    for row in progress_rows(selection, "Scoring frames"):
         name = row["name"]
         path = image_path(region, "images", name)
         with Image.open(path) as raw:
@@ -219,7 +233,7 @@ def main(argv=None):
         rows = rows[:args.limit]
     images = output / "frames"
     images.mkdir(parents=True)
-    for index, row in enumerate(rows):
+    for index, row in enumerate(progress_rows(rows, "Writing previews")):
         with Image.open(image_path(region, "images", row["name"])) as raw:
             preview = raw.convert("RGB")
             preview.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
@@ -242,7 +256,7 @@ def main(argv=None):
     for row in rows[:8]:
         roi = " ".join(map(str, row["roi"])) if row["roi"] else "draw a crop"
         print(f"{row['name']:>18}  {row['split']:>5}  {roi}")
-    print(f"{len(rows)}/{len(selection)} images in {output / 'index.html'}")
+    print(f"Gallery ready. {len(rows)}/{len(selection)} images in {output / 'index.html'}", flush=True)
     return 0
 
 
