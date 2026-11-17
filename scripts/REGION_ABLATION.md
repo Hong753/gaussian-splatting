@@ -1,5 +1,68 @@
 # Regional blur ablation
 
+## GPU 0 restart: unmasked images, regional stride 3, original LRs and resets
+
+This is a fresh 30k run on the already exported original-pose region. It uses
+every pixel for native L1 + SSIM and full-image PSNR; ROI masks and dimmed
+overlays are not loaded for training, scoring, previews or evaluation. RGB files,
+camera poses, the regional LiDAR crop+halo and old selection manifests are not
+modified. Original poses remain fixed, and AA stays enabled as in the base.
+
+Training keyframes are reselected **within all region-selected images**, using
+the existing sharpest-of-three scorer: natural filename order, consecutive
+groups of three, maximum full-resolution grayscale Laplacian variance, including
+the final incomplete group. This does not apply another stride to the old
+training keyframes. For the 4,039-image export it gives 1,347 train and 2,692
+held-out frames. All 4,039 are evaluated with their new membership. The original
+global keyframe split remains available for the older experiments.
+
+The original documented 3DGS learning rates are set explicitly: SH DC 0.0025,
+higher SH 0.000125, opacity **0.05** (not the newer fork default 0.025), scale
+**0.005** (not the earlier regional 0.001), rotation 0.001. XYZ LR is zero and
+the XYZ tensor is frozen. Cloning/splitting is disabled to keep surviving
+centers at their initial measured LiDAR coordinates; native opacity/size
+pruning stays active every 100 steps after 500 and before 15k. Native opacity
+resets cap alpha at 0.01 at steps **3k, 6k, 9k and 12k**; resets do not continue
+after the 15k active phase. No culling, extra geometry prior, scale cap or scale
+regularizer is enabled. This remains a fixed-XYZ + AA ablation, not an unchanged
+run of every original 3DGS feature.
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_region_full_image.sh 0 \
+  /data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/regions/wall_06663_v1
+```
+
+The script first scores the regional RGB images and prepares the fresh plan.
+It then stops **only** `$REGION/runs/crop_v2` through the existing model/GPU/PID
+checks, if that model's plan exists, retaining its checkpoints and reports.
+An unrelated process on the GPU is not stopped. An absent previous plan does
+not prevent a fresh launch. Optional arguments after REGION are a fresh
+VERSION and an explicit PREVIOUS_MODEL to replace a different known run.
+
+Output: `$REGION/runs/stride3_fullimage_fixed_lidar_native_lr_resets_v1`.
+Its `keyframes.json` contains the actual scores/groups, and
+`region_full_image.json` records the protocol. Native CUDA startup checks cover
+fixed centers, pruning, optimizer rates and the real opacity-reset state path.
+Checkpoints and the independent full-image evaluator run every 10k; train and
+held-out GT/render/error previews run at step 1, every 500, and the final step.
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh && conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+python scripts/serve_training_previews.py \
+  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/regions/wall_06663_v1/runs/stride3_fullimage_fixed_lidar_native_lr_resets_v1 \
+  --port 8096
+```
+
+Open `http://211.172.247.108:8096` after the first preview is saved. Full-image
+PSNR is not directly comparable to old ROI PSNR. The unchanged regional cloud
+may not cover every surface outside the crop that is visible in the full RGB
+images; removing masks cannot supply that missing initialization geometry.
+
 ## Headless SuperPoint + SuperGlue with sequential overlap (GPU 1)
 
 For the video sequence, use SuperPoint features and the official indoor

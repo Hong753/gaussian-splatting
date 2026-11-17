@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Native 3DGS + AA from LiDAR, with reduced XYZ LR and native densification.
 
-Scales are unconstrained. Opacity resets stay disabled; native pruning is optional.
+Scales are unconstrained. Native pruning and opacity resets are explicit options.
 """
 import math
 import json
@@ -22,9 +22,11 @@ def parser():
     p.add_argument('--freeze-lidar-positions', action='store_true',
                    help='Freeze original XYZ and disable cloning/splitting while retaining optional pruning')
     p.add_argument('--pruning', action='store_true', help='Enable native opacity/size pruning during densification')
+    p.add_argument('--opacity-resets', action='store_true',
+                   help='Enable native 3000-step opacity resets during the active densification/pruning phase')
     p.add_argument('--percent-dense', type=float, default=None,
                    help='Clone/split sigma boundary as a fraction of scene extent (native default: 0.01)')
-    for name in ('scaling-lr', 'densify-grad-threshold', 'prune-world-scale-ratio', 'prune-screen-size'):
+    for name in ('feature-lr', 'opacity-lr', 'rotation-lr', 'scaling-lr', 'densify-grad-threshold', 'prune-world-scale-ratio', 'prune-screen-size'):
         p.add_argument('--'+name, type=float, default=None)
     for name in ('densify-from-iter', 'densify-until-iter', 'densification-interval', 'prune-size-from-iter'):
         p.add_argument('--'+name, type=int, default=None)
@@ -45,10 +47,10 @@ def build_plan(args):
         raise ValueError('Position LR divisor must be finite and >= 1')
     if args.scale_control != 'off' or args.distance_weighting or args.local_scale_cache:
         raise ValueError('This ablation requires unconstrained scales and no distance/local-scale policies')
-    for name in ('scaling_lr', 'densify_grad_threshold', 'prune_world_scale_ratio', 'prune_screen_size'):
+    for name in ('feature_lr', 'opacity_lr', 'rotation_lr', 'scaling_lr', 'densify_grad_threshold', 'prune_world_scale_ratio', 'prune_screen_size'):
         value = getattr(args, name, None)
         if value is not None and (not math.isfinite(value) or value < 0 or
-                (name in ('scaling_lr', 'densify_grad_threshold') and value == 0)):
+                (name in ('feature_lr', 'opacity_lr', 'rotation_lr', 'scaling_lr', 'densify_grad_threshold') and value == 0)):
             raise ValueError(f'Invalid {name}: {value}')
     for name in ('densify_from_iter', 'densify_until_iter', 'densification_interval', 'prune_size_from_iter'):
         value = getattr(args, name, None)
@@ -71,8 +73,10 @@ def build_plan(args):
     for name, value in (('--position_lr_init', initial), ('--position_lr_final', final),
                         ('--densify_until_iter', 15000)):
         command[command.index(name)+1] = str(value)
+    resets = bool(getattr(args, 'opacity_resets', False))
     command += ['--position_lr_max_steps', str(args.iterations),
-        '--disable_opacity_resets', *([] if pruning else ['--disable_pruning']),
+        *(['--opacity_reset_interval', '3000'] if resets else ['--disable_opacity_resets']),
+        *([] if pruning else ['--disable_pruning']),
         '--densify_from_iter', '500', '--densification_interval', '100',
         '--densify_grad_threshold', '0.0002']
     for name in ('max_scale_ratio', 'max_scale_world'):
@@ -94,11 +98,16 @@ def build_plan(args):
         if value is not None:
             command[command.index('--'+field)+1] = str(value)
             plan['densification'][key] = value
-    for field in ('scaling_lr', 'prune_world_scale_ratio', 'prune_screen_size', 'prune_size_from_iter'):
+    for field in ('feature_lr', 'opacity_lr', 'rotation_lr', 'scaling_lr', 'prune_world_scale_ratio', 'prune_screen_size', 'prune_size_from_iter'):
         value = getattr(args, field, None)
         if value is not None:
             command += ['--'+field, str(value)]
             plan[field] = value
+    if resets:
+        plan['opacity_resets'] = True
+        plan['opacity_reset_schedule'] = dict(interval=3000,
+            active_until_exclusive=plan['densification']['until'],
+            steps=list(range(3000,min(args.iterations+1,plan['densification']['until']),3000)))
     if getattr(args, 'preserve_densification_radii', False):
         command.append('--preserve_densification_radii')
         plan['preserve_densification_radii'] = True
@@ -151,6 +160,9 @@ def execute_plan(args, plan):
         smoke.append('--freeze-lidar-positions')
     if getattr(args,'loss_mask_dir',None):
         smoke.append('--region-loss')
+    for field in ('feature_lr', 'opacity_lr', 'rotation_lr'):
+        if field in plan: smoke += ['--'+field.replace('_','-'),str(plan[field])]
+    if plan['opacity_resets']: smoke.append('--opacity-resets')
     invoke(smoke)
     if plan.get('lidar_scp'):
         invoke(['scripts/smoke_lidar_scp.py','--gpu',args.gpu,

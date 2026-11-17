@@ -18,6 +18,10 @@ def main(argv=None):
     p.add_argument('--percent-dense', type=float, default=.01)
     p.add_argument('--position-lr-divisor', type=float, default=50.)
     p.add_argument('--scaling-lr', type=float, default=.005)
+    p.add_argument('--feature-lr', type=float, default=.0025)
+    p.add_argument('--opacity-lr', type=float, default=.025)
+    p.add_argument('--rotation-lr', type=float, default=.001)
+    p.add_argument('--opacity-resets', action='store_true')
     p.add_argument('--iterations', type=int, default=30000)
     p.add_argument('--preserve-densification-radii', action='store_true')
     p.add_argument('--freeze-lidar-positions', action='store_true')
@@ -44,8 +48,11 @@ def main(argv=None):
         '--position_lr_init', str(.00016/args.position_lr_divisor),
         '--position_lr_final', str(.0000016/args.position_lr_divisor),
         '--scaling_lr', str(args.scaling_lr), '--iterations', str(args.iterations),
+        '--feature_lr',str(args.feature_lr),'--opacity_lr',str(args.opacity_lr),
+        '--rotation_lr',str(args.rotation_lr),
         '--position_lr_max_steps', str(args.iterations),
-        '--disable_opacity_resets', '--disable_pruning', '--percent_dense', str(args.percent_dense),
+        *([] if args.opacity_resets else ['--disable_opacity_resets']),
+        '--disable_pruning', '--percent_dense', str(args.percent_dense),
         *(['--freeze_lidar_positions'] if args.freeze_lidar_positions else [])]))
     cloud = BasicPointCloud(points=np.array([[-.15,-.1,2],[.15,-.1,2],[-.15,.1,2],[.15,.1,2]], np.float32),
         colors=np.array([[.7,.2,.1],[.2,.6,.2],[.2,.3,.8],[.8,.7,.2]], np.float32),
@@ -53,6 +60,11 @@ def main(argv=None):
     model = GaussianModel(0)
     model.create_from_pcd(cloud, [SimpleNamespace(image_name='smoke')], 100.)
     model.training_setup(opt)
+    expected_rates=dict(xyz=0. if args.freeze_lidar_positions else opt.position_lr_init*100.,
+        f_dc=opt.feature_lr,f_rest=opt.feature_lr/20,opacity=opt.opacity_lr,
+        scaling=opt.scaling_lr,rotation=opt.rotation_lr)
+    for group in model.optimizer.param_groups:
+        assert math.isclose(group['lr'],expected_rates[group['name']])
     original = model.get_xyz.detach().clone()
     original_color = model._features_dc.detach().clone()
     camera = SimpleNamespace(image_width=48, image_height=48, FoVx=math.pi/2, FoVy=math.pi/2,
@@ -108,10 +120,22 @@ def main(argv=None):
         restored.optimizer.step()
         assert not restored._xyz.requires_grad and restored._xyz not in restored.optimizer.state
         assert torch.equal(restored.get_xyz, original[2:])
+        if args.opacity_resets:
+            # Exercise the actual parameter replacement and Adam state path.
+            from utils.densification_policy import opacity_reset_due
+            assert [i for i in range(1,15000) if opacity_reset_due(opt,i)]==[3000,6000,9000,12000]
+            restored.reset_opacity()
+            assert (restored.get_opacity <= .010001).all()
+            assert torch.equal(restored.get_xyz, original[2:])
+            restored.optimizer.zero_grad(set_to_none=True)
+            restored._opacity.sum().backward();restored.optimizer.step()
+            assert torch.isfinite(restored.get_opacity).all() and not restored._xyz.requires_grad
         result = dict(passed=True, cuda_device=torch.cuda.get_device_name(), torch=torch.__version__,
             native_aa_rgb_gradients=True, fixed_centers=True, appearance_updated=True,
             opacity_and_world_pruning=True, no_cloning_or_splitting=True,
             checkpoint_round_trip=True, scaling_lr=opt.scaling_lr)
+        result['learning_rates']=expected_rates
+        result['opacity_reset_checked']=args.opacity_resets
         if args.region_loss:
             result['regional_rgb_loss_gradients_zero_outside_mask']=True
         if args.output:
