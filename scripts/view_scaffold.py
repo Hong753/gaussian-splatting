@@ -216,6 +216,7 @@ class Viewer:
             ply, root, cfg = model_paths(selected)
             cameras = first_camera(root / "cameras.json")
             self.status.content = f"Loading `{ply}` on the GPU…"
+            self.antialiasing.value = bool(cfg.get('antialiasing', True))
             with self.model_lock:
                 if self.backend is not None:
                     self.backend.close()

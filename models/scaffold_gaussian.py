@@ -10,7 +10,6 @@
 #
 
 import torch
-from functools import reduce
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func
 from torch import nn
@@ -20,6 +19,7 @@ from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+from utils.scaffold_growth import candidate_offsets, new_voxel_mask
 
     
 class ScaffoldGaussianModel:
@@ -90,6 +90,8 @@ class ScaffoldGaussianModel:
         self.anchor_demon = torch.empty(0)
                 
         self.optimizer = None
+        self.freeze_anchors = False
+        self.disable_anchor_growth = False
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
@@ -146,10 +148,41 @@ class ScaffoldGaussianModel:
             self.mlp_feature_bank.train()
 
     def capture(self):
-        raise NotImplementedError("Scaffold training resume checkpoints are not supported yet; saved anchors and MLPs are for rendering")
+        attributes = ('_anchor', '_offset', '_anchor_feat', '_scaling', '_rotation', '_opacity', '_exposure',
+                      'opacity_accum', 'offset_gradient_accum', 'offset_denom', 'anchor_demon', 'max_radii2D')
+        modules = ['mlp_opacity', 'mlp_cov', 'mlp_color']
+        if self.use_feat_bank: modules.append('mlp_feature_bank')
+        if self.appearance_dim: modules.append('embedding_appearance')
+        return dict(schema=1, model_type='scaffold', tensors={k: getattr(self, k).detach() for k in attributes},
+                    modules={k: getattr(self, k).state_dict() for k in modules},
+                    optimizer=self.optimizer.state_dict(), exposure_optimizer=self.exposure_optimizer.state_dict(),
+                    spatial_lr_scale=self.spatial_lr_scale, voxel_size=self.voxel_size,
+                    exposure_mapping=self.exposure_mapping, freeze_anchors=self.freeze_anchors,
+                    disable_anchor_growth=self.disable_anchor_growth,
+                    training_state=getattr(self, 'training_state', None))
 
     def restore(self, model_args, training_args):
-        raise NotImplementedError("Scaffold training resume checkpoints are not supported yet")
+        if model_args.get('schema') != 1 or model_args.get('model_type') != 'scaffold':
+            raise ValueError('Not a Scaffold optimizer checkpoint')
+        for name in ('freeze_anchors', 'disable_anchor_growth'):
+            if model_args[name] != getattr(training_args, name, False):
+                raise ValueError(f'Checkpoint geometry policy changed: {name}')
+        device = next(self.mlp_color.parameters()).device
+        for name, value in model_args['tensors'].items():
+            if name.startswith('_'):
+                setattr(self, name, nn.Parameter(value.to(device)))
+        self.spatial_lr_scale = model_args['spatial_lr_scale']
+        self.voxel_size = model_args['voxel_size']
+        self.exposure_mapping = model_args['exposure_mapping']
+        for name, state in model_args['modules'].items():
+            getattr(self, name).load_state_dict(state)
+        self.training_setup(training_args)
+        for name, value in model_args['tensors'].items():
+            if not name.startswith('_'):
+                setattr(self, name, value.to(device))
+        self.optimizer.load_state_dict(model_args['optimizer'])
+        self.exposure_optimizer.load_state_dict(model_args['exposure_optimizer'])
+        self.training_state = model_args['training_state']
 
     def set_appearance(self, num_cameras):
         if self.appearance_dim > 0:
@@ -205,7 +238,7 @@ class ScaffoldGaussianModel:
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
     
     def voxelize_sample(self, data=None, voxel_size=0.01):
-        np.random.shuffle(data)
+        # np.unique is deterministic and sorted; never mutate the shared LiDAR array.
         data = np.unique(np.round(data/voxel_size), axis=0)*voxel_size
         
         return data
@@ -254,6 +287,9 @@ class ScaffoldGaussianModel:
 
 
     def training_setup(self, training_args):
+        self.freeze_anchors = getattr(training_args, 'freeze_anchors', False)
+        self.disable_anchor_growth = getattr(training_args, 'disable_anchor_growth', False)
+        self._anchor.requires_grad_(not self.freeze_anchors)
         self.exposure_optimizer = torch.optim.Adam([self._exposure], lr=training_args.exposure_lr_init)
         self.exposure_scheduler_args = get_expon_lr_func(
             training_args.exposure_lr_init, training_args.exposure_lr_final,
@@ -355,7 +391,7 @@ class ScaffoldGaussianModel:
                 lr = self.offset_scheduler_args(iteration)
                 param_group['lr'] = lr
             if param_group["name"] == "anchor":
-                lr = self.anchor_scheduler_args(iteration)
+                lr = 0.0 if self.freeze_anchors else self.anchor_scheduler_args(iteration)
                 param_group['lr'] = lr
             if param_group["name"] == "mlp_opacity":
                 lr = self.mlp_opacity_scheduler_args(iteration)
@@ -401,8 +437,11 @@ class ScaffoldGaussianModel:
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(anchor.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((anchor, normals, offset, anchor_feat, opacities, scale, rotation), axis=1)
-        elements[:] = list(map(tuple, attributes))
+        # Avoid millions of Python tuples and another dense attribute matrix.
+        fields = iter(elements.dtype.names)
+        for array in (anchor, normals, offset, anchor_feat, opacities, scale, rotation):
+            for column in array.T:
+                elements[next(fields)] = column
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
 
@@ -563,6 +602,7 @@ class ScaffoldGaussianModel:
         optimizable_tensors = self._prune_anchor_optimizer(valid_points_mask)
 
         self._anchor = optimizable_tensors["anchor"]
+        self._anchor.requires_grad_(not self.freeze_anchors)
         self._offset = optimizable_tensors["offset"]
         self._anchor_feat = optimizable_tensors["anchor_feat"]
         self._opacity = optimizable_tensors["opacity"]
@@ -592,36 +632,21 @@ class ScaffoldGaussianModel:
             else:
                 candidate_mask = torch.cat([candidate_mask, torch.zeros(length_inc, dtype=torch.bool, device='cuda')], dim=0)
 
-            all_xyz = self.get_anchor.unsqueeze(dim=1) + self._offset * self.get_scaling[:,:3].unsqueeze(dim=1)
-            
             # assert self.update_init_factor // (self.update_hierachy_factor**i) > 0
             # size_factor = min(self.update_init_factor // (self.update_hierachy_factor**i), 1)
             size_factor = self.update_init_factor // (self.update_hierachy_factor**i)
             cur_size = self.voxel_size*size_factor
             
-            grid_coords = torch.round(self.get_anchor / cur_size).int()
-
-            selected_xyz = all_xyz.view([-1, 3])[candidate_mask]
-            selected_grid_coords = torch.round(selected_xyz / cur_size).int()
+            grid_coords = torch.round(self.get_anchor / cur_size).long()
+            selected_xyz, candidate_parents = candidate_offsets(self.get_anchor, self._offset, self.get_scaling, candidate_mask)
+            if not len(selected_xyz):
+                continue
+            selected_grid_coords = torch.round(selected_xyz / cur_size).long()
 
             selected_grid_coords_unique, inverse_indices = torch.unique(selected_grid_coords, return_inverse=True, dim=0)
 
 
-            ## split data for reducing peak memory calling
-            use_chunk = True
-            if use_chunk:
-                chunk_size = 4096
-                max_iters = grid_coords.shape[0] // chunk_size + (1 if grid_coords.shape[0] % chunk_size != 0 else 0)
-                remove_duplicates_list = []
-                for i in range(max_iters):
-                    cur_remove_duplicates = (selected_grid_coords_unique.unsqueeze(1) == grid_coords[i*chunk_size:(i+1)*chunk_size, :]).all(-1).any(-1).view(-1)
-                    remove_duplicates_list.append(cur_remove_duplicates)
-                
-                remove_duplicates = reduce(torch.logical_or, remove_duplicates_list)
-            else:
-                remove_duplicates = (selected_grid_coords_unique.unsqueeze(1) == grid_coords).all(-1).any(-1).view(-1)
-
-            remove_duplicates = ~remove_duplicates
+            remove_duplicates = new_voxel_mask(grid_coords, selected_grid_coords_unique)
             candidate_anchor = selected_grid_coords_unique[remove_duplicates]*cur_size
 
             
@@ -633,7 +658,7 @@ class ScaffoldGaussianModel:
 
                 new_opacities = inverse_sigmoid(0.1 * torch.ones((candidate_anchor.shape[0], 1), dtype=torch.float, device="cuda"))
 
-                new_feat = self._anchor_feat.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, self.feat_dim])[candidate_mask]
+                new_feat = self._anchor_feat[candidate_parents]
 
                 reduced_feat = new_feat.new_full((selected_grid_coords_unique.shape[0], new_feat.shape[1]), -float("inf"))
                 reduced_feat.scatter_reduce_(0, inverse_indices.unsqueeze(1).expand_as(new_feat), new_feat, reduce="amax", include_self=True)
@@ -663,6 +688,7 @@ class ScaffoldGaussianModel:
                 
                 optimizable_tensors = self.cat_tensors_to_optimizer(d)
                 self._anchor = optimizable_tensors["anchor"]
+                self._anchor.requires_grad_(not self.freeze_anchors)
                 self._scaling = optimizable_tensors["scaling"]
                 self._rotation = optimizable_tensors["rotation"]
                 self._anchor_feat = optimizable_tensors["anchor_feat"]
@@ -678,7 +704,8 @@ class ScaffoldGaussianModel:
         grads_norm = torch.norm(grads, dim=-1)
         offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
         
-        self.anchor_growing(grads_norm, grad_threshold, offset_mask)
+        if not self.disable_anchor_growth:
+            self.anchor_growing(grads_norm, grad_threshold, offset_mask)
         
         # update offset_denom
         self.offset_denom[offset_mask] = 0
@@ -697,6 +724,8 @@ class ScaffoldGaussianModel:
         prune_mask = (self.opacity_accum < min_opacity*self.anchor_demon).squeeze(dim=1)
         anchors_mask = (self.anchor_demon > check_interval*success_threshold).squeeze(dim=1) # [N, 1]
         prune_mask = torch.logical_and(prune_mask, anchors_mask) # [N] 
+        if prune_mask.all():
+            raise RuntimeError('Scaffold pruning would remove every anchor; inspect opacity/coverage before continuing')
         
         # update offset_denom
         offset_denom = self.offset_denom.view([-1, self.n_offsets])[~prune_mask]

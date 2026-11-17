@@ -1,4 +1,81 @@
-# orange4f: four shared-input runs, AA off
+# orange4f: shared-input runs, AA off
+
+## Scaffold-GS: two additional runs
+
+These extend an existing prepared suite without modifying the first four runs,
+their inputs or their manifests. The launchers prepare the shared suite if needed.
+Use two terminals:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd ~/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_orange4f_scaffold.sh 4 learnable
+```
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd ~/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_orange4f_scaffold.sh 5 fixed
+```
+
+| Setting | `scaffold_learnable_anchors_v1` | `scaffold_fixed_anchors_v1` |
+|---|---|---|
+| Initial anchors | Same voxelized shared LiDAR cloud | Same |
+| Anchor XYZ | Learned, LR 0.00016 → 0.0000016, multiplied by scene extent | Frozen, no XYZ gradient or Adam updates |
+| Anchor growth | Scaffold hierarchy, steps 1500–15000 | Disabled |
+| Anchor pruning | Scaffold opacity/observation criterion | Same; surviving anchor coordinates stay fixed |
+| Neural offsets, features, scale and MLPs | Learned | Learned |
+| AA / extra culling / exposure embeddings | Off | Off |
+| Duration / previews / saved checkpoints | 30k / every 500 / every 10k | Same |
+
+The stock Scaffold anchor LR in this fork is zero: its geometry normally learns
+through offsets and anchor growth. The **learnable-anchor variant is an explicit
+ablation**, using native 3DGS's XYZ LR endpoints; other Scaffold optimizer and
+loss defaults remain in place. Scaffold uses its own opacity accumulation and
+pruning, not 3DGS's periodic opacity resets.
+
+Both variants round the input points to a **0.02 scene-unit voxel grid** and
+deduplicate occupied cells. That is 2 cm only if the input coordinates are in
+metres. This differs from the older Scaffold launcher’s 0.001-unit default and
+reduces redundant anchors for a dense LiDAR cloud. This is anchor spacing,
+**not a Gaussian scale cap**. It does not retain every raw point. Fixed anchors
+are fixed grid-cell representatives, not the original unrounded LiDAR coordinates.
+
+Rendered centers are `anchor + offset × learned_scale[:3]`, so freezing anchors
+does **not** freeze all neural Gaussian centers. Offsets remain trainable in both
+runs. Counts show anchors and per-view active Gaussians separately; evaluation
+history's Gaussian capacity is `anchors × 10`, not a view-independent active count.
+
+Set `SCAFFOLD_VOXEL_SIZE` before the first launch to choose another grid spacing.
+Use the same value for both variants. To change it after preparing a run, also
+set `SCAFFOLD_RUN_VERSION=v2`; existing plans and checkpoints are never overwritten.
+The third/fourth positional arguments select source and suite version, just as
+for the four original runs. GPU numbers are arguments, not tied to the variant.
+
+No dependency installation or compilation is performed. These runs use this
+repository's Scaffold implementation, the installed native rasterizer, and the
+existing Git-installed `simple_knn` in `3dgs`. A small, clearly labelled synthetic
+CUDA preflight runs first; the real voxelized anchor count is printed afterwards.
+
+Outputs live under
+`/data/3dgs_outputs/orange4f/3dgs_finetuning/stride3_noaa_v1/`.
+Each new run has `debug_previews/index.html` and
+`periodic_evaluation/index.html`. Every 10k, a separate process on the same GPU
+evaluates **all registered source frames**, with selected/unselected PSNR and
+GT/render/error galleries. It can lag training and retry after an evaluator OOM.
+The suite index links both new preview pages.
+
+Keep the saved anchor PLY **and all three MLP files** together. Ordinary Gaussian
+PLY viewers cannot display this neural representation directly; use the existing
+`scripts/view_scaffold.py` viewer or the image reports. Resume optimizer state via
+`models/train_scaffold.py --start_checkpoint RUN/chkpnt10000.pth` with matching
+original training options; do not resume over already-published later checkpoints.
+
+## Original four runs
 
 Dataset: `/workspace/colmap_scenes/orange4f`. Run preparation once (the launcher
 does this under a lock), then launch one job in each terminal.
@@ -151,7 +228,7 @@ queue. GSPrior uses its own official renderer for evaluation.
 - Native evaluator: `RUN/periodic_evaluation/evaluator.log`.
 - GSPrior evaluator: `RUN/evaluator.log`.
 
-Serve the four-run index without using a GPU:
+Serve the suite index without using a GPU:
 
 ```bash
 source /opt/anaconda3/etc/profile.d/conda.sh &&

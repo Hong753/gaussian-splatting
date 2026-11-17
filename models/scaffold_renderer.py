@@ -90,11 +90,9 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     offsets = grid_offsets.view([-1, 3]) # [mask]
     
     # combine for parallel masking
-    concatenated = torch.cat([grid_scaling, anchor], dim=-1)
-    concatenated_repeated = concatenated.repeat_interleave(pc.n_offsets, dim=0)
-    concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets], dim=-1)
-    masked = concatenated_all[mask]
-    scaling_repeat, repeat_anchor, color, scale_rot, offsets = masked.split([6, 3, 3, 7, 3], dim=-1)
+    parent_ids = mask.nonzero(as_tuple=True)[0] // pc.n_offsets
+    scaling_repeat, repeat_anchor = grid_scaling[parent_ids], anchor[parent_ids]
+    color, scale_rot, offsets = color[mask], scale_rot[mask], offsets[mask]
     
     # post-process cov
     scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3]) # * (1+torch.sigmoid(repeat_dist))
@@ -155,15 +153,22 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
     
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii, _depth = rasterizer(
-        means3D = xyz,
-        means2D = screenspace_points,
-        shs = None,
-        colors_precomp = color,
-        opacities = opacity,
-        scales = scaling,
-        rotations = rot,
-        cov3D_precomp = None)
+    if len(xyz) == 0:
+        # A valid camera can have no currently positive-opacity offsets. Avoid
+        # the extension's ambiguous empty SH gradient shape, keeping a zero graph.
+        zero = sum(value.sum()*0 for value in (xyz, screenspace_points, color, opacity, scaling, rot))
+        rendered_image = bg_color[:, None, None].expand(3, int(viewpoint_camera.image_height), int(viewpoint_camera.image_width)) + zero
+        radii = torch.zeros(0, dtype=torch.int32, device=xyz.device)
+    else:
+        rendered_image, radii, _depth = rasterizer(
+            means3D = xyz,
+            means2D = screenspace_points,
+            shs = None,
+            colors_precomp = color,
+            opacities = opacity,
+            scales = scaling,
+            rotations = rot,
+            cov3D_precomp = None)
     
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     if is_training:

@@ -3,6 +3,8 @@ from arguments import ParamGroup
 class ScaffoldOptimizationParams(ParamGroup):
     def __init__(self, parser):
         self.iterations = 30_000
+        self.freeze_anchors = False
+        self.disable_anchor_growth = False
         self.position_lr_init = 0.0
         self.position_lr_final = 0.0
         self.position_lr_delay_mult = 0.01

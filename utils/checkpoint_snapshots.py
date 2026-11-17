@@ -46,10 +46,22 @@ def publish_snapshot(scene, iteration):
     checkpoint = model / f'chkpnt{iteration}.pth'
     atomic_write(checkpoint, lambda temp: torch.save((scene.gaussians.capture(), iteration), temp))
     files = {}
-    for path in (folder/'point_cloud.ply', model/'cfg_args', model/'keyframes.json', checkpoint):
+    paths = [folder/'point_cloud.ply', model/'cfg_args', model/'keyframes.json', checkpoint]
+    scaffold = getattr(scene.gaussians, 'is_scaffold', False)
+    mlps = []
+    if scaffold:
+        mlps = ['opacity_mlp.pt', 'cov_mlp.pt', 'color_mlp.pt']
+        if scene.gaussians.use_feat_bank: mlps.append('feature_bank_mlp.pt')
+        if scene.gaussians.appearance_dim: mlps.append('embedding_appearance.pt')
+        paths += [folder/name for name in mlps]
+    for path in paths:
         files[str(path.relative_to(model))] = dict(size=path.stat().st_size, sha256=digest(path))
     result = dict(schema=1, snapshot_id=uuid.uuid4().hex, model=str(model), iteration=iteration,
-                  state_timing='after_optimizer_step', gaussians=len(scene.gaussians.get_xyz), files=files)
+                  state_timing='after_optimizer_step',
+                  gaussians=(len(scene.gaussians.get_anchor)*scene.gaussians.n_offsets if scaffold else len(scene.gaussians.get_xyz)), files=files)
+    if scaffold:
+        result.update(model_type='scaffold', anchors=len(scene.gaussians.get_anchor),
+                      gaussian_count_kind='neural_capacity', scaffold_mlps=mlps)
     activation=(getattr(scene.gaussians,'fixed_lidar_state',None) or {}).get('lidar_activation')
     if activation is not None:
         result['allocated_gaussians']=result['gaussians']
@@ -71,6 +83,12 @@ def read_snapshot(model, iteration, *, verify=True):
     result = json.loads(marker.read_text())
     required = {f'point_cloud/iteration_{iteration}/point_cloud.ply', 'cfg_args',
                 'keyframes.json', f'chkpnt{iteration}.pth'}
+    if result.get('model_type') == 'scaffold':
+        mlps = set(result.get('scaffold_mlps', []))
+        mandatory = {'opacity_mlp.pt', 'cov_mlp.pt', 'color_mlp.pt'}
+        if not mandatory <= mlps <= mandatory | {'feature_bank_mlp.pt', 'embedding_appearance.pt'}:
+            raise ValueError('Incomplete Scaffold networks in snapshot')
+        required |= {f'point_cloud/iteration_{iteration}/{name}' for name in mlps}
     if 'pose_cache' in result:
         relative=f'point_cloud/iteration_{iteration}/poses.json'
         if result['pose_cache']!=relative:

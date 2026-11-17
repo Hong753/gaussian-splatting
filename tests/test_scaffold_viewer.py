@@ -115,6 +115,10 @@ class ScaffoldViewerTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(renders, [(960, 480, True)])
         self.assertEqual(frames[0].shape, (480, 960, 3))
+        # Loading a no-AA checkpoint must also switch the interactive viewer off.
+        (self.run / 'cfg_args').write_text("Namespace(model_type='scaffold', scaffold_n_offsets=10, antialiasing=False)")
+        app.load(self.ply)
+        self.assertFalse(app.antialiasing.value)
 
 
 if __name__ == "__main__":

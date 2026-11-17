@@ -124,6 +124,9 @@ def train(model):
             elif data.get('experiment') == 'distance_weighted':
                 from scripts import run_distance_weighted
                 launcher = run_distance_weighted
+            elif data.get('experiment') == 'scaffold':
+                from scripts import run_orange4f_scaffold
+                launcher = run_orange4f_scaffold
             plan = launcher.build_plan(args)
             if plan != data['plan']:
                 raise ValueError('Training plan changed after preparation')
@@ -172,7 +175,7 @@ def soft_diagnostics(model, start, end):
 
 def verify_metrics(data, iteration, summary, csv_path):
     if (summary['iteration'] != iteration or summary['model'] != data['model'] or
-            summary['source'] != data['source'] or summary['model_type'] != '3dgs' or
+            summary['source'] != data['source'] or summary['model_type'] != data['plan'].get('model_type', '3dgs') or
             summary['antialiasing'] != data['plan'].get('antialiasing', True) or summary['occlusion']['occlusion_mode'] != 'off'):
         raise ValueError('Evaluation used the wrong checkpoint or render protocol')
     expected = dict(all=len(data['frames']), selected=len(data['selected']),
@@ -251,6 +254,14 @@ def evaluate(data, snapshot, start):
 
 
 def experiment_diagnostics(data, start, end):
+    if data.get('experiment') == 'scaffold':
+        path = Path(data['model'])/'scaffold_training.jsonl'
+        rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+        rows = [r for r in rows if start < r['iteration'] <= end]
+        good = bool(rows) and all(r['anchors'] > 0 and r['freeze_anchors'] == data['plan']['freeze_anchors'] for r in rows)
+        return dict(interval=[start, end], passed=good, latest=rows[-1] if rows else None,
+                    warnings=[] if good else ['Missing or invalid Scaffold training diagnostics'],
+                    count_semantics='Anchors and per-view active neural Gaussians are reported separately')
     if data.get('experiment') == 'native_lidar':
         from scripts.tune_local_scale import read_rows
         rows = [r for r in read_rows(Path(data['model'])/'densification.jsonl')
@@ -415,12 +426,15 @@ def write_history(data, results):
                  frames=r['counts']['all'], snapshot_id=r['snapshot_id']) for r in results]
     poses=bool(data['plan'].get('pose_refinement'))
     regional=bool(data.get('training_args',{}).get('loss_mask_dir'))
+    method = 'Scaffold-GS' if data['plan'].get('model_type') == 'scaffold' else '3DGS'
+    aa = 'on' if data['plan'].get('antialiasing', True) else 'off'
+    population_label = 'Gaussian capacity' if method == 'Scaffold-GS' else 'Gaussians'
     if poses:
         for row,result in zip(rows,results):
             row['refined_all_psnr_db']=result['refined_poses']['mean_psnr_db']['all']
             row['refined_selected_psnr_db']=result['refined_poses']['mean_psnr_db']['selected']
     atomic_json(folder/'history.json', dict(expected_iterations=data['iterations'], completed=rows,
-        complete=len(rows)==len(data['iterations']), render_protocol='3DGS + AA; no mesh/culling; no exposure; primary metrics use original poses'+('; ROI-only PSNR on regional export' if regional else '')))
+        complete=len(rows)==len(data['iterations']), render_protocol=f'{method}; AA {aa}; no mesh/culling; no exposure; primary metrics use original poses'+('; ROI-only PSNR on regional export' if regional else '')))
     def save_csv(temp):
         with temp.open('w', newline='') as stream:
             writer = csv.DictWriter(stream, fieldnames=['iteration', 'gaussians', 'all_psnr_db', 'selected_psnr_db',
@@ -442,6 +456,7 @@ def write_history(data, results):
         body.append('<tr>'+''.join(f'<td>{html.escape(str(v))}</td>' for v in cells)+f'<td>{links}</td></tr>')
     title = {'local_scale':'Local KNN scale checkpoints', 'fixed_lidar':'Fixed LiDAR checkpoints',
              'native_lidar':'Native LiDAR checkpoints',
+             'scaffold':'Scaffold-GS checkpoints',
              'discrete_lidar':'Discrete LiDAR checkpoints',
              'distance_weighted':'Distance-weighted LiDAR checkpoints'}.get(data.get('experiment'), 'Soft surface checkpoints')
     if poses: title='Bounded pose refinement checkpoints'
@@ -449,9 +464,9 @@ def write_history(data, results):
     page = ('<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="30">'
         f'<title>{title}</title><style>body{{font:16px sans-serif;margin:2em}}td,th{{padding:.6em;text-align:left}}</style>'
         f'<h1>{title}</h1>'+('<p>ROI-only PSNR on all frames in the regional export; not the full 5,009-frame scene. Bright preview pixels are scored; dim pixels are excluded.</p>' if regional else '')+
-        '<p>All registered frames in this run’s source; AA on; mesh-free inference. '
+        f'<p>All registered frames in this run’s source; AA {aa}; mesh-free inference. '
         'Selected = training keyframes. Unselected = all remaining frames. Image galleries are sampled.</p>'
-        '<table><tr><th>Step</th><th>Gaussians</th><th>Frames</th><th>All PSNR</th><th>Selected PSNR</th>'
+        f'<table><tr><th>Step</th><th>{population_label}</th><th>Frames</th><th>All PSNR</th><th>Selected PSNR</th>'
         '<th>Unselected PSNR</th>'+('<th>Cached-pose all PSNR</th><th>Cached-pose train PSNR</th>' if poses else '')+
         '<th>Reports</th></tr>'+''.join(body)+'</table>'+
         ('<p>Primary PSNR uses original poses for all frames. Cached-pose metrics correct only training views; '

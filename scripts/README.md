@@ -407,9 +407,14 @@ prefilter compatible with this repository's rasterizer.
 A saved Scaffold model consists of anchor `point_cloud.ply` and the three MLP
 files in the same `point_cloud/iteration_N/` directory. This PLY is **not** an
 ordinary 3DGS PLY and cannot be opened directly in SuperSplat. Keep the entire
-iteration folder when moving a model. Live SIBR viewing, training resumption,
+iteration folder when moving a model. Live SIBR viewing,
 depth regularization, held-out `--eval` training, and sparse Adam are not yet
 implemented for Scaffold-GS. The regular all-frame PSNR evaluation works.
+The Scaffold trainer also writes optimizer checkpoints and supports
+`--start_checkpoint`. The orange4f launchers add atomic snapshot publication,
+parallel all-frame evaluation, and step-1/every-500/final train/held-out previews.
+See [ORANGE4F.md](ORANGE4F.md#scaffold-gs-two-additional-runs) for the learnable
+anchor and fixed-anchor ablation. Fixed anchors still have learned Gaussian offsets.
 
 Example smoke run before longer training:
 
