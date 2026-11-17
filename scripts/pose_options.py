@@ -3,6 +3,15 @@ import json
 from pathlib import Path
 
 
+def dataset_pose_labels(source):
+    """Distinguish an offline COLMAP rerun from the source's original poses."""
+    path=Path(source)/'colmap_rerun.json'
+    if not path.is_file(): return {}
+    audit=json.loads(path.read_text())
+    if not audit.get('accepted'): raise ValueError('Dataset COLMAP audit was not accepted')
+    return {row['name']:'rerun COLMAP training pose' for row in audit['frames']}
+
+
 def add_arguments(parser):
     parser.add_argument('--camera-poses',choices=('original','refined'),default='original',
         help='Original COLMAP poses, or cached training-view corrections from the selected checkpoint; held-out poses stay original')
@@ -71,5 +80,8 @@ def apply_camera(camera,cache):
 
 
 def protocol(spec):
-    return ('cached training-view corrections; unselected frames retain original COLMAP poses'
-            if spec.get('camera_poses','original')=='refined' else 'original COLMAP poses for all frames')
+    if spec.get('camera_poses','original')=='refined':
+        return 'cached training-view corrections; unselected frames retain dataset COLMAP poses'
+    if dataset_pose_labels(spec['cfg']['source_path']):
+        return 'rerun COLMAP training poses aligned to LiDAR; unchanged original held-out poses'
+    return 'original COLMAP poses for all frames'

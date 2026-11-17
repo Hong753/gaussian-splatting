@@ -1,5 +1,96 @@
 # Regional blur ablation
 
+## Rerun COLMAP on the selected training images (GPU 1)
+
+This ablation reruns feature extraction, exhaustive matching, incremental SfM,
+and bundle adjustment using **only the existing region's training images**.
+The mapper starts from feature matches, without the old poses as an initial
+reconstruction. Existing undistorted PINHOLE intrinsics stay fixed. An existing
+COLMAP executable must be on PATH, or set `COLMAP_BIN=/path/to/colmap`; the
+launcher does not install or change environments.
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/run_region_colmap.sh 1 \
+  /data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/regions/wall_06663_v1
+```
+
+The GPU argument limits SIFT extraction/matching to physical GPU 1 (logical
+device 0 inside COLMAP), then trains/evaluates GS on physical GPU 1. Mapping and
+bundle adjustment use COLMAP's default CPU solver. CLI option names are read
+from the installed COLMAP help, supporting the older `SiftExtraction` /
+`SiftMatching` and newer `FeatureExtraction` / `FeatureMatching` option groups.
+Exhaustive matching tries all selected-image pairs and can take substantial
+time. Per-stage logs and successful stage markers are saved; interrupted
+preprocessing reuses completed stages. The launcher never stops another run.
+
+For the completed `wall_06663_v1` export, it uses 1,349 training images; the
+2,690 held-out images are excluded from COLMAP. It requires all selected train
+images in one reconstructed component; missing registrations are listed in
+`registration_report.json` and block training, rather than silently changing
+the ablation. A robust similarity alignment to the original training camera
+centers puts the new poses back into the LiDAR coordinate frame. Alignment
+uses a RANSAC threshold of 5% of the maximum training-camera distance from the
+centroid, in original scene units. Fewer than 70% inlier centers or median
+rotation discrepancy above 15 degrees blocks export. These checks only catch
+gross alignment failures; they do not establish that the new poses are better.
+Per-frame center/rotation differences are saved in `alignment_report.json`.
+
+Outputs, with `REGION` denoting that existing regional dataset:
+
+- `$REGION/colmap_train_v1/`: training-only image links, calibrated database,
+  COLMAP stage logs, sparse models, alignment transform and pose audit.
+- `$REGION/colmap_train_v1/dataset/`: new training poses, **unchanged held-out
+  poses**, identical RGB and ROI masks, and the same cropped LiDAR initialization.
+  The new COLMAP sparse points are not used to initialize Gaussians. Original
+  dataset files are never overwritten.
+- `$REGION/runs/crop_colmap_fixed_v1/`: 3DGS + AA with the same settings as
+  `crop_v2`: fixed LiDAR centers, scaling LR 0.001, unconstrained scales, no
+  densification/pruning/opacity reset/culling. With 1,349/1,670 selected frames,
+  training lasts 90k steps and includes the matched checkpoint at 80,778.
+
+Checkpoints and a separate same-GPU evaluator run every 10k steps, plus the
+matched checkpoint. Evaluation covers all 4,039 exported regional frames and
+their original ROI pixels. Training PSNR uses the **new training poses**;
+held-out PSNR uses the unchanged original held-out poses. This tests corrected
+training supervision, not held-out COLMAP relocalization or all-5,009-frame PSNR.
+The original and new training poses therefore differ in train comparisons.
+
+GT/render/error previews start at step 1, repeat every 500 steps, and include
+fixed random training and held-out frames. Once training reaches its first
+preview, run in another terminal:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+python scripts/serve_training_previews.py \
+  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/regions/wall_06663_v1/runs/crop_colmap_fixed_v1 \
+  --port 8094
+```
+
+Open `http://211.172.247.108:8094`. COLMAP preprocessing itself does not produce
+Gaussian previews. Use a third launcher argument such as `v2` for a fresh
+COLMAP workspace and training model; an existing training model is not reused.
+
+Once both runs have the same checkpoint and GPU 1 is free, compare them using
+their own dataset poses and identical images/masks:
+
+```bash
+REGION=/data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/regions/wall_06663_v1
+python -u scripts/compare_region.py --region "$REGION" \
+  --models "$REGION/runs/crop_v2" "$REGION/runs/crop_colmap_fixed_v1" \
+  --iterations 30000 --different-poses --gpu 1 \
+  --output "$REGION/comparisons/original_vs_colmap_30000"
+```
+
+`--different-poses` is mandatory for this comparison. Without it, the comparator
+continues to reject pose differences. Neither mode permits different source
+images or intrinsics, and both use the original regional ROI masks.
+
 ## Automatic selection and adaptive geometry
 
 For an immediate automatic test around `06663.jpg`, this command **exports the

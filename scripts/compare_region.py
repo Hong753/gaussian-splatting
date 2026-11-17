@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare saved runs on identical regional views, original poses and ROI masks."""
+"""Compare shared regional images/masks; explicitly opt in to different poses."""
 import argparse
 import json
 import math
@@ -14,7 +14,7 @@ from scripts.eval_all_frames import choose_iteration
 from scripts.occlusion_options import apply_overrides
 
 
-def prepare_specs(region, models, iterations):
+def prepare_specs(region, models, iterations, different_poses=False):
     import numpy as np
     region=Path(region).resolve()
     selection=json.loads((region/'selection.json').read_text())
@@ -28,14 +28,16 @@ def prepare_specs(region, models, iterations):
             if name not in spec['records']:
                 raise ValueError(f'{model}: missing regional camera {name}')
             saved=spec['records'][name]
-            for key in ('R','T','width','height','fx','fy','cx','cy'):
+            keys=('width','height','fx','fy','cx','cy') if different_poses else ('R','T','width','height','fx','fy','cx','cy')
+            for key in keys:
                 if not np.allclose(saved[key],reference[key],rtol=0,atol=1e-8):
                     raise ValueError(f'{model}: camera {name} has different {key}; this is not the same-pose ablation')
             if Path(saved['image_path']).resolve()!=Path(reference['image_path']).resolve():
                 raise ValueError(f'{model}: image source differs for {name}')
         selected_step,_=choose_iteration(Path(model),step,'3dgs')
         spec=apply_overrides(spec,SimpleNamespace(occlusion='off'))
-        spec.update(records=records,camera_poses='original',comparison_iteration=selected_step)
+        own_records={name:spec['records'][name] for name in records} if different_poses else records
+        spec.update(records=own_records,camera_poses='original',comparison_iteration=selected_step)
         spec['cfg']={**spec['cfg'],'loss_mask_dir':str(region/'masks'),'resolution':1}
         specs.append(spec)
     return specs,selection
@@ -47,12 +49,13 @@ def main(argv=None):
     p.add_argument('--models',type=Path,nargs='+',required=True)
     p.add_argument('--iterations',type=int,nargs='+',default=[30000])
     p.add_argument('--different-steps',action='store_true',help='Explicitly compare different iterations, e.g. expected image exposure matching')
+    p.add_argument('--different-poses',action='store_true',help='Render each model using its own dataset poses; still require identical RGB/calibration/masks')
     p.add_argument('--gpu',default='0')
     p.add_argument('--output',type=Path,required=True)
     args=p.parse_args(argv)
     steps=args.iterations*len(args.models) if len(args.iterations)==1 else args.iterations
     if len(steps)!=len(args.models): p.error('Pass one shared iteration or one iteration per model')
-    specs,selection=prepare_specs(args.region,args.models,steps)
+    specs,selection=prepare_specs(args.region,args.models,steps,args.different_poses)
     if len({s['comparison_iteration'] for s in specs})>1 and not args.different_steps:
         p.error('Different checkpoints require --different-steps; otherwise choose a shared saved iteration')
     if args.output.exists(): raise FileExistsError(f'Choose a fresh comparison output: {args.output}')
@@ -84,9 +87,10 @@ def main(argv=None):
         for s,r in zip(specs,rendered)]
     write_gallery(args.output,'Regional GT / rendering comparison — ROI PSNR',rows,summaries,
         dict(metric='ROI-only mean per-channel PSNR, then mean over views; outside ROI dimmed in images',
-             camera_poses='identical original COLMAP poses; full resolution; AA; no culling; no exposure',
+             camera_poses=('Per-model dataset poses (may differ across runs)' if args.different_poses else 'Identical original COLMAP poses')+'; full resolution; AA; no culling; no exposure',
              region=str(args.region.resolve()),regional_training_names=sorted(training),
-             different_steps=args.different_steps,counts=dict(all=len(names),train=len(training),heldout=len(names)-len(training))))
+             different_steps=args.different_steps,different_poses=args.different_poses,
+             counts=dict(all=len(names),train=len(training),heldout=len(names)-len(training))))
     print(json.dumps(summaries,indent=2))
     print(f'Open {args.output / "index.html"}')
 

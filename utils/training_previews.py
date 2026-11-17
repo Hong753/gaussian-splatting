@@ -106,9 +106,12 @@ def create_previewer(scene, dataset, config, *, start_iteration=0, subdirectory=
         archive = root.with_name(f'{subdirectory}_before_restart_{time.time_ns()}')
         root.rename(archive)
         print(f'Debug previews: archived the later trajectory to {archive}', flush=True)
-    previewer = TrainingPreviewer(root, frames, config,
-        dict(source=str(Path(dataset.source_path).resolve()), heldout_protocol=protocol,
-             eligible_train=len(train), eligible_heldout=len(test_names)))
+    metadata=dict(source=str(Path(dataset.source_path).resolve()), heldout_protocol=protocol,
+                  eligible_train=len(train), eligible_heldout=len(test_names))
+    from scripts.pose_options import dataset_pose_labels
+    labels=dataset_pose_labels(dataset.source_path)
+    if labels: metadata['dataset_pose_labels']=labels
+    previewer = TrainingPreviewer(root, frames, config, metadata)
     print(f'Debug previews: {len(selected["train"])} train + {len(selected["held-out"])} held-out, '
           f'every {config["every"]} steps; {previewer.root / "index.html"}', flush=True)
     return previewer
@@ -180,7 +183,7 @@ class TrainingPreviewer:
                     rgb(pred).save(temporary / f'{key}.png')
                     rgb(error).save(temporary / f'{key}_error.jpg', quality=95, subsampling=0)
                     row = dict(name=original_camera.image_name, split=split,
-                        pose='current refined training pose' if refined else 'original pose',
+                        pose='current refined training pose' if refined else self.manifest.get('dataset_pose_labels',{}).get(original_camera.image_name,'original pose'),
                         psnr_db=score if math.isfinite(score) else 'inf',
                         metric='ROI PSNR' if mask is not None else 'full-image PSNR',
                         gt=f'gt/{key}.png', render=f'{folder.name}/{key}.png',

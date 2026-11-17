@@ -79,6 +79,7 @@ def prepare_args(argv=None):
                   expected_updates_per_image=dict(full=args.reference_steps/meta['original_train_count'],regional=matched/len(train)),
                   loss='ROI-normalized L1 + SSIM; outside-ROI pixels unsupervised',
                   visibility='native 3DGS + AA, no external culling',
+                  camera_poses=meta.get('camera_pose_protocol','Original exported COLMAP poses'),
                   geometry=geometry,geometry_mode=args.geometry,
                   position_lr_multiplier=args.position_lr_multiplier if args.geometry=='adaptive' else 0.,
                   evaluation='ROI PSNR on every exported frame; original training membership; full-frame images dimmed outside ROI',
@@ -94,8 +95,14 @@ def main(argv=None):
     args, protocol=prepare_args(argv)
     plan=native.build_plan(args)
     print(json.dumps(protocol,indent=2),flush=True)
+    region=Path(protocol['region'])
+    inputs=[args.keyframes,args.point_cloud,region/'selection.json',*mask_inputs(args)]
+    if (region/'colmap_rerun.json').is_file():
+        from scripts.keyframe_pipeline.common import read_model
+        _,_,_,pose_files=read_model(region)
+        inputs += [region/'colmap_rerun.json',*[Path(stamp[0]) for stamp in pose_files]]
     result=periodic.prepare_experiment(args,plan,'native_lidar',
-                [args.keyframes,args.point_cloud,Path(protocol['region'])/'selection.json',*mask_inputs(args)])
+                inputs)
     if not args.dry_run:
         (args.model/'region_ablation.json').write_text(json.dumps(protocol,indent=2)+'\n')
     return result

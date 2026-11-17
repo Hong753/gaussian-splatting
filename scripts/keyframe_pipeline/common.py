@@ -87,9 +87,9 @@ def make_image(iid, camera_id, name, q, t):
     return Image(iid, camera_id, name, R, -R.T @ t)
 
 
-def read_model(source):
+def read_model(source, *, model_dir=None):
     from utils.colmap_paths import colmap_model_dir
-    model = colmap_model_dir(source)
+    model = colmap_model_dir(source) if model_dir is None else Path(model_dir)
     cameras, images = {}, {}
     binary = all((model / f"{name}.bin").exists() for name in ("cameras", "images"))
     if binary:

@@ -22,6 +22,7 @@ def render_views(spec, names, iteration, output, antialiasing=None):
     from tqdm import tqdm
     cfg = spec["cfg"]
     pose_cache=pose_options.load_cache(spec,iteration)
+    dataset_labels=pose_options.dataset_pose_labels(cfg['source_path'])
     if spec["type"] == "proxygs":
         if antialiasing:
             raise ValueError("Proxy-GS does not support Graphdeco AA; use --no-antialiasing")
@@ -69,7 +70,9 @@ def render_views(spec, names, iteration, output, antialiasing=None):
             gt.save(output / "gt" / f"{key}.png")
             rendered.save(output / "renders" / f"{key}.png")
             Image.fromarray(rgb(display((pred-target).abs().mul(4).clamp(0, 1),mask))).save(output / "errors" / f"{key}.png")
-            label=spec['path'].name+(' | cached train pose' if pose_cache is not None and name in pose_cache['frames'] else ' | original pose')
+            cached_pose=pose_cache is not None and name in pose_cache['frames']
+            pose_label='cached train pose' if cached_pose else dataset_labels.get(name,'original pose')
+            label=spec['path'].name+' | '+pose_label
             if mask is not None:
                 label += ' | ROI only'
             save_panel(gt, rendered, output / "comparisons" / f"{key}.jpg", label, psnr)
@@ -78,7 +81,7 @@ def render_views(spec, names, iteration, output, antialiasing=None):
                                  psnr_db=psnr if math.isfinite(psnr) else "inf",
                                  metric='ROI PSNR' if mask is not None else 'full-image PSNR',
                                  mask_fraction=mask.float().mean().item() if mask is not None else 1.,
-                                 camera_pose='refined' if pose_cache is not None and name in pose_cache['frames'] else 'original',
+                                 camera_pose='refined' if cached_pose else ('colmap_rerun' if name in dataset_labels else 'original'),
                                  target_sha256=hashlib.sha256(str(target_hash_array.shape).encode() + target_hash_array.tobytes()).hexdigest())
             del camera, pred, target
     atomic_json(output / "frames.json", records)
