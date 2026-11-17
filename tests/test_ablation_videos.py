@@ -179,6 +179,52 @@ class AblationVideosTests(unittest.TestCase):
         stack.assert_called_once()
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg required")
+    def test_single_model_actual_and_random_videos_encode_at_requested_checkpoint(self):
+        model = self.model("crop_v2")
+        checkpoint(model, 40000)
+        seen = []
+
+        def frames(spec, cameras, width, height, aa):
+            seen.append((spec["iteration"], spec["cfg"]["occlusion_mode"], aa,
+                         video.core.trajectory_record(cameras)))
+            for _ in cameras:
+                yield np.broadcast_to(np.array([0, 255, 0], dtype=np.uint8),
+                                      (height, width, 3)).copy()
+
+        # Use the public render.py entry point and real ffmpeg encoding. Only
+        # the CUDA renderer is replaced; GT reading and all video assembly run.
+        from scripts.render import main as render_main
+        for mode in ("actual", "random"):
+            with self.subTest(mode=mode):
+                output = self.root / mode
+                argv = ["--video", mode, "--source", str(self.source), "--model", str(model),
+                    "--iteration", "30000", "--aa", "on", "--occlusion", "off", "--in-process",
+                    "--output", str(output), "--width", "64", "--duration", "1", "--fps", "5",
+                    "--source-window", "12", "--control-step", "4", "--deviation", "0.5"]
+                with patch.object(video.core, "rendered_frames", side_effect=frames), \
+                        patch.object(video, "replace_with_model", side_effect=AssertionError("Must stay in-process")), \
+                        patch.dict(sys.modules, {"tqdm": SimpleNamespace(tqdm=lambda xs, **kwargs: xs)}):
+                    self.assertEqual(render_main(argv), 0)
+                plan = json.loads((output / "trajectory.json").read_text())
+                self.assertTrue(plan["complete"])
+                self.assertEqual(plan["completed_models"], [0])
+                self.assertEqual(seen[-1][:3], (30000, "off", True))
+                result = "side_by_side.mp4" if mode == "actual" else "render.mp4"
+                self.assertEqual(plan["result_video"], result)
+                data = json.loads(subprocess.check_output(["ffprobe", "-v", "error", "-count_frames",
+                    "-show_entries", "stream=width,height,nb_read_frames", "-of", "json",
+                    str(output / result)], text=True))["streams"][0]
+                count = len(self.names) if mode == "actual" else 5
+                self.assertEqual((data["width"], data["height"], int(data["nb_read_frames"])),
+                                 (128 if mode == "actual" else 64, 72, count))
+                if mode == "actual":
+                    self.assertEqual([c["image_name"] for c in plan["cameras"]], self.names)
+                    self.assertTrue((output / "original.mp4").is_file())
+                else:
+                    self.assertFalse((output / "original.mp4").exists())
+                    self.assertFalse((output / "side_by_side.mp4").exists())
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg required")
     def test_real_gt_and_multiple_panel_video_encoding(self):
         models = [self.model("baseline"), self.model("refined", self.refined())]
         seen = []

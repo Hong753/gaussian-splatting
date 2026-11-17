@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared random-camera videos or GT/captured-camera videos for saved ablations."""
+"""Random-camera or GT/captured-camera videos for one or more saved models."""
 import argparse
 import hashlib
 import json
@@ -86,8 +86,6 @@ def build_plan(args):
     if output.exists() and any(output.iterdir()) and not args.dry_run:
         raise ValueError(f"Use an empty output directory: {output}")
     paths = resolve_models(args.models, args.model_root, args.runs, allow_duplicates=True)
-    if len(paths) < 2:
-        raise ValueError("Supply at least two models for a comparison")
     specs = [model_info(path) for path in paths]
     if args.in_process and any(spec['type'] != '3dgs' for spec in specs):
         raise ValueError('--in-process videos require native 3DGS models')
@@ -160,7 +158,7 @@ def build_plan(args):
             type=kind, iteration=iteration, ply=str(ply), label=label, antialiasing=bool(antialiasing),
             python=metadata.get("python", sys.executable), train_count=len(spec["splits"]["train"]),
             cameras=selected_cameras, trajectory_sha256=camera_hash(selected_cameras),
-            video=f"model_{index}.mp4"))
+            video="render.mp4" if len(specs) == 1 else f"model_{index}.mp4"))
     if args.video == "actual":
         core.validate_originals(source / "images", cameras)
     return dict(version=1, mode=args.video, source=str(source), output=str(output),
@@ -169,6 +167,7 @@ def build_plan(args):
         pose_protocol=("shared source trajectory" if args.video == "random" or args.actual_poses == "source"
                        else "matching filenames, each model's saved camera calibration"),
         color_protocol="base appearance; no per-image exposure correction",
+        result_video="render.mp4" if args.video == "random" and len(specs) == 1 else "side_by_side.mp4",
         models=models, completed_models=[], complete=False, **path_details)
 
 
@@ -221,10 +220,12 @@ def execute_model(plan_path, index, chain=True):
     elif index + 1 == len(plan["models"]):
         videos = ([output / "original.mp4"] if plan["mode"] == "actual" else [])
         videos += [output / m["video"] for m in plan["models"]]
-        stack_videos(videos, output / "side_by_side.mp4", plan["crf"])
+        result = output / plan.get("result_video", "side_by_side.mp4")
+        if len(videos) > 1:
+            stack_videos(videos, result, plan["crf"])
         plan["complete"] = True
         atomic_json(plan_path, plan)
-        print(f"Video complete: {output / 'side_by_side.mp4'}", flush=True)
+        print(f"Video complete: {result}", flush=True)
 
 
 def replace_with_model(path, plan, index):

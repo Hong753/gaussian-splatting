@@ -488,11 +488,16 @@ iteration for both; `-1` selects each model's latest, which may differ.
 ### Ablation videos and saved result tables
 
 `scripts/render.py --video random` and `--video actual` accept any mixture of
-native 3DGS/AbsGS, Scaffold, Textured Gaussians and Proxy-GS. Supply at least two
+native 3DGS/AbsGS, Scaffold, Textured Gaussians and Proxy-GS. Supply one or more
 `--models` paths, or use `--model-root ROOT --runs NAME ...` to resolve nested
 run folders. `--labels` and `--aa` accept one value per model. Proxy-GS and
 Textured Gaussians require AA off; `auto` uses saved AA or assumes on for legacy
 native configurations that lack the field. Set AA explicitly for old runs.
+
+With a single model, actual-camera videos contain GT and the render in
+`side_by_side.mp4`; random-camera videos produce `render.mp4` without a GT panel.
+For a saved regional checkpoint, `bash scripts/render_region_videos.sh GPU MODEL
+30000` renders both paths using its saved source poses. See `REGION_ABLATION.md`.
 
 ```bash
 python scripts/collect_ablation_results.py --root /data/3dgs_outputs/orange_4F/1_full --list

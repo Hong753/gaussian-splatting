@@ -179,6 +179,46 @@ python -u scripts/compare_region.py --region "$REGION" \
 continues to reject pose differences. Neither mode permits different source
 images or intrinsics, and both use the original regional ROI masks.
 
+## Original-pose regional videos at 30k
+
+Render the current `crop_v2` control on GPU 0 after its 30k snapshot has been
+published. This reads the checkpoint only; it does not restart or stop training.
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+bash scripts/render_region_videos.sh 0 \
+  /data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/regions/wall_06663_v1/runs/crop_v2 \
+  30000
+```
+
+The two videos render sequentially on the specified GPU, with AA on and
+external culling off. They use the original regional dataset poses, not the
+new COLMAP/SuperGlue reconstruction. Both plans are checked before rendering.
+The launcher requires `point_cloud/iteration_30000/ready.json`, so it cannot
+read a partly written snapshot. It activates the `3dgs` environment itself.
+
+Under `$REGION/runs/crop_v2/videos/iteration_30000/`:
+
+- `actual/side_by_side.mp4`: **GT | 30k render**, natural filename order, every
+  exported regional camera (4,039 for this export: 1,349 train + 2,690 held-out).
+  No frame subsampling; playback is 30 fps rather than original capture timing.
+- `random/render.mp4`: a 40-second seeded novel trajectory, derived from a
+  continuous 180-frame regional segment with modest translation and rotation.
+  Novel views have no matching GT images. Camera-support bounds are applied,
+  but this is not a mesh collision check.
+- Each subfolder contains `trajectory.json` with poses, checkpoint, AA/culling
+  settings, frame count and completion status; actual also retains separate
+  `original.mp4` and `render.mp4` files.
+
+These are full-frame visualizations, not ROI-masked PSNR evaluation. Areas
+outside the cropped geometry and supervised ROI can be incomplete. Panel
+width is 1,280 pixels. No all-5,009-frame evaluation is implied by these videos.
+Supply a different GPU as the first argument if needed. Existing nonempty
+video folders are preserved; pass a fresh fourth argument to render again.
+
 ## Automatic selection and adaptive geometry
 
 For an immediate automatic test around `06663.jpg`, this command **exports the
