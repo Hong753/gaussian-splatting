@@ -9,6 +9,12 @@ region="${2:-/data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/regions/wall_06
 version="${3:-v1}"
 frontend="${REGION_COLMAP_FRONTEND:-sift}"
 overlap="${COLMAP_SEQUENTIAL_OVERLAP:-20}"
+bridge_rounds="${SUPERGLUE_BRIDGE_ROUNDS:-3}"
+bridge_budget="${SUPERGLUE_BRIDGE_BUDGET:-512}"
+if [[ ! "$bridge_rounds" =~ ^[0-9]{1,2}$ || ! "$bridge_budget" =~ ^[1-9][0-9]{0,3}$ ]]; then
+  echo 'SUPERGLUE_BRIDGE_ROUNDS must be 0..99; SUPERGLUE_BRIDGE_BUDGET must be 1..9999.' >&2; exit 2
+fi
+bridge_rounds=$((10#$bridge_rounds))
 if [[ "$frontend" != sift && "$frontend" != superglue ]] || [[ ! "$overlap" =~ ^[1-9][0-9]{0,3}$ ]]; then
   echo 'Frontend must be sift or superglue; sequential overlap must be a positive integer.' >&2; exit 2
 fi
@@ -111,11 +117,26 @@ if [[ "$frontend" == superglue ]]; then
     touch "$job/features.done"
   fi
   if [[ ! -e "$job/matching.done" ]]; then
-    python -u scripts/region_superglue.py match --workspace "$job" --gpu "$gpu" 2>&1 | tee "$job/logs/superglue.log"
-    # Raw learned matches: CPU geometric verification only. Never run SIFT
-    # matching or treat SuperGlue output as already-verified inliers.
-    run_stage verification matches_importer --database_path "$job/database.db" \
-      --match_list_path "$job/superglue_raw_matches.txt" --match_type raw "--$matching.use_gpu" 0
+    verify_pending() {
+      local batch="$1"
+      python -u scripts/region_superglue.py match --workspace "$job" --gpu "$gpu" --pending-only \
+        2>&1 | tee "$job/logs/superglue_$batch.log"
+      # Feed only missing geometry rows, including cached matches from an
+      # interrupted batch. Completed rejected/accepted pairs are never rerun.
+      if [[ -s "$job/superglue_raw_matches.txt" ]]; then
+        run_stage "verification_$batch" matches_importer --database_path "$job/database.db" \
+          --match_list_path "$job/superglue_raw_matches.txt" --match_type raw "--$matching.use_gpu" 0
+      fi
+      python -u scripts/region_superglue.py audit-verified --workspace "$job"
+    }
+    verify_pending resume
+    for ((bridge_attempt=0; bridge_attempt<bridge_rounds; bridge_attempt++)); do
+      connected="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["connected"])' "$job/verification_report.json")"
+      if [[ "$connected" == True ]]; then break; fi
+      python -u scripts/region_superglue.py plan-bridges --workspace "$job" --bridge-budget "$bridge_budget"
+      bridge_id="$(python -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["rounds"]))' "$job/bridge_pairs.json")"
+      verify_pending "bridge_$bridge_id"
+    done
     python -u scripts/region_superglue.py check-verified --workspace "$job"
     touch "$job/matching.done"
   fi

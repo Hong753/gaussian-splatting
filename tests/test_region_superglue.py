@@ -112,11 +112,78 @@ def test_database_keypoints_preserve_ids_and_verified_graph(workspace,monkeypatc
     sg.check_verified(workspace,config)
     with sqlite3.connect(workspace/'database.db') as db:
         db.execute('INSERT INTO two_view_geometries VALUES(?,?)',(10*2147483647+12,16))
-    with pytest.raises(ValueError,match='non-sequential'): sg.check_verified(workspace,config)
+    with pytest.raises(ValueError,match='outside the sequential/bridge manifest'): sg.check_verified(workspace,config)
 
 
-@pytest.mark.parametrize('modern',[False,True])
-def test_superglue_launcher_never_invokes_gpu_sift_and_hands_off_gpu1(tmp_path,region,modern):
+def test_bridge_recovery_preserves_caches_and_verifies_only_new_pairs(workspace,monkeypatch):
+    config=sg.load_config(workspace)
+    monkeypatch.setattr(sg,'model_class',lambda repo,name:FakeSP if name=='superpoint' else FakeSG)
+    sg.extract(workspace,config,'cpu');sg.match(workspace,config,'cpu')
+    files=list((workspace/'superpoint').glob('*.npz'))+list((workspace/'superglue_matches').glob('*.npz'))
+    stamps={p:(p.stat().st_mtime_ns,sg.digest(p)) for p in files}
+    names=config['names']
+    with sqlite3.connect(workspace/'database.db') as db:
+        db.executescript('CREATE TABLE images(image_id INTEGER PRIMARY KEY,name TEXT); '
+                        'CREATE TABLE two_view_geometries(pair_id INTEGER PRIMARY KEY,rows INTEGER);')
+        db.executemany('INSERT INTO images VALUES(?,?)',enumerate(names,start=1))
+        # The rejected second temporal link is a completed attempt, not pending.
+        db.executemany('INSERT INTO two_view_geometries VALUES(?,?)',[(2147483647+2,16),(2*2147483647+3,0)])
+    report=sg.check_verified(workspace,config,require_connected=False)
+    assert report['component_sizes']==[2,1] and report['pending_pairs']==0
+    calls=FakeSG.calls
+    sg.match(workspace,config,'cpu',pending_only=True)
+    assert FakeSG.calls==calls and (workspace/'superglue_raw_matches.txt').read_text()==''
+    pairs=sg.plan_bridges(workspace,config,budget=10)
+    assert [p['images'] for p in pairs]==[[names[0],names[2]]]
+    assert sg.pending_pairs(workspace,config)==[(names[0],names[2])]
+    # Resuming prepare must preserve appended bridge pairs and feature settings.
+    assert sg.prepare(workspace,Path(config['repository']))==config
+    assert len((workspace/'pairs.txt').read_text().splitlines())==3
+    sg.match(workspace,config,'cpu',pending_only=True)
+    assert FakeSG.calls==calls+1
+    raw=(workspace/'superglue_raw_matches.txt').read_text()
+    assert raw.startswith(f'{names[0]} {names[2]}\n') and f'{names[1]} {names[2]}\n' not in raw
+    # Crash between matching and verification: cached bridge is reused.
+    sg.match(workspace,config,'cpu',pending_only=True)
+    assert FakeSG.calls==calls+1
+    assert not sg.check_verified(workspace,config,require_connected=False)['connected']
+    with pytest.raises(ValueError,match='pending'):
+        sg.plan_bridges(workspace,config,budget=10)
+    with sqlite3.connect(workspace/'database.db') as db:
+        db.execute('INSERT INTO two_view_geometries VALUES(?,?)',(2147483647+3,16))
+    assert sg.check_verified(workspace,config)['connected']
+    assert sg.plan_bridges(workspace,config)==[]
+    for path,stamp in stamps.items():
+        assert (path.stat().st_mtime_ns,sg.digest(path))==stamp
+    # Held-out files cannot enter the bridge manifest or the graph.
+    ledger=json.loads((workspace/'bridge_pairs.json').read_text())
+    ledger['rounds'][0]['pairs'][0]['images'][1]='00003.png'
+    (workspace/'bridge_pairs.json').write_text(json.dumps(ledger))
+    with pytest.raises(ValueError,match='non-training'): sg.all_pairs(workspace,config)
+
+
+def test_bridge_candidates_are_balanced_deterministic_and_cross_component_only():
+    names=[f'{i:05d}.jpg' for i in range(14)]
+    groups=[names[i:i+2] for i in range(0,14,2)]
+    tried=set(sg.sequential_pairs(names,2))
+    descriptors=np.random.default_rng(3).normal(size=(len(names),16))
+    descriptors/=np.linalg.norm(descriptors,axis=1,keepdims=True)
+    result=sg.choose_bridge_pairs(names,groups,tried,descriptors,28)
+    assert result==sg.choose_bridge_pairs(names,groups,tried,descriptors,28)
+    assert len(result)==28 and len({tuple(p['images']) for p in result})==28
+    membership={n:i for i,g in enumerate(groups) for n in g}
+    touched=set()
+    for p in result:
+        a,b=p['images']
+        assert a<b and (a,b) not in tried and membership[a]!=membership[b]
+        touched.update([membership[a],membership[b]])
+    assert touched==set(range(7))
+    assert {p['method'] for p in result}=={'temporal','appearance'}
+    assert sg.choose_bridge_pairs(names,groups,set(sg.sequential_pairs(names,99)),descriptors,28)==[]
+
+
+@pytest.mark.parametrize('modern,recover',[(False,False),(True,False),(False,True)])
+def test_superglue_launcher_never_invokes_gpu_sift_and_hands_off_gpu1(tmp_path,region,modern,recover):
     repo=Path(__file__).resolve().parents[1];launch=tmp_path/'launch/scripts';launch.mkdir(parents=True)
     for name in ('run_region_superglue.sh','run_region_colmap.sh'):
         shutil.copy(repo/'scripts'/name,launch/name)
@@ -176,7 +243,12 @@ elif command=='matches_importer':
         assert db.execute('SELECT COUNT(*) FROM descriptors').fetchone()[0]==0
         for block in Path(opt('match_list_path')).read_text().strip().split('\\n\\n'):
             lines=block.splitlines();a,b=lines[0].split();i,j=sorted((ids[a],ids[b]))
-            db.execute('INSERT INTO two_view_geometries VALUES(?,?)',(i*2147483647+j,len(lines)-1))
+            count=0 if os.environ['RECOVER']=='1' and (i,j)==(2,3) else len(lines)-1
+            db.execute('INSERT INTO two_view_geometries VALUES(?,?)',(i*2147483647+j,count))
+    # Simulate the old interrupted workspace after all base geometry rows exist.
+    interrupted=Path(os.environ['INTERRUPTED'])
+    if os.environ['RECOVER']=='1' and not interrupted.exists():
+        interrupted.touch();sys.exit(23)
 else:
     output=Path(opt('output_path'));output=output/'0' if command=='mapper' else output
     shutil.copytree(os.environ['FIXTURE'],output,dirs_exist_ok=True)
@@ -184,17 +256,27 @@ else:
     for path in bindir.iterdir(): path.chmod(0o755)
     env={**os.environ,'PATH':str(bindir)+os.pathsep+os.environ['PATH'],'RECONSTRUCTION_CONDA_SH':str(conda),
          'LAUNCH_MARKER':str(tmp_path/'handoff'),'CALLS':str(tmp_path/'calls'),'FIXTURE':str(fixture),'MODERN':str(int(modern)),
-         'COLMAP_BIN':str(bindir/'colmap'),'SUPERGLUE_REPO':str(model_cache(tmp_path/'network')),'COLMAP_SEQUENTIAL_OVERLAP':'2'}
+         'COLMAP_BIN':str(bindir/'colmap'),'SUPERGLUE_REPO':str(model_cache(tmp_path/'network')),
+         'RECOVER':str(int(recover)),'INTERRUPTED':str(tmp_path/'interrupted'),
+         'COLMAP_SEQUENTIAL_OVERLAP':'1' if recover else '2'}
     result=subprocess.run(['bash',str(launch/'run_region_superglue.sh'),'1',str(region)],env=env,capture_output=True,text=True,timeout=60)
+    overlap=1 if recover else 2
+    job=region/f'colmap_superpoint_superglue_seq{overlap}_v1'
+    if recover:
+        assert result.returncode==23,result.stdout+result.stderr
+        assert (job/'features.done').is_file() and not (job/'matching.done').exists()
+        cached={p:p.stat().st_mtime_ns for folder in ('superpoint','superglue_matches') for p in (job/folder).glob('*.npz')}
+        result=subprocess.run(['bash',str(launch/'run_region_superglue.sh'),'1',str(region)],env=env,capture_output=True,text=True,timeout=60)
+        assert all(p.stat().st_mtime_ns==stamp for p,stamp in cached.items())
+        assert len(json.loads((job/'bridge_pairs.json').read_text())['rounds'])==1
     assert result.returncode==0,result.stdout+result.stderr
-    model=region/'runs/crop_colmap_superglue_seq2_fixed_v1'
+    model=region/f'runs/crop_colmap_superglue_seq{overlap}_fixed_v1'
     assert (tmp_path/'handoff').read_text()==str(model)
     calls=[json.loads(s) for s in (tmp_path/'calls').read_text().splitlines()]
-    assert [a[0] for a in calls]==['database_creator','feature_importer','matches_importer','mapper','bundle_adjuster','model_aligner']
+    assert [a[0] for a in calls]==['database_creator','feature_importer','matches_importer']+(['matches_importer'] if recover else [])+['mapper','bundle_adjuster','model_aligner']
     plan=json.loads((model/'periodic_evaluation/plan.json').read_text())
     assert plan['gpu']=='1' and plan['training_args']['debug_preview_every']==500
     assert len(plan['selected'])==3 and len(plan['frames'])==4
     assert plan['plan']['freeze_lidar_positions'] and not plan['plan']['hard_culling']
-    job=region/'colmap_superpoint_superglue_seq2_v1'
     assert len((job/'pairs.txt').read_text().splitlines())==3
-    assert json.loads((job/'verification_report.json').read_text())['verified_pairs']==3
+    assert json.loads((job/'verification_report.json').read_text())['verified_pairs']==(2 if recover else 3)

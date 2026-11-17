@@ -184,6 +184,9 @@ def export(workspace):
                  evaluation='Identical images and original ROI masks; training render poses differ from the control')
     if job.get('frontend')=='superpoint-superglue':
         audit['feature_matching']=json.loads((workspace/'superglue.json').read_text())
+        for name in ('verification_report.json','bridge_pairs.json'):
+            if (workspace/name).is_file():
+                audit[name.removesuffix('.json')]=json.loads((workspace/name).read_text())
     atomic_json(workspace/'alignment_report.json',audit)
     if not audit['accepted']:
         raise ValueError('COLMAP-to-LiDAR alignment failed sanity checks; inspect alignment_report.json before training')

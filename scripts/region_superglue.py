@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Disk-cached SuperPoint/SuperGlue sequential matches for regional COLMAP."""
 import argparse
+from collections import deque
 from functools import lru_cache
 import hashlib
 import importlib.util
@@ -41,6 +42,57 @@ def save_npz(path,**arrays):
     atomic_write(path,write)
 
 
+def bridge_rounds(workspace,config):
+    path=workspace/'bridge_pairs.json'
+    if not path.exists(): return []
+    saved=json.loads(path.read_text())
+    if saved.get('schema')!=1 or saved.get('config_sha256')!=digest(workspace/'superglue.json'):
+        raise ValueError('Bridge-pair settings differ from the cached SuperGlue configuration')
+    names=set(config['names']);seen=set(sequential_pairs(config['names'],config['overlap']))
+    order={name:i for i,name in enumerate(config['names'])}
+    for record in saved['rounds']:
+        for entry in record['pairs']:
+            a,b=entry['images']
+            if a not in names or b not in names or order[a]>=order[b] or (a,b) in seen:
+                raise ValueError('Invalid, duplicate, or non-training bridge pair')
+            seen.add((a,b))
+    return saved['rounds']
+
+
+def all_pairs(workspace,config):
+    return sequential_pairs(config['names'],config['overlap'])+[
+        tuple(entry['images']) for record in bridge_rounds(workspace,config) for entry in record['pairs']]
+
+
+def write_pairs(workspace,config):
+    pairs=all_pairs(workspace,config)
+    atomic_write(workspace/'pairs.txt',lambda p:p.write_text(''.join(f'{a} {b}\n' for a,b in pairs)))
+    return pairs
+
+
+def database_pairs(workspace,config):
+    """Every geometry row, including zero-inlier rows, is a completed attempt."""
+    with sqlite3.connect(workspace/'database.db') as db:
+        ids={name:iid for iid,name in db.execute('SELECT image_id,name FROM images')}
+        rows=list(db.execute('SELECT pair_id,rows FROM two_view_geometries'))
+    if set(ids)!=set(config['names']): raise ValueError('Unexpected training membership in database')
+    lookup={}
+    for a,b in all_pairs(workspace,config):
+        lo,hi=sorted((ids[a],ids[b]));lookup[lo*2147483647+hi]=(a,b)
+    if any(pair_id not in lookup for pair_id,_ in rows):
+        raise ValueError('Database contains pairs outside the sequential/bridge manifest')
+    return lookup,rows
+
+
+def pending_pairs(workspace,config):
+    pairs=all_pairs(workspace,config)
+    # Standalone feature/match smoke checks do not yet have a COLMAP database.
+    if not (workspace/'database.db').is_file(): return pairs
+    lookup,rows=database_pairs(workspace,config)
+    completed={lookup[pair_id] for pair_id,_ in rows}
+    return [pair for pair in pairs if pair not in completed]
+
+
 def prepare(workspace,repo,max_size=1600,max_keypoints=4096):
     job=load_job(workspace)
     if job.get('frontend')!='superpoint-superglue': raise ValueError('Need a fresh SuperGlue workspace, not a SIFT cache')
@@ -57,14 +109,13 @@ def prepare(workspace,repo,max_size=1600,max_keypoints=4096):
     if path.exists() and json.loads(path.read_text())!=config:
         raise ValueError('SuperGlue inputs/settings changed; use a new VERSION/workspace')
     atomic_json(path,config)
-    pairs=sequential_pairs(config['names'],config['overlap'])
-    atomic_write(workspace/'pairs.txt',lambda p:p.write_text(''.join(f'{a} {b}\n' for a,b in pairs)))
+    pairs=write_pairs(workspace,config)
     # The native importer creates version-correct image/rig/frame records. These
     # empty placeholders are replaced by learned keypoints before verification.
     for name in config['names']:
         path=workspace/'image_registration'/f'{name}.txt';path.parent.mkdir(parents=True,exist_ok=True)
         path.write_text('0 128\n')
-    print(f'SuperPoint + indoor SuperGlue: {len(config["names"])} images, {len(pairs):,} sequential pairs; overlap={config["overlap"]}.',flush=True)
+    print(f'SuperPoint + indoor SuperGlue: {len(config["names"])} images, {len(pairs):,} planned pairs; base overlap={config["overlap"]}.',flush=True)
     return config
 
 
@@ -152,16 +203,20 @@ def match_one(model,a,b,device):
     return matches,confidence[valid].astype(np.float32)
 
 
-def match(workspace,config,device):
-    model=model_class(config['repository'],'superglue')({k:config[k] for k in ('weights','sinkhorn_iterations','match_threshold')}).eval().to(device)
-    pairs=sequential_pairs(config['names'],config['overlap'])
+def match(workspace,config,device,pending_only=False):
+    pairs=pending_pairs(workspace,config) if pending_only else all_pairs(workspace,config)
+    model=None;computed=0
+    print(f'SuperGlue batch: {len(pairs):,} pairs; already-verified pairs skipped={pending_only}.',flush=True)
     # At most one temporal window in CPU memory; only the current pair on GPU.
     feature=lru_cache(maxsize=min(32,config['overlap']+1))(lambda name:read_feature(workspace,name))
     for i,(a,b) in enumerate(pairs):
         path=cache_path(workspace,'superglue_matches',[a,b])
         if not path.exists():
+            if model is None:
+                model=model_class(config['repository'],'superglue')({k:config[k] for k in ('weights','sinkhorn_iterations','match_threshold')}).eval().to(device)
             matches,scores=match_one(model,feature(a),feature(b),device)
             save_npz(path,matches=matches,scores=scores)
+            computed+=1
         if i%50==0 or i+1==len(pairs):
             print(f'SuperGlue {i+1}/{len(pairs)}: {a} <-> {b}',flush=True)
     counts=[]
@@ -175,7 +230,9 @@ def match(workspace,config,device):
                 np.savetxt(stream,matches,fmt='%d');stream.write('\n')
     atomic_write(workspace/'superglue_raw_matches.txt',write_raw)
     atomic_json(workspace/'superglue_matching_report.json',dict(images=len(config['names']),pairs=len(pairs),
-        overlap=config['overlap'],matches=sum(counts),median_matches=float(np.median(counts)),
+        total_planned_pairs=len(all_pairs(workspace,config)),pending_only=pending_only,
+        computed_pairs=computed,cached_pairs=len(pairs)-computed,
+        overlap=config['overlap'],matches=sum(counts),median_matches=float(np.median(counts)) if counts else 0.,
         zero_match_pairs=counts.count(0),geometrically_verified=False))
 
 
@@ -202,17 +259,11 @@ def import_keypoints(workspace,config):
     print(f'Imported original-resolution SuperPoint coordinates for {len(images)} images.',flush=True)
 
 
-def check_verified(workspace,config):
-    with sqlite3.connect(workspace/'database.db') as db:
-        ids={name:iid for iid,name in db.execute('SELECT image_id,name FROM images')}
-        rows=list(db.execute('SELECT pair_id,rows FROM two_view_geometries'))
-    if set(ids)!=set(config['names']): raise ValueError('Unexpected training membership in database')
-    graph={name:set() for name in ids};lookup={}
-    for a,b in sequential_pairs(config['names'],config['overlap']):
-        lo,hi=sorted((ids[a],ids[b]));lookup[lo*2147483647+hi]=(a,b)
+def check_verified(workspace,config,require_connected=True):
+    lookup,rows=database_pairs(workspace,config)
+    graph={name:set() for name in config['names']}
     verified=0
     for pair_id,n in rows:
-        if pair_id not in lookup: raise ValueError('Database contains non-sequential image pairs')
         if n>=15:
             a,b=lookup[pair_id];graph[a].add(b);graph[b].add(a);verified+=1
     remaining=set(graph);components=[]
@@ -222,22 +273,133 @@ def check_verified(workspace,config):
             name=stack.pop();component.append(name)
             for neighbor in graph[name]&remaining: remaining.remove(neighbor);stack.append(neighbor)
         components.append(sorted(component,key=natural_key))
+    components.sort(key=lambda c:(-len(c),natural_key(c[0])))
     report=dict(expected_pairs=len(lookup),stored_pairs=len(rows),verified_pairs=verified,
-                inlier_threshold=15,components=components,isolated=[n for n,edges in graph.items() if not edges])
+                pending_pairs=len(lookup)-len(rows),connected=len(components)==1,
+                inlier_threshold=15,components=components,component_sizes=list(map(len,components)),
+                isolated=[n for n,edges in graph.items() if not edges])
     atomic_json(workspace/'verification_report.json',report)
     print(f'Geometric verification: {verified}/{len(lookup)} pairs have >=15 inliers; {len(components)} connected components.',flush=True)
-    if len(components)!=1:
-        raise ValueError('Sequential match graph is disconnected. See verification_report.json; increase overlap in a new workspace before training. No frames were silently dropped.')
+    print(f'Component sizes: {report["component_sizes"]}; unverified planned pairs: {report["pending_pairs"]}.',flush=True)
+    if require_connected and len(components)!=1:
+        raise ValueError(f'Match graph remains disconnected: component sizes {report["component_sizes"]}. '
+            'All caches and verified pairs are retained. See verification_report.json and bridge_pairs.json. '
+            'Rerun the same workspace to try further bridges; no frames were dropped and GS training has not started.')
+    if require_connected and report['pending_pairs']:
+        raise ValueError('Some planned pairs have not been geometrically verified; resume the same workspace')
+    return report
+
+
+def appearance_descriptors(workspace,config):
+    """Cheap retrieval proposals from existing local descriptors, not pose priors."""
+    identity=digest(workspace/'superglue.json')
+    path=cache_path(workspace,'retrieval',identity)
+    if path.exists():
+        with np.load(path,allow_pickle=False) as data: descriptors=data['descriptors']
+    else:
+        pooled=[]
+        for i,name in enumerate(config['names']):
+            data=read_feature(workspace,name)
+            weights=np.maximum(data['scores'],0)
+            mean=(data['descriptors']*weights[None]).sum(1)/max(float(weights.sum()),1e-12)
+            maximum=data['descriptors'].max(1)
+            parts=[part/max(float(np.linalg.norm(part)),1e-12) for part in (mean,maximum)]
+            vector=np.concatenate(parts);pooled.append(vector/max(float(np.linalg.norm(vector)),1e-12))
+            if i%100==0 or i+1==len(config['names']):
+                print(f'Bridge retrieval cache: {i+1}/{len(config["names"])} images',flush=True)
+        descriptors=np.asarray(pooled,dtype=np.float32)
+        save_npz(path,descriptors=descriptors)
+    if descriptors.shape!=(len(config['names']),512) or not np.isfinite(descriptors).all():
+        raise ValueError('Invalid retrieval descriptor cache')
+    return descriptors
+
+
+def choose_bridge_pairs(names,components,attempted,descriptors,budget):
+    """Balance temporal and appearance proposals across all disconnected groups.
+
+    Appearance pooling is only a ranking heuristic. SuperGlue and COLMAP must
+    validate every proposal; no edge is inserted on descriptor similarity alone.
+    """
+    if budget<1: raise ValueError('Bridge budget must be positive')
+    index={name:i for i,name in enumerate(names)}
+    flattened=[name for component in components for name in component]
+    if len(flattened)!=len(names) or set(flattened)!=set(names):
+        raise ValueError('Components must partition the selected training images')
+    if descriptors.ndim!=2 or len(descriptors)!=len(names) or not np.isfinite(descriptors).all():
+        raise ValueError('Invalid bridge descriptors')
+    excluded=np.eye(len(names),dtype=bool)
+    for a,b in attempted:
+        i,j=index[a],index[b];excluded[i,j]=excluded[j,i]=True
+    similarity=descriptors@descriptors.T
+    queues=[]
+    for component in components:
+        left=np.array(sorted(index[n] for n in component))
+        outside=np.ones(len(names),dtype=bool);outside[left]=False
+        right=np.flatnonzero(outside)
+        ii,jj=np.nonzero(~excluded[np.ix_(left,right)])
+        a,b=left[ii],right[jj]
+        # Two candidate queues per component prevent the largest component
+        # from taking the whole matching budget and starving small components.
+        for method,score in [('temporal',np.abs(a-b)),('appearance',-similarity[a,b])]:
+            ranking=np.argsort(score,kind='stable')
+            candidates=[];uses={};deferred=[]
+            for pos in ranking:
+                x,y=sorted((int(a[pos]),int(b[pos])))
+                crowded=uses.get(x,0)>=4 or uses.get(y,0)>=4
+                if crowded and len(deferred)>=budget: continue
+                entry=dict(images=[names[x],names[y]],method=method,
+                           selected_index_gap=y-x,appearance_similarity=float(similarity[x,y]))
+                if crowded:
+                    deferred.append(entry);continue
+                candidates.append(entry);uses[x]=uses.get(x,0)+1;uses[y]=uses.get(y,0)+1
+                if len(candidates)>=budget: break
+            candidates.extend(deferred[:max(0,budget-len(candidates))])
+            queues.append(deque(candidates))
+    chosen=[];seen=set(attempted)
+    while queues and len(chosen)<budget:
+        active=[]
+        for queue in queues:
+            while queue and tuple(queue[0]['images']) in seen: queue.popleft()
+            if queue and len(chosen)<budget:
+                entry=queue.popleft();chosen.append(entry);seen.add(tuple(entry['images']))
+            if queue: active.append(queue)
+        queues=active
+    return chosen
+
+
+def plan_bridges(workspace,config,budget=512):
+    report=check_verified(workspace,config,require_connected=False)
+    if report['pending_pairs']:
+        raise ValueError('Finish the pending match/verification batch before planning further bridges')
+    if report['connected']: return []
+    for marker in ('matching.done','mapping.done','ba.done','alignment.done'):
+        if (workspace/marker).exists():
+            raise ValueError(f'Refusing to change matches after {marker}; inspect the existing reconstruction')
+    pairs=choose_bridge_pairs(config['names'],report['components'],set(all_pairs(workspace,config)),
+                              appearance_descriptors(workspace,config),budget)
+    if not pairs:
+        raise ValueError('No untried pairs remain across disconnected groups. Cached work retained; '
+                         'inspect isolated images in verification_report.json before changing the training set.')
+    rounds=bridge_rounds(workspace,config)
+    rounds.append(dict(round=len(rounds)+1,component_sizes=report['component_sizes'],pairs=pairs))
+    atomic_json(workspace/'bridge_pairs.json',dict(schema=1,config_sha256=digest(workspace/'superglue.json'),
+        policy='Cross-component temporal + pooled-SuperPoint appearance proposals; no pose prior; '
+               'all pairs require SuperGlue matching and COLMAP geometric verification',rounds=rounds))
+    write_pairs(workspace,config)
+    print(f'Bridge round {len(rounds)}: {len(pairs)} new cross-component pairs; existing matches retained.',flush=True)
+    return pairs
 
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage',choices=('prepare','extract','match','import-keypoints','check-verified'))
+    parser.add_argument('stage',choices=('prepare','extract','match','import-keypoints','check-verified','audit-verified','plan-bridges'))
     parser.add_argument('--workspace',type=Path,required=True)
     parser.add_argument('--repository',type=Path)
     parser.add_argument('--max-size',type=int,default=1600)
     parser.add_argument('--max-keypoints',type=int,default=4096)
     parser.add_argument('--gpu',default='1')
+    parser.add_argument('--pending-only',action='store_true',help='Match/import only pairs absent from COLMAP geometry rows')
+    parser.add_argument('--bridge-budget',type=int,default=512)
     parser.add_argument('--device',choices=('cuda','cpu'),default='cuda',help='CPU is for small smoke checks; normal runs use CUDA')
     args=parser.parse_args(argv);workspace=args.workspace.expanduser().resolve()
     if args.stage=='prepare':
@@ -251,9 +413,15 @@ def main(argv=None):
         if args.device=='cuda' and not torch.cuda.is_available(): raise RuntimeError('SuperPoint/SuperGlue requires CUDA in the active 3dgs environment')
         torch.set_num_threads(8)
         print(f'{args.stage}: {torch.cuda.get_device_name(0) if args.device=="cuda" else "CPU"}; physical GPU {args.gpu}',flush=True)
-        (extract if args.stage=='extract' else match)(workspace,config,args.device)
+        if args.stage=='extract': extract(workspace,config,args.device)
+        else: match(workspace,config,args.device,pending_only=args.pending_only)
     elif args.stage=='import-keypoints': import_keypoints(workspace,config)
-    else: check_verified(workspace,config)
+    else:
+        try:
+            if args.stage=='plan-bridges': plan_bridges(workspace,config,args.bridge_budget)
+            else: check_verified(workspace,config,require_connected=args.stage=='check-verified')
+        except ValueError as exc:
+            parser.exit(1,f'COLMAP graph: {exc}\n')
     return 0
 
 

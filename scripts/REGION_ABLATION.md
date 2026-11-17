@@ -6,8 +6,8 @@ For the video sequence, use SuperPoint features and the official indoor
 SuperGlue model on GPU 1. Each selected training image is paired with the next
 20 selected images in natural filename order. For 1,349 images this is 26,770
 pairs, rather than 909,226 exhaustive pairs. The overlap counts **selected
-frames**, not raw video frame numbers. There is no automatic loop-closure
-retrieval or geometry-based pairing in this experiment.
+frames**, not raw video frame numbers. If this graph is disconnected, automatic
+recovery adds bounded cross-component temporal and appearance proposals below.
 
 ```bash
 source /opt/anaconda3/etc/profile.d/conda.sh &&
@@ -40,8 +40,8 @@ into fake SIFT descriptors. `matches_importer --match_type raw` then runs CPU
 geometric verification on the **SuperGlue correspondences**, with GPU SIFT
 disabled. Neither the SIFT extractor nor the exhaustive/sequential SIFT matcher
 is invoked. Mapping, fixed-intrinsics BA, LiDAR-frame alignment and Gaussian
-training follow automatically. A disconnected verified match graph or missing
-registrations stops the run with a report instead of silently dropping images.
+training follow automatically. Disconnected verified groups trigger recovery
+in the same workspace; missing registrations still stop before GS training.
 
 New outputs (the failed SIFT workspace is left available):
 
@@ -52,7 +52,8 @@ New outputs (the failed SIFT workspace is left available):
   the current network/pair. Restarting the same command reuses completed work.
 - `superglue_matching_report.json`: raw correspondence counts;
   `verification_report.json`: verified pair counts, connected components and
-  isolated images. Inspect this before increasing overlap if connectivity fails.
+  isolated images. `bridge_pairs.json` records any additional pairs and their
+  selection reason. All bridge matches pass the same COLMAP verification.
 - `$REGION/runs/crop_colmap_superglue_seq20_fixed_v1/`: the same fixed-LiDAR
   3DGS + AA control, 90k steps for this export, no culling or scale cap, previews
   every 500 steps and parallel regional ROI evaluation every 10k. Only training
@@ -62,6 +63,57 @@ For a different overlap, prefix the command with e.g.
 `COLMAP_SEQUENTIAL_OVERLAP=30`; the output names then contain `seq30`.
 `SUPERPOINT_MAX_SIZE` and `SUPERPOINT_MAX_KEYPOINTS` override feature extraction
 limits. Changing those requires a fresh VERSION (third positional argument).
+
+### Recover a disconnected sequential graph without starting over
+
+Rerun the **same command and version** after pulling. Existing `features.done`,
+per-image descriptors, pair caches and COLMAP geometry rows are reused. A row
+with zero inliers is also a completed attempt and is not reverified. Interrupted
+new pairs resume from their existing match caches.
+
+The launcher first verifies only missing pairs. If components remain, it
+proposes up to 512 untried pairs per round, balancing short temporal gaps and
+pooled SuperPoint descriptor similarity across components. Similarity only
+selects candidates: SuperGlue matches them, then COLMAP verifies them with the
+same settings. No old camera poses or held-out images are used for recovery.
+Up to three rounds run per invocation; `SUPERGLUE_BRIDGE_BUDGET` and
+`SUPERGLUE_BRIDGE_ROUNDS` change these bounded budgets. Original sequential
+settings and the workspace name remain unchanged. `pairs.txt` now includes
+base and added pairs. The ledger is retained across restarts.
+
+Connectivity alone does not prove successful SfM. Mapping, all-image registration
+and alignment checks still run before GS. If no valid bridges are found, the
+component sizes and isolated names remain in `verification_report.json`; the
+pipeline does not merge them using invented correspondences or drop images.
+
+### Additional learnable-geometry controls (GPUs 2 and 3)
+
+Keep the two fixed-LiDAR controls. These two **additional** runs use the same
+LiDAR initialization, images, masks and 90k schedule, with position optimization
+at 0.05 times the native LR, densification and native pruning. Position LR
+endpoints before scene-extent scaling are `8e-6` and `8e-8`; updates start at
+step 1. Native clone/split/prune runs every 100 steps after 500 and before 15k.
+Scale LR stays 0.001, scales remain unconstrained, culling and opacity resets
+stay disabled. Previews run every 500 steps; snapshots and regional train/held-out
+ROI evaluation run every 10k, plus the exposure-matched checkpoint.
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh && conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting && git pull --ff-only
+REGION=/data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/regions/wall_06663_v1
+# Original poses: can start independently of COLMAP.
+bash scripts/run_region_adaptive.sh 2 "$REGION" original
+# Separate terminal, after the SuperGlue COLMAP dataset export finishes:
+bash scripts/run_region_adaptive.sh 3 "$REGION" colmap
+```
+
+Models are `$REGION/runs/crop_original_adaptive_lr005_v1` and
+`$REGION/runs/crop_colmap_superglue_seq20_adaptive_lr005_v1`. The second reads the
+accepted `colmap_superpoint_superglue_seq20_v1/dataset` export, rechecks its audit,
+and still initializes from the original LiDAR, never the new SfM sparse cloud.
+It does not start before that export exists. Camera poses stay fixed within each
+GS run; the learnable positions here are **Gaussian centers**, not camera poses.
+Set `COLMAP_VERSION`/`COLMAP_SEQUENTIAL_OVERLAP` if using another COLMAP workspace.
 
 Once Gaussian training starts, open its live preview in another terminal:
 
