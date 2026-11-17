@@ -117,7 +117,10 @@ Necessary integration changes are recorded in `run_protocol.json`:
 
 First launch on GPU 2 or 3 installs the official extension and fusion dependencies
 in `~/.venvs/gsprior-orange4f`, inheriting the existing 3dgs environment's working
-PyTorch. It does **not** replace native 3DGS's rasterizer. The cached checkout is
+PyTorch and Git-installed **simple_knn**. Setup verifies that both environments
+resolve the same simple_knn extension; it never builds or installs GSPrior's
+bundled simple-knn. Only the plane rasterizer is built from GSPrior.
+It does **not** replace native 3DGS's rasterizer. The cached checkout is
 `~/.cache/3dgs/GSPrior-dcb7c89-orange4f-v1`.
 Concurrent setup is locked. Overrides: `GSPRIOR_REPO`, `GSPRIOR_ENV`.
 

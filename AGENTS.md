@@ -27,3 +27,8 @@ For Proxy-GS, run preparation, training, and automatic rendering without Python
 supervisor subprocesses. Use process replacement for environment/runtime changes
 so training errors remain the direct traceback. Retain proxy/depth caches when
 restarting a failed attempt.
+
+Reuse the user's working Git-installed `simple_knn` from the `3dgs` environment
+for third-party methods, including GSPrior. Do not rebuild or replace it using
+their bundled `simple-knn` submodules. Isolated environments should inherit and
+verify the existing extension; build only the method-specific rasterizer.
