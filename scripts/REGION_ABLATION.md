@@ -23,6 +23,11 @@ device 0 inside COLMAP), then trains/evaluates GS on physical GPU 1. Mapping and
 bundle adjustment use COLMAP's default CPU solver. CLI option names are read
 from the installed COLMAP help, supporting the older `SiftExtraction` /
 `SiftMatching` and newer `FeatureExtraction` / `FeatureMatching` option groups.
+Alignment likewise selects the installed `alignment_max_error` or legacy
+`robust_alignment_max_error` flag; the legacy robust-alignment switch is enabled
+when exposed. A failed option check stops before feature extraction or training.
+After pulling a compatibility fix, rerun the same command and version to reuse
+the prepared workspace; no deletion or new export is needed.
 Exhaustive matching tries all selected-image pairs and can take substantial
 time. Per-stage logs and successful stage markers are saved; interrupted
 preprocessing reuses completed stages. The launcher never stops another run.

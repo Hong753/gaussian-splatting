@@ -176,8 +176,8 @@ def test_comparison_requires_explicit_pose_difference_and_uses_own_poses(tmp_pat
     np.testing.assert_allclose(specs[0]['records']['00003.png']['R'],specs[1]['records']['00003.png']['R'])
 
 
-@pytest.mark.parametrize('modern',[False,True])
-def test_shell_gpu1_sequence_cache_and_training_handoff(tmp_path,region,modern):
+@pytest.mark.parametrize('modern,legacy_alignment',[(False,True),(False,False),(True,False)])
+def test_shell_gpu1_sequence_cache_and_training_handoff(tmp_path,region,modern,legacy_alignment):
     """Exercise the real launcher/helper/plan; replace COLMAP and the CUDA host."""
     repo=Path(__file__).resolve().parents[1];launch=tmp_path/'launch/scripts';launch.mkdir(parents=True)
     shutil.copy(repo/'scripts/run_region_colmap.sh',launch/'run_region_colmap.sh')
@@ -194,13 +194,16 @@ def test_shell_gpu1_sequence_cache_and_training_handoff(tmp_path,region,modern):
 from pathlib import Path
 args=sys.argv[1:];command=args[0]
 def opt(name): return args[args.index('--'+name)+1]
+legacy=os.environ['LEGACY_ALIGNMENT']=='1'
+alignment_options=['robust_alignment','robust_alignment_max_error'] if legacy else ['alignment_max_error']
+if os.environ.get('MISSING_ALIGNMENT')=='1': alignment_options=[]
 if '-h' in args:
     prefix='Feature' if os.environ['MODERN']=='1' else 'Sift'
     groups={'feature_extractor':[prefix+'Extraction.'+v for v in ['use_gpu','gpu_index','max_image_size']]+['image_list_path','ImageReader.existing_camera_id'],
     'exhaustive_matcher':[prefix+'Matching.'+v for v in ['use_gpu','gpu_index']],
     'mapper':['Mapper.ba_refine_'+v for v in ['focal_length','principal_point','extra_params']],
     'bundle_adjuster':['BundleAdjustment.refine_'+v for v in ['focal_length','principal_point','extra_params']],
-    'model_aligner':['ref_images_path','ref_is_gps','alignment_type','alignment_max_error','transform_path']}
+    'model_aligner':['ref_images_path','ref_is_gps','alignment_type','transform_path']+alignment_options}
     print(' '.join('--'+v for v in groups[command]));sys.exit(0)
 assert os.environ['CUDA_VISIBLE_DEVICES']=='1'
 with open(os.environ['CALLS'],'a') as f: f.write(json.dumps(args)+'\\n')
@@ -212,12 +215,17 @@ elif command=='feature_extractor':
 elif command in ['mapper','bundle_adjuster','model_aligner']:
     output=Path(opt('output_path'));output=output/'0' if command=='mapper' else output
     shutil.copytree(os.environ['FIXTURE'],output,dirs_exist_ok=True)
-    if command=='model_aligner': Path(opt('transform_path')).write_text('test similarity')
+    if command=='model_aligner':
+        tolerance='robust_alignment_max_error' if legacy else 'alignment_max_error'
+        assert float(opt(tolerance))>0
+        assert ('--alignment_max_error' not in args) if legacy else ('--robust_alignment_max_error' not in args and '--robust_alignment' not in args)
+        if legacy: assert opt('robust_alignment')=='1'
+        Path(opt('transform_path')).write_text('test similarity')
 ''')
     fake.chmod(0o755)
     env={**os.environ,'PATH':str(bindir)+os.pathsep+os.environ['PATH'],'RECONSTRUCTION_CONDA_SH':str(conda),
          'LAUNCH_MARKER':str(tmp_path/'handoff'),'CALLS':str(tmp_path/'calls'),'FIXTURE':str(fixture),'MODERN':str(int(modern)),
-         'COLMAP_BIN':str(fake)}
+         'COLMAP_BIN':str(fake),'LEGACY_ALIGNMENT':str(int(legacy_alignment))}
     result=subprocess.run(['bash',str(launch/'run_region_colmap.sh'),'1',str(region)],env=env,capture_output=True,text=True,timeout=60)
     assert result.returncode==0,result.stdout+result.stderr
     model=region/'runs/crop_colmap_fixed_v1';assert (tmp_path/'handoff').read_text()==str(model)
@@ -225,12 +233,20 @@ elif command in ['mapper','bundle_adjuster','model_aligner']:
     assert [a[0] for a in calls]==['database_creator','feature_extractor','exhaustive_matcher','mapper','bundle_adjuster','model_aligner']
     assert '--input_path' not in calls[3]  # Fresh SfM, not BA initialized from old poses.
     assert calls[-1][calls[-1].index('--ref_is_gps')+1]=='0'
+    tolerance_option='--robust_alignment_max_error' if legacy_alignment else '--alignment_max_error'
+    assert float(calls[-1][calls[-1].index(tolerance_option)+1])==pytest.approx(json.loads((region/'colmap_train_v1/job.json').read_text())['alignment_max_error'])
     plan=json.loads((model/'periodic_evaluation/plan.json').read_text());assert plan['gpu']=='1'
     assert plan['training_args']['debug_preview_every']==500
     # Remove only the synthetic, unstarted training plan: cached COLMAP is reused.
     shutil.rmtree(model)
     again=subprocess.run(['bash',str(launch/'run_region_colmap.sh'),'1',str(region)],env=env,capture_output=True,text=True,timeout=60)
     assert again.returncode==0,again.stdout+again.stderr
+    assert len((tmp_path/'calls').read_text().splitlines())==6
+    missing=subprocess.run(['bash',str(launch/'run_region_colmap.sh'),'1',str(region),'missing'],
+                           env={**env,'MISSING_ALIGNMENT':'1'},capture_output=True,text=True,timeout=15)
+    assert missing.returncode!=0 and 'Stopped before reconstruction' in missing.stderr
+    assert not (region/'colmap_train_missing/database.db').exists()
+    assert not (region/'runs/crop_colmap_fixed_missing').exists()
     assert len((tmp_path/'calls').read_text().splitlines())==6
     (bindir/'nvidia-smi').write_text('#!/bin/sh\nexit 2\n')
     failed=subprocess.run(['bash',str(launch/'run_region_colmap.sh'),'1',str(region),'v2'],env=env,capture_output=True,text=True,timeout=15)

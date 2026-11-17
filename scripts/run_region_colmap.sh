@@ -33,12 +33,14 @@ run_stage() {
   printf 'COLMAP stage: %s\n' "$1"
   colmap_gpu "$@" 2>&1 | tee "$job/logs/$log.log"
 }
+echo 'Checking COLMAP options; reconstruction and GS training have not started yet.'
 for command in feature_extractor exhaustive_matcher mapper bundle_adjuster model_aligner; do
   colmap_gpu "$command" -h >"$job/logs/${command}_help.txt" 2>&1
 done
 # COLMAP renamed these option groups; use the installed executable's help.
 feature_help="$job/logs/feature_extractor_help.txt"
 matching_help="$job/logs/exhaustive_matcher_help.txt"
+alignment_help="$job/logs/model_aligner_help.txt"
 if grep -q -- '--FeatureExtraction.use_gpu' "$feature_help"; then extraction=FeatureExtraction; else extraction=SiftExtraction; fi
 if grep -q -- '--FeatureMatching.use_gpu' "$matching_help"; then matching=FeatureMatching; else matching=SiftMatching; fi
 require_option() {
@@ -52,9 +54,22 @@ for option in focal_length principal_point extra_params; do
   require_option "$job/logs/mapper_help.txt" "Mapper.ba_refine_$option"
   require_option "$job/logs/bundle_adjuster_help.txt" "BundleAdjustment.refine_$option"
 done
-for option in ref_images_path ref_is_gps alignment_type alignment_max_error transform_path; do
-  require_option "$job/logs/model_aligner_help.txt" "$option"
+for option in ref_images_path ref_is_gps alignment_type transform_path; do
+  require_option "$alignment_help" "$option"
 done
+alignment_extra=()
+if grep -q -- '--alignment_max_error' "$alignment_help"; then
+  alignment_error_option=alignment_max_error
+elif grep -q -- '--robust_alignment_max_error' "$alignment_help"; then
+  alignment_error_option=robust_alignment_max_error
+else
+  echo "Stopped before reconstruction: COLMAP exposes neither alignment_max_error nor robust_alignment_max_error (see $alignment_help)." >&2
+  exit 1
+fi
+if grep -Eq -- '--robust_alignment([[:space:]=]|$)' "$alignment_help"; then
+  alignment_extra+=(--robust_alignment 1)
+fi
+printf 'COLMAP alignment tolerance option: --%s\n' "$alignment_error_option"
 
 if [[ ! -e "$job/database.db" ]]; then run_stage database database_creator --database_path "$job/database.db"; fi
 python scripts/region_colmap.py seed-cameras --workspace "$job"
@@ -96,10 +111,11 @@ if [[ ! -e "$job/alignment.done" ]]; then
   mkdir -p "$job/aligned"
   run_stage alignment model_aligner --input_path "$job/refined" --output_path "$job/aligned" \
     --ref_images_path "$job/reference_centers.txt" --ref_is_gps 0 --alignment_type custom \
-    --alignment_max_error "$tolerance" --transform_path "$job/similarity.txt"
+    "--$alignment_error_option" "$tolerance" "${alignment_extra[@]}" --transform_path "$job/similarity.txt"
   touch "$job/alignment.done"
 fi
 python -u scripts/region_colmap.py export --workspace "$job"
+printf 'COLMAP preprocessing completed; preparing Gaussian training on GPU %s.\n' "$gpu"
 flock -u 9
 exec 9>&-
 python -u scripts/run_region_ablation.py --region "$job/dataset" --context crop \
