@@ -163,6 +163,7 @@ def execute_plan(args, plan):
     for field in ('feature_lr', 'opacity_lr', 'rotation_lr'):
         if field in plan: smoke += ['--'+field.replace('_','-'),str(plan[field])]
     if plan['opacity_resets']: smoke.append('--opacity-resets')
+    if not plan['antialiasing']: smoke.append('--no-antialiasing')
     invoke(smoke)
     if plan.get('lidar_scp'):
         invoke(['scripts/smoke_lidar_scp.py','--gpu',args.gpu,

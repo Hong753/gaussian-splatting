@@ -173,7 +173,7 @@ def soft_diagnostics(model, start, end):
 def verify_metrics(data, iteration, summary, csv_path):
     if (summary['iteration'] != iteration or summary['model'] != data['model'] or
             summary['source'] != data['source'] or summary['model_type'] != '3dgs' or
-            not summary['antialiasing'] or summary['occlusion']['occlusion_mode'] != 'off'):
+            summary['antialiasing'] != data['plan'].get('antialiasing', True) or summary['occlusion']['occlusion_mode'] != 'off'):
         raise ValueError('Evaluation used the wrong checkpoint or render protocol')
     expected = dict(all=len(data['frames']), selected=len(data['selected']),
                     unselected=len(data['frames'])-len(data['selected']))
@@ -192,16 +192,17 @@ def verify_metrics(data, iteration, summary, csv_path):
 
 def evaluate(data, snapshot, start):
     iteration, model = snapshot['iteration'], Path(data['model'])
+    aa_flag = '--antialiasing' if data['plan'].get('antialiasing', True) else '--no-antialiasing'
     metric = model/f'psnr_all_frames/iteration_{iteration}'
     previews = model/f'view_comparisons/iteration_{iteration}'
     run_occlusion.invoke(['scripts/eval_all_frames.py', '--source', data['source'], '--model', str(model),
-        '--iteration', str(iteration), '--antialiasing', '--occlusion', 'off',
+        '--iteration', str(iteration), aa_flag, '--occlusion', 'off',
         '--expected-frames', str(data['expected_frames'])])
     summary = json.loads((metric/'summary.json').read_text())
     verify_metrics(data, iteration, summary, metric/'per_frame.csv')
     run_occlusion.invoke(['scripts/render.py', '--model', str(model), '--iteration', str(iteration),
         '--split', 'both', '--eval-set', 'unselected', '--max-views', str(data['report_max_views']),
-        '--antialiasing', '--occlusion', 'off', '--gpu', data['gpu'], '--in-process', '--output', str(previews)])
+        aa_flag, '--occlusion', 'off', '--gpu', data['gpu'], '--in-process', '--output', str(previews)])
     if read_snapshot(model, iteration) != snapshot:
         raise ValueError('Snapshot changed during evaluation')
     if not (previews/'index.html').is_file():
@@ -217,7 +218,7 @@ def evaluate(data, snapshot, start):
         refined=metric/'poses_refined'
         refined_previews=previews/'poses_refined'
         run_occlusion.invoke(['scripts/eval_all_frames.py','--source',data['source'],'--model',str(model),
-            '--iteration',str(iteration),'--antialiasing','--occlusion','off','--camera-poses','refined',
+            '--iteration',str(iteration),aa_flag,'--occlusion','off','--camera-poses','refined',
             '--expected-frames',str(data['expected_frames'])])
         cached=json.loads((refined/'summary.json').read_text())
         verify_metrics(data,iteration,cached,refined/'per_frame.csv')
@@ -228,7 +229,7 @@ def evaluate(data, snapshot, start):
             raise ValueError('Unselected camera evaluation changed when applying train-only pose offsets')
         run_occlusion.invoke(['scripts/render.py','--model',str(model),'--iteration',str(iteration),
             '--split','both','--eval-set','unselected','--max-views',str(data['report_max_views']),
-            '--antialiasing','--occlusion','off','--camera-poses','refined','--gpu',data['gpu'],
+            aa_flag,'--occlusion','off','--camera-poses','refined','--gpu',data['gpu'],
             '--in-process','--output',str(refined_previews)])
         if not (refined_previews/'index.html').is_file() or read_snapshot(model,iteration)!=snapshot:
             raise ValueError('Missing pose comparisons or changed checkpoint during evaluation')
@@ -240,7 +241,7 @@ def evaluate(data, snapshot, start):
             enabled=previews/'poses_refined_culling_on'
             run_occlusion.invoke(['scripts/render.py','--model',str(model),'--iteration',str(iteration),
                 '--split','both','--eval-set','unselected','--max-views',str(data['report_max_views']),
-                '--antialiasing','--occlusion','on','--camera-poses','refined','--gpu',data['gpu'],
+                aa_flag,'--occlusion','on','--camera-poses','refined','--gpu',data['gpu'],
                 '--in-process','--output',str(enabled)])
             result['culling_comparison']=str(combine(refined_previews,enabled,previews/'culling_comparison',model,iteration))
             if read_snapshot(model,iteration)!=snapshot:

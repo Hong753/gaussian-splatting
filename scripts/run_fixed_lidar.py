@@ -50,6 +50,7 @@ def parser():
     p.add_argument('--distance-far-quantile',type=float,default=.95)
     p.add_argument('--distance-rank-samples',type=int,default=8192)
     p.add_argument('--resolution', type=int, default=-1)
+    p.add_argument('--antialiasing', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--expected-frames', type=int, default=5009)
     p.add_argument('--report-max-views', type=int, default=64)
     p.add_argument('--eval-memory-fraction', type=float, default=.20)
@@ -113,7 +114,8 @@ def build_plan(args):
         '--initial_point_cloud', str(args.point_cloud.expanduser().resolve()),
         '--keyframe_manifest', str(model/'keyframes.json'),
         '--iterations', str(args.iterations), '--resolution', str(args.resolution),
-        '--data_device', 'cpu', '--disable_viewer', '--antialiasing',
+        '--data_device', 'cpu', '--disable_viewer',
+        *(['--antialiasing'] if getattr(args, 'antialiasing', True) else []),
         '--fixed_lidar', '--max_scale_ratio', str(args.max_scale_ratio),
         '--max_scale_world', str(args.max_scale_world),
         '--position_lr_init', '0', '--position_lr_final', '0', '--densify_until_iter', '0',
@@ -154,7 +156,7 @@ def build_plan(args):
         policy['distance_updates']=config
     return dict(source=str(source), model=str(model), gpu=args.gpu, initial_points=len(vertices.data),
                 max_scale_ratio=args.max_scale_ratio, max_scale_world=args.max_scale_world,
-                positions='fixed throughout', population='constant', antialiasing=True,
+                positions='fixed throughout', population='constant', antialiasing=getattr(args, 'antialiasing', True),
                 hard_culling=False, soft_surface=False, opacity_resets=False,
                 stages=[dict(name='train', argv=command)], **policy)
 

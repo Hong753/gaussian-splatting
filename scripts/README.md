@@ -1,5 +1,8 @@
 # Training
 
+For four shared-input orange4f runs (native 3DGS and released GSPrior, each with
+learnable or fixed LiDAR centers, AA off), see [ORANGE4F.md](ORANGE4F.md).
+
 For a spatial image/pose/LiDAR subset, interactive selection, and a controlled
 regional blur ablation with matching GT/render previews, see
 [REGION_ABLATION.md](REGION_ABLATION.md).

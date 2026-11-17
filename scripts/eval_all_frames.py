@@ -49,7 +49,7 @@ def main():
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--iteration", type=int, default=-1, help="Saved iteration, or -1 for latest")
-    parser.add_argument("--antialiasing", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--antialiasing", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument('--expected-frames', type=int, default=0,
                         help='Fail unless this many registered images are evaluated (0: no explicit count)')
     add_arguments(parser)
@@ -57,6 +57,8 @@ def main():
     args = parser.parse_args()
     model, source = args.model.resolve(), args.source.resolve()
     cfg = read_config(model / "cfg_args")
+    if args.antialiasing is None:
+        args.antialiasing = bool(cfg.get('antialiasing', True))
     model_type = cfg.get("model_type", "3dgs")
     spec = pose_options.apply_overrides(apply_overrides(dict(path=model, cfg=cfg, type=model_type), args),args)
     cfg = spec["cfg"]

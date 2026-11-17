@@ -11,7 +11,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
-def check_empty_rendering(render, device='cuda'):
+def check_empty_rendering(render, device='cuda', antialiasing=True):
     """A globally empty model differs from a nonempty, invisible camera view."""
     import torch
     from utils.graphics_utils import getProjectionMatrix
@@ -19,7 +19,7 @@ def check_empty_rendering(render, device='cuda'):
         world_view_transform=torch.eye(4,device=device),
         full_proj_transform=getProjectionMatrix(.01,100.,math.pi/2,math.pi/2).to(device).T,
         camera_center=torch.zeros(3,device=device))
-    pipe=SimpleNamespace(compute_cov3D_python=False,convert_SHs_python=False,antialiasing=True,
+    pipe=SimpleNamespace(compute_cov3D_python=False,convert_SHs_python=False,antialiasing=antialiasing,
                          debug=True,occlusion_mode='off')
     for n in (0,2):
         xyz=torch.tensor([[0.,0.,-2.]]*n,device=device).reshape(n,3).requires_grad_()
@@ -50,6 +50,7 @@ def main(argv=None):
     p.add_argument('--opacity-lr', type=float, default=.025)
     p.add_argument('--rotation-lr', type=float, default=.001)
     p.add_argument('--opacity-resets', action='store_true')
+    p.add_argument('--antialiasing', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--iterations', type=int, default=30000)
     p.add_argument('--preserve-densification-radii', action='store_true')
     p.add_argument('--freeze-lidar-positions', action='store_true')
@@ -70,7 +71,7 @@ def main(argv=None):
     from utils.graphics_utils import BasicPointCloud, getProjectionMatrix
     if not torch.cuda.is_available():
         raise RuntimeError('Native LiDAR smoke requires the CUDA-enabled 3dgs environment')
-    empty_checks=check_empty_rendering(render)
+    empty_checks=check_empty_rendering(render, antialiasing=args.antialiasing)
     opt_parser = argparse.ArgumentParser()
     params = OptimizationParams(opt_parser)
     opt = params.extract(opt_parser.parse_args(['--scale_control', 'off',
@@ -101,7 +102,7 @@ def main(argv=None):
         full_proj_transform=getProjectionMatrix(.01,100.,math.pi/2,math.pi/2).cuda().T,
         camera_center=torch.zeros(3, device='cuda'))
     pipe = SimpleNamespace(convert_SHs_python=False, compute_cov3D_python=False,
-                           debug=True, antialiasing=True, occlusion_mode='off')
+                           debug=True, antialiasing=args.antialiasing, occlusion_mode='off')
     for step in range(1, 4):
         lr = model.update_learning_rate(step)
         assert (lr == 0) if args.freeze_lidar_positions else (lr > 0)
@@ -177,7 +178,7 @@ def main(argv=None):
                 assert torch.equal(before,restored.get_xyz)
             else: raise AssertionError('Pruning deleted the entire fixed cloud')
         result = dict(passed=True, cuda_device=torch.cuda.get_device_name(), torch=torch.__version__,
-            native_aa_rgb_gradients=True, fixed_centers=True, appearance_updated=True,
+            native_rgb_gradients=True, antialiasing=args.antialiasing, fixed_centers=True, appearance_updated=True,
             opacity_and_world_pruning=True, no_cloning_or_splitting=True,
             checkpoint_round_trip=True, scaling_lr=opt.scaling_lr)
         result['learning_rates']=expected_rates
@@ -252,7 +253,7 @@ def main(argv=None):
                 record_stats=True, max_world_size=.01, preserve_radii=True)
             assert len(model.get_xyz) == 4 and model.last_densification_stats['pruned'] == 1
     result = dict(passed=True, cuda_device=torch.cuda.get_device_name(), torch=torch.__version__,
-        native_aa_rgb_xyz_gradients=True, reduced_lr_updates_xyz=True, no_scale_projection=True,
+        native_rgb_xyz_gradients=True, antialiasing=args.antialiasing, reduced_lr_updates_xyz=True, no_scale_projection=True,
         clone_and_split=True, pruning_disabled_path_checked=True, native_opacity_pruning=True,
         children_optimized=True, percent_dense=opt.percent_dense,
         position_lr_divisor=args.position_lr_divisor, scaling_lr=opt.scaling_lr,
