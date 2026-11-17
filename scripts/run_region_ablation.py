@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare fixed-position regional reconstruction or its full-cloud control."""
+"""Prepare fixed or adaptive regional reconstruction and its full-cloud control."""
 import argparse
 import hashlib
 import json
@@ -23,9 +23,18 @@ def prepare_args(argv=None):
     p.add_argument('--iterations',type=int,default=30000)
     p.add_argument('--reference-steps',type=int,default=100000,
                    help='Full-scene step count for the matched expected updates/image checkpoint')
+    p.add_argument('--geometry',choices=('fixed','adaptive'),default='fixed',
+                   help='Adaptive enables XYZ optimization, cloning/splitting and pruning')
+    p.add_argument('--position-lr-multiplier',type=float,default=.05,
+                   help='Adaptive XYZ LR multiplier relative to native 3DGS, before scene-extent scaling')
     p.add_argument('--dry-run',action='store_true')
     args=p.parse_args(argv)
+    if not math.isfinite(args.position_lr_multiplier) or not 0 < args.position_lr_multiplier <= 1:
+        raise ValueError('Position LR multiplier must be finite and in (0, 1]')
     region=args.region.expanduser().resolve()
+    if not (region/'selection.json').is_file():
+        raise FileNotFoundError(f'Region has not been exported: {region}. '
+                                'Run scripts/run_region_auto.sh GPU for automatic export and training.')
     meta=json.loads((region/'selection.json').read_text())
     if meta.get('schema') != 1 or Path(meta['region']) != region:
         raise ValueError('Selection export was moved or has an incompatible schema; re-export with select_region.py')
@@ -40,14 +49,27 @@ def prepare_args(argv=None):
     matched=max(1,round(args.reference_steps*len(train)/meta['original_train_count']))
     # Always include the requested exposure-matched checkpoint, even for a large box.
     iterations=args.iterations if matched<=args.iterations else 10000*math.ceil(matched/10000)
-    model=(args.model or region/'runs'/f'{args.context}_v1').expanduser().resolve()
+    suffix='v1' if args.geometry=='fixed' else f'adaptive_lr{args.position_lr_multiplier:g}_v1'
+    model=(args.model or region/'runs'/f'{args.context}_{suffix}').expanduser().resolve()
     point_cloud=region/'input.ply' if args.context=='crop' else Path(meta['original_point_cloud'])
     command=['--source',str(region),'--model',str(model),'--keyframes',str(region/'keyframes.json'),
              '--point-cloud',str(point_cloud),'--gpu',args.gpu,'--iterations',str(iterations),
              '--checkpoint-every','10000','--extra-checkpoints',str(matched),
              '--expected-frames',str(len(meta['selection'])),'--resolution','1',
-             '--loss-mask-dir',str(region/'masks'),'--freeze-lidar-positions','--scaling-lr','.001',
-             '--densify-from-iter','0','--densify-until-iter','1','--densification-interval','250']
+             '--loss-mask-dir',str(region/'masks'),'--scaling-lr','.001']
+    if args.geometry=='fixed':
+        command+=['--freeze-lidar-positions','--densify-from-iter','0',
+                  '--densify-until-iter','1','--densification-interval','250']
+        geometry='fixed XYZ; learned color/opacity/rotation/scale; no growth, pruning, scale limits or opacity resets'
+    else:
+        if iterations <= 600:
+            raise ValueError('Adaptive regional training needs more than 600 steps for native densification')
+        command+=['--position-lr-divisor',str(1/args.position_lr_multiplier),'--pruning',
+                  '--densify-from-iter','500','--densify-until-iter',str(min(15000,iterations)),
+                  '--densification-interval','100','--percent-dense','.01',
+                  '--densify-grad-threshold','.0002']
+        geometry=('optimized XYZ from step 1; native cloning/splitting and opacity/size pruning; '
+                  'learned color/opacity/rotation/scale; no scale limits or opacity resets')
     if args.dry_run: command.append('--dry-run')
     training=native.parser().parse_args(command)
     protocol=dict(region=str(region),context=args.context,model=str(model),
@@ -57,12 +79,14 @@ def prepare_args(argv=None):
                   expected_updates_per_image=dict(full=args.reference_steps/meta['original_train_count'],regional=matched/len(train)),
                   loss='ROI-normalized L1 + SSIM; outside-ROI pixels unsupervised',
                   visibility='native 3DGS + AA, no external culling',
-                  geometry='fixed XYZ; learned color/opacity/rotation/scale; no growth, pruning, scale limits or opacity resets',
+                  geometry=geometry,geometry_mode=args.geometry,
+                  position_lr_multiplier=args.position_lr_multiplier if args.geometry=='adaptive' else 0.,
                   evaluation='ROI PSNR on every exported frame; original training membership; full-frame images dimmed outside ROI',
                   caveats=['Matched expected image draws, not equal per-surface gradient exposure.',
                            'SH degree follows the native global-step schedule; very early matched checkpoints may have lower SH degree.',
                            'Crop and full controls recompute KNN initialization; the halo reduces boundary differences.',
-                           'A temporal-window selection tests view consistency but also changes coverage.'])
+                           'A temporal-window selection tests view consistency but also changes coverage.',
+                           'Adaptive mode uses the exported cameras\' scene extent for XYZ LR and split/prune thresholds; full-scene and regional extents differ.'])
     return training, protocol
 
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Select a LiDAR region, inspect overlapping RGB views, export original poses."""
 import argparse
+import json
 from pathlib import Path
 import sys
 import threading
@@ -30,22 +31,57 @@ def parser():
     p.add_argument('--sample-points', type=int, default=1000000)
     p.add_argument('--port', type=int, default=8091)
     p.add_argument('--review-file', type=Path, help='Autosaved review; defaults to OUTPUT.review.json')
-    p.add_argument('--export', action='store_true', help='Headless export of explicitly kept images from the saved review')
+    p.add_argument('--export', action='store_true', help='Headless export of kept review images, or all candidates with --automatic')
+    p.add_argument('--automatic', action='store_true', help='With --export, use automatic candidates without manual review')
+    p.add_argument('--reuse', action='store_true', help='Reuse a matching automatic export; requires --automatic --export')
     return p
+
+
+def automatic_export(data, args, config):
+    """Reuse only exports with the same inputs, box, filtering and sampling."""
+    if args.output.exists():
+        meta_path=args.output/'selection.json'
+        if not args.reuse or not meta_path.is_file():
+            raise FileExistsError(f'Use a fresh region directory: {args.output}')
+        meta=json.loads(meta_path.read_text())
+        expected=dict(schema=1,region=str(args.output.resolve()),selection_mode='automatic',
+                      source=str(data.source),original_point_cloud=str(data.point_cloud),
+                      original_keyframes=str(data.keyframes),center=config['center'],size=config['size'],
+                      settings={k:v for k,v in config.items() if k not in ('center','size')},
+                      sample_points=data.sample_count,sample_points_requested=data.max_points,
+                      inputs=[*data.pose_stamps,file_stamp(data.point_cloud),file_stamp(data.keyframes)])
+        changed=[key for key,value in expected.items() if meta.get(key)!=value]
+        if changed:
+            raise ValueError(f'Existing region differs in {changed}; use a fresh --output')
+        print(f'Reusing automatic region: {args.output} ({len(meta["selection"])} views)',flush=True)
+        return
+    print('Finding automatic regional candidates (approximate LiDAR visibility)...',flush=True)
+    rows=data.find(**config)
+    data.export(args.output,rows=rows,**config)
 
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.automatic and (not args.export or args.review_file):
+        raise ValueError('--automatic requires --export and cannot use --review-file')
+    if args.reuse and not (args.automatic and args.export):
+        raise ValueError('--reuse requires --automatic --export')
     if args.baseline:
         args.point_cloud = args.point_cloud or args.baseline/'input.ply'
         args.keyframes = args.keyframes or args.baseline/'keyframes.json'
     if args.point_cloud is None or args.keyframes is None:
         raise ValueError('Supply --baseline or both --point-cloud and --keyframes')
-    if args.output.exists():
+    if args.output.exists() and not args.reuse:
         raise FileExistsError(f'Use a new region directory: {args.output}')
     data = RegionData(args.source, args.point_cloud, args.keyframes, args.sample_points)
     settings = dict(halo=args.halo,min_overlap=args.min_overlap,max_camera_distance=args.max_camera_distance,
                     frame_start=args.frame_start,frame_end=args.frame_end,exclude=args.exclude)
+    if args.automatic:
+        if args.center is None and args.anchor not in {im.name for im in data.images}:
+            raise ValueError(f'Anchor {args.anchor!r} not registered; specify --anchor IMAGE_NAME')
+        center=args.center if args.center is not None else data.anchor_center(args.anchor)
+        automatic_export(data,args,dict(center=list(map(float,center)),size=args.size,**settings))
+        return 0
     review_file=(args.review_file or args.output.with_name(args.output.name+'.review.json')).expanduser().resolve()
     if review_file == args.output.resolve() or args.output.resolve() in review_file.parents:
         raise ValueError('Keep --review-file outside the fresh export directory (default: OUTPUT.review.json)')

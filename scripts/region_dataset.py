@@ -224,6 +224,8 @@ class RegionData:
                         original_frame_count=len(self.images), original_lidar_count=len(self.vertices),
                         region=str(output), center=list(map(float,center)), size=list(map(float,size)),
                         settings=settings, lidar_count=len(ids), sample_points=self.sample_count,
+                        sample_points_requested=self.max_points,
+                        selection_mode='manual' if review is not None else 'automatic',
                         mask_max_side=256, selection=rows, mask_sha256=mask_hashes,
                         inputs=[*self.pose_stamps,file_stamp(self.point_cloud),file_stamp(self.keyframes)],
                         calibration_audit=calibration_audit,

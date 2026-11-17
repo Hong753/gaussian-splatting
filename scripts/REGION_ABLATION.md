@@ -1,5 +1,71 @@
 # Regional blur ablation
 
+## Automatic selection and adaptive geometry
+
+For an immediate automatic test around `06663.jpg`, this command **exports the
+region first**, then prepares and starts training on GPU 0:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+git pull --ff-only &&
+python -m pip install -r requirements-region.txt &&
+bash scripts/run_region_auto.sh 0
+```
+
+It uses a 4x4x4 scene-unit box centered on near central LiDAR returns in the
+anchor image, plus a 1-unit halo. Automatic candidate filters use the same
+approximate LiDAR depth masks described below. This bypasses manual review
+explicitly; automatic candidates are not certified as unoccluded.
+
+Outputs are under
+`3dgs_finetuning/regions/wall_06663_auto_v1/runs/crop_adaptive_lr05_v1`.
+The wrapper creates the missing regional dataset, reuses it only if its inputs,
+box, selection settings and sampling match, and refuses to overwrite a model.
+It does not require the earlier `wall_06663_v1` manual export. For a subsequent
+fresh run with the same automatic dataset, pass `GPU REGION v2`.
+`REGION_SOURCE`, `REGION_BASELINE` and `REGION_OUTPUT_ROOT` optionally override
+the scene defaults. Existing GPU jobs are never stopped by this wrapper.
+
+This mode uses 3DGS + AA with:
+
+- **Position updates from step 1 at 0.05x native LR** (divisor 20): initial
+  `8e-6`, final `8e-8`, before native camera-extent scaling. No fixed-position warmup.
+- Native adaptive cloning/splitting and opacity/size pruning: start 500,
+  end 15,000, interval 100, gradient threshold `0.0002`, split boundary
+  `0.01 * regional_scene_extent`. The small regional camera extent is recomputed;
+  this is not the earlier whole-scene `0.0001` override.
+- Scaling LR `0.001`, unconstrained scales, opacity resets disabled, original
+  camera poses, and no external culling. Initialization uses all crop+halo LiDAR.
+- At least 30k steps with the exposure-matched checkpoint described below,
+  10k checkpoints and regional ROI evaluation. GT/render/error previews remain
+  enabled at step 1, every 500 steps and the final step.
+
+Open the training previews from a second terminal:
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh &&
+conda activate 3dgs &&
+cd /home/sequor_vfm/gaussian-splatting &&
+python scripts/serve_training_previews.py \
+  --model /data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/regions/wall_06663_auto_v1/runs/crop_adaptive_lr05_v1 \
+  --port 8092
+```
+
+Browse `http://211.172.247.108:8092`. The evaluator measures only the exported
+regional frames and ROI pixels, not all 5,009 full-scene images.
+
+For a manually exported region, the same adaptive mode is available through
+`scripts/run_region_ablation.py --region REGION --geometry adaptive
+--position-lr-multiplier .05 --model MODEL --gpu 0`, followed by
+`bash scripts/run_prepared_reconstruction.sh MODEL`.
+For headless automatic export alone, use `scripts/select_region.py` with
+the source, baseline, output and box arguments below plus `--automatic --export`;
+add `--reuse` to validate and reuse an existing automatic export.
+
+## Fixed-position control and manual selection
+
 Question: does a fixed-position reconstruction become sharp when trained on
 images of one physical region, and does removing the rest of the LiDAR matter?
 The first diagnostic uses 3DGS + AA, original poses, fixed original LiDAR XYZ,
@@ -89,7 +155,7 @@ offsets. Large offsets need a separate camera-model correction experiment.
 
 For reproducibility or a second temporal-window ablation, use explicit box
 coordinates with `--center X Y Z --size SX SY SZ` and a fresh output, then review
-the resulting candidates. `--export` now requires a saved manual review and
+the resulting candidates. Without `--automatic`, `--export` requires a saved manual review and
 exports its kept images using the saved box/search settings without starting
 Viser. Use `--review-file PATH` to explicitly select a saved review. Optional
 `--frame-start NAME --frame-end NAME` restricts the lexical image-name range

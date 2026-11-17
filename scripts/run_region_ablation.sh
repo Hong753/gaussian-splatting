@@ -8,6 +8,11 @@ source "${RECONSTRUCTION_CONDA_SH:-/opt/anaconda3/etc/profile.d/conda.sh}"
 conda activate 3dgs
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 region_gpu="$1"
+if [[ ! -f "$2/selection.json" ]]; then
+  echo "Region has not been exported: $2" >&2
+  echo "For automatic export and adaptive training: bash scripts/run_region_auto.sh $region_gpu" >&2
+  exit 1
+fi
 region_dir="$(realpath "$2")"
 region_context="${3:-crop}"
 region_version="${4:-v1}"
