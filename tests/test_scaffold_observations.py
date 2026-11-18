@@ -216,3 +216,53 @@ def test_indexed_launcher_trains_on_exact_red_rows(tmp_path, explicit_rows):
         f.write(b'x')
     with pytest.raises(ValueError,match='input changed'):
         runner.main(args)
+
+
+def test_same_checkpoint_ablation_measures_actual_occlusion(tmp_path):
+    from scripts import audit_scaffold_render as audit
+
+    # Three parents overlap on one pixel. Only the middle parent is indexed.
+    diff = ModuleType('diff_gaussian_rasterization')
+    diff.GaussianRasterizationSettings = lambda **kw: kw
+    def rasterizer(raster_settings):
+        def composite(means3D, opacities, colors_precomp, **unused):
+            alpha = opacities[:,0]
+            trans = (1-alpha).cumprod(0)
+            w = torch.cat([torch.ones_like(alpha[:1]), trans[:-1]]) * alpha
+            pixel = (colors_precomp*w[:,None]).sum(0) + trans[-1]*raster_settings['bg']
+            return pixel[:,None,None].expand(3,4,4), torch.ones_like(alpha), None
+        return composite
+    diff.GaussianRasterizer = rasterizer
+    with cpu_backend() as Model:
+        torch.manual_seed(15)
+        path = Path(__file__).resolve().parents[1]/'models/scaffold_renderer.py'
+        spec = importlib.util.spec_from_file_location('scaffold_audit_backend',path)
+        backend = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules,{'diff_gaussian_rasterization':diff,
+                    'models.scaffold_gaussian':SimpleNamespace(ScaffoldGaussianModel=Model)}):
+            spec.loader.exec_module(backend)
+        gs = build(Model,True)
+        gs.eval()
+        cam = SimpleNamespace(FoVx=1.,FoVy=1.,camera_center=torch.zeros(3),image_width=4,image_height=4,
+                              world_view_transform=torch.eye(4),full_proj_transform=torch.eye(4),
+                              image_name='test.jpg',original_image=torch.full((3,4,4),.4))
+        visible = torch.tensor([False,True,False,True,False,True])
+        selected = torch.tensor([False,False,False,True,False,False])
+        pipe = SimpleNamespace(debug=False,antialiasing=False)
+        bg = torch.zeros(3)
+        with torch.no_grad(), patch.dict(sys.modules, {'models.scaffold_renderer':backend}), \
+                patch.object(backend, 'prefilter_voxel', return_value=visible):
+            gs.mlp_opacity[2].weight.zero_()
+            gs.mlp_opacity[2].bias.copy_(torch.tensor([.8,-.8]).atanh())
+            images,stats = audit.compare(cam,gs,pipe,bg,selected)
+            torch.testing.assert_close(images[3][:,0,0],torch.tensor([.832,.16,.008]))
+            assert stats['indexed_coverage'] == 1. and stats['indexed_children'] == 1 and stats['full_children'] == 3
+            assert stats['fraction_indexed_weight_blocked'] == pytest.approx(.8)
+            assert not torch.equal(images[1],images[2])
+            all_images,_ = audit.compare(cam,gs,pipe,bg,visible)
+            torch.testing.assert_close(all_images[1],all_images[2],atol=0,rtol=0)
+            empty_images,empty_stats = audit.compare(cam,gs,pipe,bg,torch.zeros_like(visible))
+            assert not empty_images[2].any() and empty_stats['indexed_coverage'] == 0
+            assert empty_stats['mean_indexed_weight'] == 0 and empty_stats['fraction_indexed_weight_blocked'] is None
+        audit.write_report(tmp_path,10000,{'test.jpg':dict(stats,images=['a.png']*4)})
+        assert '83.2%' in (tmp_path/'index.html').read_text()
