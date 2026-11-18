@@ -219,6 +219,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print(f'Scale {"cap" if opt.scale_control == "clamp" else "penalty target"} = '
                   f'{opt.max_scale_ratio:g} x initialization spacing'
                   + (f', limited to {opt.max_scale_world:g} scene units.' if opt.max_scale_world else '.'))
+            if opt.scale_control == 'clamp':
+                caps = gaussians.fixed_lidar_state['log_scale_cap'].detach().reshape(-1)
+                stride = max(1, (caps.numel() + 99999) // 100000)
+                sample = caps[::stride].exp()
+                median, p90, p99 = torch.quantile(sample, sample.new_tensor([.5, .9, .99])).tolist()
+                print(f'Per-anchor axis ceilings in scene units ({sample.numel():,} sampled anchors): '
+                      f'median {median:.5g}, p90 {p90:.5g}, p99 {p99:.5g}', flush=True)
         if opt.scale_control == 'regularize':
             print(f'Scale regularizer weight {opt.scale_regularization_weight:g}: capped initialization; '
                   'no post-step clamp or scale-moment resets. The target is not a guaranteed maximum.')

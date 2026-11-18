@@ -57,6 +57,76 @@ def ply(path, xyz, log_sigma=None):
 
 
 class Orange4FDetailTest(unittest.TestCase):
+    def test_estimate_fixed_scale_needs_only_original_cloud(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            xyz = np.float32([[0,0,0], [1,0,0], [2,0,0], [3,0,0]])
+            ply(root/"input.ply", xyz)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                audit.main(["--fixed-model", str(root), "--estimate-fixed-scale"])
+            result = json.loads(buf.getvalue().split("\n", 1)[1])
+            expected = np.median(np.sqrt(np.array([14,6,6,14])/3))
+            self.assertAlmostEqual(result["initial_3nn_sigma"]["median"], expected, places=6)
+            self.assertAlmostEqual(result["proposed_per_anchor_axis_ceiling"]["median"], 2*expected, places=6)
+
+    def test_fixed_scale_training_reaches_trainer_without_floor_region_or_old_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, fixed = fixture(root)
+            images = root/"capture/sparse/0/images.txt"
+            images.write_text(images.read_text().replace(audit.FRAME, "other.jpg"))
+            (fixed/"point_cloud/iteration_30000/point_cloud.ply").unlink()
+            output = root/"new_fixed"
+            with patch.object(audit, "regional_model", side_effect=AssertionError), \
+                    patch.object(audit.subprocess, "run") as train, patch.object(audit, "evaluate") as evaluate, \
+                    patch.dict("os.environ"):
+                audit.main(["--train-fixed-scale", "--fixed-model", str(fixed), "--output", str(output), "--gpu", "0"])
+            train.assert_called_once()
+            evaluate.assert_called_once()
+            command = train.call_args.args[0]
+            self.assertEqual(command[2], "train.py")
+            parser = argparse.ArgumentParser()
+            ModelParams(parser)
+            OptimizationParams(parser)
+            PipelineParams(parser)
+            opt, _ = parser.parse_known_args(command[3:])
+            self.assertTrue(opt.fixed_lidar)
+            self.assertFalse(opt.freeze_lidar_positions)
+            self.assertEqual((opt.scale_control, opt.max_scale_ratio, opt.densify_until_iter), ("clamp", 2., 0))
+            self.assertEqual(opt.iterations, 50000)
+            self.assertEqual(audit.read_json(output/"keyframes.json"), audit.read_json(fixed/"keyframes.json"))
+
+    def test_adaptive_control_accepts_training_or_absent_reference(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            base, region, _ = fixture(root)
+            manifest = audit.read_json(base/"keyframes.json")
+            manifest["selected_images"][-1] = audit.FRAME
+            (base/"keyframes.json").write_text(json.dumps(manifest))
+            for available in (True, False):
+                if not available:
+                    images = root/"capture/sparse/0/images.txt"
+                    images.write_text(images.read_text().replace(audit.FRAME, "other.jpg"))
+                    manifest["selected_images"][-1] = "other.jpg"
+                    (base/"keyframes.json").write_text(json.dumps(manifest))
+                with self.subTest(available=available):
+                    buf = io.StringIO()
+                    with redirect_stdout(buf):
+                        audit.main(["--baseline", str(base), "--regional", str(region), "--plan-only"])
+                    self.assertIn("training" if available else "0 matching registered images", buf.getvalue())
+                    plan = json.loads(buf.getvalue()[buf.getvalue().index("{"):])
+                    self.assertIn("--percent_dense", plan["command"])
+                    spec = audit.model_info(base)
+                    with patch.object(audit, "measured_frames", return_value=dict(unselected=22)), \
+                            patch.object(audit, "floor_render", return_value=("gt", dict(crop_psnr_db=25, gradient_agreement=.8))) as render, \
+                            patch.object(audit, "run"):
+                        audit.evaluate(spec, region, "0", dict(method="shared-camera similarity", applied_scale=1.))
+                    report = audit.read_json(region/"comparison/results.json")
+                    self.assertIs(report["held_out"], False if available else None)
+                    self.assertEqual(render.call_count, 3 if available else 0)
+                    self.assertEqual("crop_psnr_db" in report["rows"][0], available)
+
     def test_two_checkpoints_keep_original_schedules_and_use_measured_split(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

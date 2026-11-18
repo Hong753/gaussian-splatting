@@ -1,5 +1,54 @@
 # orange4f: shared-input runs, AA off
 
+## Fixed-LiDAR scale
+
+Run `python -u scripts/orange4f_detail.py --estimate-fixed-scale` to print the
+initial sigma and proposed ceiling distribution from the fixed baseline's
+`input.ply`. Each anchor's sigma is the root mean square distance to its three
+nearest other input points, with the native initialization floor. For clouds
+larger than 100,000 anchors, the CPU summary queries a reproducible sample
+against the full cloud.
+
+Run `python -u scripts/orange4f_detail.py --train-fixed-scale` to train with a
+per-axis ceiling of twice each anchor's own initial sigma. The existing fixed
+LiDAR training mode keeps the entire input population and disables pruning and
+opacity resets. `--fixed-scale-ratio` changes the proposed multiplier. The
+default run saves 30k and 50k checkpoints in `fixed_lidar_knn2x_50k_v1`.
+Running the script without these options runs the adaptive split comparison.
+Both comparisons report the actual split of the saved floor photograph and
+omit its crop if it cannot be identified.
+
+## Camera trajectory and source-image video
+
+From the activated `3dgs` environment, export the full capture to MP4 with
+
+```bash
+python -u scripts/render_pose_video.py
+```
+
+The exporter reads the full-scene poses and input point cloud recorded together
+in `stride3_noaa_v1/suite.json`, or the full-scene baseline's saved inputs if the
+suite manifest is absent. It draws the camera path in a fixed 3D overview
+and pairs each moving frustum with the original image for that pose. It projects
+every finite input point and retains the nearest point at each overview pixel.
+Teal marks the geometric field of view up to the displayed depth, including
+points behind intervening surfaces. The amber top edge shows camera roll.
+The default video includes every registered image in natural filename order at
+24 fps and is saved to
+`/data/3dgs_outputs/orange4f/3dgs_finetuning/pose_trajectory.mp4`.
+The export runs on CPU and requires FFmpeg with libx264.
+
+For a clip starting at the floor diagnostic frame, run
+
+```bash
+python -u scripts/render_pose_video.py --start-frame 12569.jpg --max-frames 120 \
+  --output /data/3dgs_outputs/orange4f/3dgs_finetuning/floor_trajectory.mp4
+```
+
+Use `--frustum-depth` to choose the drawing depth in reconstruction units.
+To inspect a different reconstruction, pass `--source DATASET --point-cloud RAW.ply`
+with both inputs in the same world frame.
+
 ## Scaffold-GS: two additional runs
 
 These extend an existing prepared suite without modifying the first four runs,

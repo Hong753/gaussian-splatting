@@ -158,7 +158,7 @@ def same_photo(a, b):
         return first.size == second.size and np.array_equal(first.convert("RGB"), second.convert("RGB"))
 
 
-def training_command(base, output, ratio):
+def training_command(base, output, ratio=None, fixed_scale_ratio=None):
     """Recreate the actual native model and optimizer settings, including the 30k LR horizon."""
     from arguments import ModelParams, OptimizationParams, PipelineParams
     parser = argparse.ArgumentParser()
@@ -171,12 +171,19 @@ def training_command(base, output, ratio):
     if (cfg.get("model_type", "3dgs") != "3dgs" or cfg.get("loss_mask_dir") or cfg.get("depths")
             or cfg.get("train_test_exp") or cfg.get("occlusion_mode", "off") != "off"
             or cfg.get("train_depth_occlusion_dir") or opt.get("pose_refinement")
-            or opt.get("iterations") != STEPS[0] or not cfg.get("keyframe_manifest")):
-        raise ValueError("--baseline must be the full-scene, native 30k RGB keyframe control")
+            or (fixed_scale_ratio is None and opt.get("iterations") != STEPS[0]) or not cfg.get("keyframe_manifest")):
+        raise ValueError("Expected a native, full-scene RGB keyframe baseline (30k for the adaptive comparison)")
     settings = {**cfg, **opt, "source_path": str(Path(cfg["source_path"]).resolve()),
                 "model_path": str(output), "initial_point_cloud": str(base["path"] / "input.ply"),
-                "keyframe_manifest": str(output / "keyframes.json"), "iterations": STEPS[-1],
-                "percent_dense": ratio}
+                "keyframe_manifest": str(output / "keyframes.json"), "iterations": STEPS[-1]}
+    if fixed_scale_ratio is None:
+        settings["percent_dense"] = positive(ratio)
+    else:
+        if not (opt.get("freeze_lidar_positions") or opt.get("fixed_lidar")):
+            raise ValueError("--fixed-model must identify a fixed-center LiDAR baseline")
+        settings.update(fixed_lidar=True, freeze_lidar_positions=False, scale_control="clamp",
+                        max_scale_ratio=positive(fixed_scale_ratio), max_scale_world=0.,
+                        densify_until_iter=0, position_lr_init=0., position_lr_final=0.)
     command = [sys.executable, "-u", "train.py"]
     for key, default in defaults.items():
         value = settings.get(key, default)
@@ -213,6 +220,46 @@ def quantiles(values):
     return dict(zip(("p10", "median", "p90", "p99"), map(float, np.percentile(values, (10, 50, 90, 99)))))
 
 
+def estimate_fixed_scale(cloud, ratio):
+    from plyfile import PlyData
+    from scripts.audit_lidar_scale import initial_sigma
+    ratio = positive(ratio)
+    v = PlyData.read(str(cloud), mmap="r")["vertex"].data
+    if not set("xyz") <= set(v.dtype.names) or {"scale_0", "f_dc_0"} & set(v.dtype.names):
+        raise ValueError(f"Expected an original XYZ point cloud in {cloud}")
+    xyz = np.column_stack([v[k] for k in "xyz"]).astype(np.float32, copy=False)
+    if len(xyz) <= 100000:
+        query = xyz
+    else:
+        query = xyz[np.random.default_rng(0).choice(len(xyz), 100000, replace=False)]
+    print(f"Measuring {len(query):,} anchors against all {len(xyz):,} input points ...", flush=True)
+    sigma = initial_sigma(xyz, query)
+    return dict(point_cloud=str(cloud), input_points=len(xyz), measured_anchors=len(query),
+                units="input PLY scene units, per-axis standard deviation",
+                initial_3nn_sigma=quantiles(sigma), proposed_ceiling_over_initial=ratio,
+                proposed_per_anchor_axis_ceiling=quantiles(sigma * ratio))
+
+
+def floor_reference(spec):
+    names = [name for name in spec["records"] if Path(name).name == FRAME]
+    if FRAME in names:
+        names = [FRAME]
+    if len(names) != 1:
+        return None, f"{FRAME} has {len(names)} matching registered images"
+    name = names[0]
+    record = spec["records"][name]
+    if ROI[0]+ROI[2] > record["width"] or ROI[1]+ROI[3] > record["height"]:
+        return None, f"saved floor crop is outside {name} at its native resolution"
+    original = FLOOR_SOURCE/"images"/FRAME
+    try:
+        if original.is_file() and not same_photo(original, Path(record["image_path"])):
+            return None, f"{name} differs from the source photograph used to select the floor crop"
+    except OSError as exc:
+        return None, f"could not verify the saved crop photograph ({exc})"
+    split = "training" if name in spec["splits"]["train"] else "held-out"
+    return name, split
+
+
 def fixed_floor_plane(source, cloud, record):
     if Path(source).resolve() == FLOOR_SOURCE.resolve():
         return CENTER, NORMAL, "saved diagnostic"
@@ -240,9 +287,10 @@ def spacing_report(model):
     opt = spec["cfg"].get("optimization_settings", {})
     if spec["type"] != "3dgs" or not (opt.get("freeze_lidar_positions") or opt.get("fixed_lidar")):
         raise ValueError("Floor spacing requires a native fixed-LiDAR checkpoint")
-    record = spec["records"][FRAME]
-    if record["width"] < ROI[0]+ROI[2] or record["height"] < ROI[1]+ROI[3]:
-        raise ValueError("The saved floor crop is outside the reference image")
+    name, split = floor_reference(spec)
+    if name is None:
+        raise ValueError(split)
+    record = spec["records"][name]
     iteration, ply = choose_iteration(spec["path"], -1)
     def read_xyz(path):
         v = PlyData.read(str(path), mmap="r")["vertex"].data
@@ -264,7 +312,7 @@ def spacing_report(model):
     v, learned = read_xyz(ply)
     live = roi_indices(learned, record, center, normal)
     result = dict(iteration=iteration, model=str(model), source=spec["cfg"]["source_path"],
-                  frame=FRAME, roi_xywh=ROI, plane_center=center.tolist(), plane_normal=normal.tolist(),
+                  frame=name, split=split, roi_xywh=ROI, plane_center=center.tolist(), plane_normal=normal.tolist(),
                   plane_tolerance=TOLERANCE, plane_source=plane_source, units="fixed model scene units",
                   selection="Centers within floor plane tolerance projecting into the crop; occlusion is not tested",
                   input_points_in_crop=len(ids), surviving_centers_in_crop=len(live),
@@ -310,18 +358,18 @@ def run(*args):
     subprocess.run([sys.executable, "-u", *map(str, args)], cwd=ROOT, check=True)
 
 
-def floor_render(model, step, output, base, expected_gt):
+def floor_render(model, step, output, base, expected_gt, name):
     import cv2
     from scripts.diagnose_floor_blur import salience
     from scripts.render_views_worker import render_views
     spec = model_info(model)
-    if (spec["records"][FRAME] != base["records"][FRAME] or spec["splits"]["train"] != base["splits"]["train"]
+    if (spec["records"][name] != base["records"][name] or spec["splits"]["train"] != base["splits"]["train"]
             or spec["cfg"].get("antialiasing") != base["cfg"].get("antialiasing")):
         raise ValueError("Camera, AA or training split differs")
     # Native-pixel floor crop even if the training image was downsampled.
     spec["cfg"] = {**spec["cfg"], "resolution": 1}
-    render_views(spec, [FRAME], step, output)
-    r = read_json(output / "frames.json")[FRAME]
+    render_views(spec, [name], step, output)
+    r = read_json(output / "frames.json")[name]
     if expected_gt and r["target_sha256"] != expected_gt:
         raise ValueError("Ground truth RGB differs between renders")
     x,y,w,h = ROI
@@ -345,39 +393,56 @@ def evaluate(base, output, gpu, transfer):
     report.mkdir(exist_ok=True)
     import torch
     rows, gt = [], None
-    control = "Matched" if "applied_scale" in transfer else "Proposed"
-    for label, model, step in (("Baseline 30k",base["path"],30000), (f"{control} 30k",output,30000),
-                               (f"{control} 50k",output,50000)):
+    name, floor_status = floor_reference(base)
+    control = transfer.get("label") or ("Matched" if "applied_scale" in transfer else "Proposed")
+    comparisons = [(f"{control} 30k", output, 30000), (f"{control} 50k", output, 50000)]
+    has_baseline = (base["path"]/"point_cloud/iteration_30000/point_cloud.ply").is_file()
+    if has_baseline:
+        comparisons.insert(0, ("Baseline 30k", base["path"], 30000))
+    for label, model, step in comparisons:
         averages = measured_frames(model, step, str(Path(base["cfg"]["source_path"]).resolve()), base)
         folder = report / label.replace(" ", "_")
-        gt, metrics = floor_render(model, step, folder, base, gt)
+        metrics = {}
+        if name is not None:
+            gt, metrics = floor_render(model, step, folder, base, gt, name)
+            metrics["crop_image"] = f"{folder.name}/image_crop.png"
         torch.cuda.empty_cache()  # The next full-frame evaluation runs in a separate process.
-        rows.append(dict(label=label, model=str(model), iteration=step, mean_psnr_db=averages,
-                         crop_image=f"{folder.name}/image_crop.png", **metrics))
-    run("scripts/render.py", "--models", base["path"], output, "--iteration", 30000, "--gpu", gpu,
-        "--split", "both", "--eval-set", "unselected", "--max-views", 8, "--output", report/"paired_30k")
+        rows.append(dict(label=label, model=str(model), iteration=step, mean_psnr_db=averages, **metrics))
+    models = [base["path"], output] if has_baseline else [output]
+    has_holdout = bool(base["records"].keys() - base["splits"]["train"])
+    split = "both" if has_holdout else "train"
+    run("scripts/render.py", "--models", *models, "--iteration", 30000, "--gpu", gpu,
+        "--split", split, "--eval-set", "unselected", "--max-views", 8, "--output", report/"paired_30k")
     run("scripts/render.py", "--model", output, "--iteration", 50000, "--gpu", gpu,
-        "--split", "both", "--eval-set", "unselected", "--max-views", 8, "--output", report/"matched_50k")
-    atomic_json(report/"results.json", dict(frame=FRAME, roi=ROI, held_out=FRAME not in base["splits"]["train"],
-                                             identical_original_poses=True, regional_scale_transfer=transfer, rows=rows))
+        "--split", split, "--eval-set", "unselected", "--max-views", 8, "--output", report/"matched_50k")
+    policy_key = "fixed_scale_policy" if transfer.get("label") == "Fixed cap" else "regional_scale_transfer"
+    atomic_json(report/"results.json", dict(frame=name, roi=ROI if name else None, floor_status=floor_status,
+                                             held_out=(floor_status == "held-out") if name else None,
+                                             identical_original_poses=True, rows=rows, **{policy_key: transfer}))
     lines = []
+    group = "unselected" if has_holdout else "selected"
+    group_name = "Held-out" if has_holdout else "Training"
+    gallery_split = "eval" if has_holdout else "train"
     for r in rows:
-        lines.append(f'<tr><td>{r["label"]}</td><td>{r["mean_psnr_db"]["unselected"]:.3f}</td>'
-                     f'<td>{float(r["crop_psnr_db"]):.3f}</td><td>{r["gradient_agreement"]}</td></tr>')
-    pictures = [("Source photograph", "Baseline_30k/gt_crop.png")] + [(r["label"], r["crop_image"]) for r in rows]
+        crop_cells = (f'<td>{float(r["crop_psnr_db"]):.3f}</td><td>{r["gradient_agreement"]}</td>' if name else '')
+        lines.append(f'<tr><td>{r["label"]}</td><td>{r["mean_psnr_db"][group]:.3f}</td>{crop_cells}</tr>')
+    first_folder = rows[0]["label"].replace(" ", "_")
+    pictures = ([("Source photograph", f"{first_folder}/gt_crop.png")] +
+                [(r["label"], r["crop_image"]) for r in rows]) if name else []
+    crop_headers = '<th>Floor PSNR (dB)</th><th>Floor edge agreement</th>' if name else ''
     page = ('<!doctype html><meta charset="utf-8"><title>Orange4F detail comparison</title>'
             '<style>body{font:16px system-ui;max-width:1280px;margin:2em auto}td,th{padding:.5em}img{width:100%}</style>'
-            f'<h1>{FRAME} floor comparison</h1><p>Split cutoff from {html.escape(transfer["method"])}. '
+            f'<h1>Orange4F detail comparison</h1><p>Floor crop: {html.escape(name or FRAME)} ({html.escape(floor_status)}).</p>'
+            f'<p>{html.escape(transfer["method"])}. '
             '<a href="../detail_plan.json">Training settings</a></p>'
-            '<table><tr><th>Run</th><th>Held-out PSNR (dB)</th><th>Floor PSNR (dB)</th>'
-            '<th>Floor edge agreement</th></tr>'+''.join(lines)+'</table>'+''.join(
+            f'<table><tr><th>Run</th><th>{group_name} PSNR (dB)</th>{crop_headers}</tr>'+''.join(lines)+'</table>'+''.join(
                 f'<h2>{html.escape(label)}</h2><a href="{img}"><img src="{img}"></a>' for label,img in pictures)
-            +'<p><a href="paired_30k/eval/index.html">Shared held-out views at 30k</a> · '
-             '<a href="matched_50k/eval/index.html">Held-out views at 50k</a> · <a href="results.json">Metrics</a></p>')
+            +f'<p><a href="paired_30k/{gallery_split}/index.html">{group_name} views at 30k</a> · '
+             f'<a href="matched_50k/{gallery_split}/index.html">{group_name} views at 50k</a> · <a href="results.json">Metrics</a></p>')
     (report/"index.html").write_text(page)
     for row in rows:
-        print(f"{row['label']}: held-out {row['mean_psnr_db']['unselected']:.3f} dB; "
-              f"floor {float(row['crop_psnr_db']):.3f} dB", flush=True)
+        floor = f", {floor_status} floor crop {float(row['crop_psnr_db']):.3f} dB" if name else ""
+        print(f"{row['label']}: {group_name} {row['mean_psnr_db'][group]:.3f} dB{floor}", flush=True)
     print(report / "index.html", flush=True)
 
 
@@ -415,41 +480,58 @@ def main(argv=None):
     parser.add_argument("--baseline", type=Path, default=SUITE/"3dgs")
     parser.add_argument("--fixed-model", type=Path, default=SUITE/"3dgs_fixed_lidar")
     parser.add_argument("--regional", type=Path, help="Regional adaptive run or exported region containing selection.json")
-    parser.add_argument("--output", type=Path, default=SUITE.parent/"matched_split_50k_v1")
+    parser.add_argument("--output", type=Path, help="Separate model directory (default chosen by experiment)")
     parser.add_argument("--gpu", help="Physical CUDA device. Default honors CUDA_VISIBLE_DEVICES or selects a free GPU")
-    parser.add_argument("--spacing-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--spacing-only", action="store_true", help="Audit the fixed checkpoint's saved floor crop")
+    mode.add_argument("--estimate-fixed-scale", action="store_true", help="Estimate per-anchor sigma from input.ply on CPU")
+    mode.add_argument("--train-fixed-scale", action="store_true", help="Train fixed centers with per-anchor KNN scale caps")
+    parser.add_argument("--fixed-scale-ratio", type=float, default=2., help="Per-axis sigma ceiling / native 3-NN sigma")
     parser.add_argument("--plan-only", action="store_true", help="Print measured extents and training command without training")
     args = parser.parse_args(argv)
+    if args.estimate_fixed_scale:
+        print(json.dumps(estimate_fixed_scale(args.fixed_model.expanduser().resolve()/"input.ply",
+                                              args.fixed_scale_ratio), indent=2))
+        return
     if args.spacing_only:
         print(json.dumps(spacing_report(args.fixed_model.resolve()), indent=2))
         return
-    output = args.output.expanduser().resolve()
-    base = model_info(args.baseline)
-    region = regional_reference(regional_model(args.regional))
+    default_model = (f"fixed_lidar_knn{args.fixed_scale_ratio:g}x_50k_v1"
+                     if args.train_fixed_scale else "matched_split_50k_v1")
+    output = (args.output or SUITE.parent/default_model).expanduser().resolve()
+    base = model_info(args.fixed_model if args.train_fixed_scale else args.baseline)
     if not (base["path"]/"input.ply").is_file():
         raise FileNotFoundError(base["path"]/"input.ply")
-    if FRAME not in base["records"] or FRAME in base["splits"]["train"]:
-        raise ValueError("Expected the original split with the saved floor reference held out")
-    choose_iteration(base["path"], STEPS[0])
-    extent, old_sigma, full_source = split_settings(base)
-    region_extent, regional_sigma, target_source = split_settings(region)
-    target, transfer = regional_cutoff(base, region, region_extent, regional_sigma)
-    if math.isclose(old_sigma, target, rel_tol=1e-6):
-        print("The physical thresholds already coincide; this run tests the iteration extension only.", flush=True)
-    ratio = target / extent
-    command = training_command(base, output, ratio)
-    plan = dict(baseline=str(base["path"]), regional=str(region["path"]), full_extent=extent,
-                regional_extent=region_extent, extent_source=full_source, target_source=target_source,
-                regional_scale_transfer=transfer,
-                baseline_split_sigma=old_sigma, matched_split_sigma=target, percent_dense=ratio,
-                selected_keyframes_sha256=digest(base["path"]/"keyframes.json"),
+    name, floor_status = floor_reference(base)
+    print(f"Floor crop {name or FRAME}: {floor_status}.", flush=True)
+    if args.train_fixed_scale:
+        ratio = positive(args.fixed_scale_ratio)
+        transfer = dict(method=f"Fixed LiDAR, each principal sigma capped at {ratio:g} times its initial 3-NN sigma",
+                        label="Fixed cap", max_scale_ratio=ratio, constant_population=True, opacity_resets=False)
+        print(f"{transfer['method']}. All input anchors are retained.", flush=True)
+        command = training_command(base, output, fixed_scale_ratio=ratio)
+        plan = dict(fixed_scale_policy=transfer)
+    else:
+        choose_iteration(base["path"], STEPS[0])
+        region = regional_reference(regional_model(args.regional))
+        extent, old_sigma, full_source = split_settings(base)
+        region_extent, regional_sigma, target_source = split_settings(region)
+        target, transfer = regional_cutoff(base, region, region_extent, regional_sigma)
+        if math.isclose(old_sigma, target, rel_tol=1e-6):
+            print("The physical thresholds already coincide; this run tests the iteration extension only.", flush=True)
+        ratio = target / extent
+        command = training_command(base, output, ratio)
+        plan = dict(regional=str(region["path"]), full_extent=extent, regional_extent=region_extent,
+                    extent_source=full_source, target_source=target_source, regional_scale_transfer=transfer,
+                    baseline_split_sigma=old_sigma, matched_split_sigma=target, percent_dense=ratio)
+        print(f"Full extent {extent:.6g}, regional extent {region_extent:.6g}, "
+              f"split sigma {old_sigma:.6g} → {target:.6g}, percent_dense={ratio:.8g}.", flush=True)
+        print(f"Regional reference: {region['path']} ({target_source})", flush=True)
+        print(f"{transfer['method']}: {transfer['shared_views']}/{transfer['regional_train_views']} views, "
+              f"relative RMS {transfer['relative_rms_residual']:.2%}, regional sigma {regional_sigma:.6g}, "
+              f"full-coordinate target {target:.6g}.", flush=True)
+    plan.update(baseline=str(base["path"]), selected_keyframes_sha256=digest(base["path"]/"keyframes.json"),
                 input_ply_sha256=digest(base["path"]/"input.ply"), command=command)
-    print(f"Full extent {extent:.6g}, regional extent {region_extent:.6g}, "
-          f"split sigma {old_sigma:.6g} → {target:.6g}, percent_dense={ratio:.8g}.", flush=True)
-    print(f"Regional reference: {region['path']} ({target_source})", flush=True)
-    print(f"{transfer['method']}: {transfer['shared_views']}/{transfer['regional_train_views']} views, "
-          f"relative RMS {transfer['relative_rms_residual']:.2%}, regional sigma {regional_sigma:.6g}, "
-          f"full-coordinate target {target:.6g}.", flush=True)
     if args.plan_only:
         print(json.dumps(plan, indent=2))
         return
@@ -470,6 +552,15 @@ def main(argv=None):
             shutil.copyfile(base["path"]/"keyframes.json", manifest)
         elif digest(manifest) != plan["selected_keyframes_sha256"]:
             raise ValueError(f"Training manifest changed: {manifest}")
+        gpu = select_gpu(args.gpu)
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu
+        print(f"Using CUDA device {gpu}.", flush=True)
+        snapshots = [step for step in STEPS if read_snapshot(output,step)]
+        if 50000 not in snapshots:
+            if snapshots:
+                command = command + ["--start_checkpoint", str(output/f"chkpnt{max(snapshots)}.pth")]
+            print("Training with live GT/render/error previews", flush=True)
+            subprocess.run(command, cwd=ROOT, check=True, pass_fds=(lock.fileno(),))
         floor_out = output/"fixed_floor_spacing.json"
         try:
             fixed = args.fixed_model.expanduser().resolve()
@@ -481,16 +572,7 @@ def main(argv=None):
                 atomic_json(floor_out, previous)
             print(json.dumps(previous, indent=2), flush=True)
         except (OSError, ValueError, KeyError) as exc:
-            print(f"Fixed-floor measurement unavailable: {exc}. Continuing adaptive comparison.", flush=True)
-        gpu = select_gpu(args.gpu)
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpu
-        print(f"Using CUDA device {gpu}.", flush=True)
-        snapshots = [step for step in STEPS if read_snapshot(output,step)]
-        if 50000 not in snapshots:
-            if snapshots:
-                command = command + ["--start_checkpoint", str(output/f"chkpnt{max(snapshots)}.pth")]
-            print("Training with live GT/render/error previews", flush=True)
-            subprocess.run(command, cwd=ROOT, check=True, pass_fds=(lock.fileno(),))
+            print(f"Fixed-floor measurement unavailable: {exc}. Continuing comparison.", flush=True)
         evaluate(base, output, gpu, transfer)
 
 
