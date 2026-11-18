@@ -107,7 +107,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     else:
         return xyz, color, opacity, scaling, rot
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, update_anchors=None, contribution_anchors=None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, update_anchors=None, contribution_anchors=None, return_alpha=False):
     """
     Render the scene. 
     
@@ -154,12 +154,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
-    raster_settings = GaussianRasterizationSettings(
+    settings = dict(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
         tanfovx=tanfovx,
         tanfovy=tanfovy,
-        bg=bg_color,
         scale_modifier=scaling_modifier,
         viewmatrix=viewpoint_camera.world_view_transform,
         projmatrix=viewpoint_camera.full_proj_transform,
@@ -170,7 +169,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         antialiasing=pipe.antialiasing
     )
 
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    def rasterizer(background):
+        return GaussianRasterizer(raster_settings=GaussianRasterizationSettings(bg=background, **settings))
     
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     if len(xyz) == 0:
@@ -179,38 +179,32 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         zero = sum(value.sum()*0 for value in (xyz, screenspace_points, color, opacity, scaling, rot))
         rendered_image = bg_color[:, None, None].expand(3, int(viewpoint_camera.image_height), int(viewpoint_camera.image_width)) + zero
         radii = torch.zeros(0, dtype=torch.int32, device=xyz.device)
+        if return_alpha:
+            alpha = zero.expand(rendered_image.shape[1:])
     else:
-        rendered_image, radii, _depth = rasterizer(
-            means3D = xyz,
-            means2D = screenspace_points,
-            shs = None,
-            colors_precomp = color,
-            opacities = opacity,
-            scales = scaling,
-            rotations = rot,
-            cov3D_precomp = None)
-    
+        inputs = dict(means3D=xyz, means2D=screenspace_points, scales=scaling, rotations=rot)
+        rendered_image, radii, _ = rasterizer(bg_color)(
+            colors_precomp=color, opacities=opacity, shs=None, cov3D_precomp=None, **inputs)
+        if return_alpha:
+            # White on black gives accumulated opacity. Hold geometry fixed for this loss
+            # so expanding footprints cannot directly satisfy the hit target.
+            coverage, _, _ = rasterizer(torch.zeros_like(bg_color))(
+                colors_precomp=torch.ones_like(color), opacities=opacity, shs=None, cov3D_precomp=None,
+                **{name: tensor.detach() for name, tensor in inputs.items()})
+            alpha = coverage[0]
+
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
+    result = dict(render=rendered_image, viewspace_points=screenspace_points,
+                  visibility_filter=radii > 0, radii=radii)
+    if return_alpha:
+        result['alpha'] = alpha
     if is_training:
-        result = {"render": rendered_image,
-                "viewspace_points": screenspace_points,
-                "visibility_filter" : radii > 0,
-                "radii": radii,
-                "selection_mask": mask,
-                "neural_opacity": neural_opacity,
-                "scaling": scaling,
-                }
+        result.update(selection_mask=mask, neural_opacity=neural_opacity, scaling=scaling)
         if update_anchors is not None:
             active = eligible & (radii > 0)
             result['active_children'] = active
             result['active_parents'] = parent[active].unique()
-        return result
-    else:
-        return {"render": rendered_image,
-                "viewspace_points": screenspace_points,
-                "visibility_filter" : radii > 0,
-                "radii": radii,
-                }
+    return result
 
 
 def prefilter_voxel(viewpoint_camera, pc, pipe, bg_color, scaling_modifier=1.0):

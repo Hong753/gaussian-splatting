@@ -163,8 +163,11 @@ class TrainingPreviewer:
                     refined = (split == 'train' and pose_refiner is not None and
                                original_camera.image_name in pose_refiner.names)
                     camera = pose_refiner.camera(original_camera) if refined else original_camera
-                    pred = render_fn(camera, model, pipe, background, separate_sh=separate_sh,
-                                     use_trained_exp=False)['render']
+                    result = render_fn(camera, model, pipe, background, separate_sh=separate_sh,
+                                     use_trained_exp=False)
+                    pred = result['render']
+                    indexed = result.get('indexed_render')
+                    del result
                     target = original_camera.original_image[:3].to(pred.device)
                     if pred.shape != target.shape or not torch.isfinite(pred).all() or not torch.isfinite(target).all():
                         raise ValueError(f'Invalid debug preview image: {original_camera.image_name}')
@@ -175,8 +178,19 @@ class TrainingPreviewer:
                     mask = getattr(original_camera, 'loss_mask', None)
                     score = image_score(pred, target, mask).item()
                     error = (pred - target).abs().mul(4).clamp(0, 1)
-                    pred, target, error = [display(x, mask) for x in (pred,target,error)]
+                    paired = {}
                     key = hashlib.sha256((split + '/' + original_camera.image_name).encode()).hexdigest()[:24]
+                    if indexed is not None:
+                        if indexed.shape != pred.shape or not torch.isfinite(indexed).all():
+                            raise ValueError(f'Invalid indexed preview for {original_camera.image_name}')
+                        indexed = indexed.clamp(0, 1)
+                        indexed_score = image_score(indexed, target, mask).item()
+                        filename = f'{key}_indexed.png'
+                        rgb(display(indexed, mask)).save(temporary / filename)
+                        paired = dict(indexed_render=f'{folder.name}/{filename}',
+                                      indexed_psnr_db=indexed_score if math.isfinite(indexed_score) else 'inf')
+                        del indexed
+                    pred, target, error = [display(x, mask) for x in (pred,target,error)]
                     gt_path = self.root / 'gt' / f'{key}.png'
                     if not gt_path.exists():
                         atomic_write(gt_path, lambda path: rgb(target).save(path, format='PNG'))
@@ -187,7 +201,7 @@ class TrainingPreviewer:
                         psnr_db=score if math.isfinite(score) else 'inf',
                         metric='ROI PSNR' if mask is not None else 'full-image PSNR',
                         gt=f'gt/{key}.png', render=f'{folder.name}/{key}.png',
-                        error=f'{folder.name}/{key}_error.jpg', width=pred.shape[-1], height=pred.shape[-2])
+                        error=f'{folder.name}/{key}_error.jpg', width=pred.shape[-1], height=pred.shape[-2], **paired)
                     rows.append(row)
                     if tb_writer:
                         tag = f'debug_previews/{split}/{key}'
@@ -229,7 +243,8 @@ main{padding:22px 30px;display:grid;gap:24px}.card{background:#192535;border:1px
 .images{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:2px;background:#344150}
 figure{margin:0;background:#121c29}figcaption{padding:9px 12px;color:#c8d6e8;font-size:13px}
 img{display:block;width:100%;height:auto;cursor:zoom-in}a{color:#8abcfb}.badge{color:#78d5bb}#status{font-size:13px}
-@media(max-width:700px){header,main{padding:16px}.images{grid-template-columns:1fr}}
+.images.paired{grid-template-columns:repeat(4,minmax(0,1fr))}
+@media(max-width:700px){header,main{padding:16px}.images,.images.paired{grid-template-columns:1fr}}
 </style></head><body><header><h1>Training previews</h1>
 <p>Fixed random frames · GT / render / absolute error ×4. Click an image for full resolution.</p>
 <p>These few-frame PSNR values are diagnostics; the separate all-frame evaluation remains unchanged.</p>
@@ -250,8 +265,13 @@ function show(){
     const card=elem('section',undefined,'card'),head=elem('div',undefined,'title');
     head.append(elem('strong',frame.split+' · '+frame.name),elem('span',
       (typeof frame.psnr_db==='number'?frame.psnr_db.toFixed(3):frame.psnr_db)+' dB · '+(frame.metric||'PSNR')+' · '+frame.pose,'meta'));
-    const images=elem('div',undefined,'images');
-    for(const [key,label] of [['gt','Actual image'],['render','Rendered image'],['error','Absolute error ×4']]){
+    const images=elem('div',undefined,frame.indexed_render?'images paired':'images');
+    const panels=[['gt','Actual image'],['render',frame.indexed_render?'Full scene':'Rendered image'],['error',frame.indexed_render?'Full render error ×4':'Absolute error ×4']];
+    if(frame.indexed_render){
+      const db=typeof frame.indexed_psnr_db==='number'?frame.indexed_psnr_db.toFixed(3):frame.indexed_psnr_db;
+      panels.push(['indexed_render','Indexed parents only · '+db+' dB']);
+    }
+    for(const [key,label] of panels){
       const f=elem('figure'),link=elem('a'),im=elem('img');link.href=frame[key];link.target='_blank';link.rel='noopener';
       im.src=frame[key];im.alt=label+' — '+frame.name;link.append(im);f.append(elem('figcaption',label),link);images.append(f);
     }card.append(head,images);$('cards').append(card);

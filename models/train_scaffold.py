@@ -7,6 +7,8 @@ import os
 import sys
 import json
 import random
+import math
+from functools import partial
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
 from random import randint
@@ -57,9 +59,12 @@ def evaluate_training_views(scene, gaussians, pipe, background, iteration, use_e
         gaussians.train()
 
 
-def preview_render(camera, gaussians, pipe, background, **unused):
-    result = render(camera, gaussians, pipe, background,
-                    visible_mask=prefilter_voxel(camera, gaussians, pipe, background))
+def preview_render(camera, gaussians, pipe, background, membership=None, **unused):
+    visible = prefilter_voxel(camera, gaussians, pipe, background)
+    result = {'render': render(camera, gaussians, pipe, background, visible_mask=visible)['render']}
+    if membership is not None and camera.image_name in membership.index:
+        selected = visible & membership.mask(camera.image_name)
+        result['indexed_render'] = render(camera, gaussians, pipe, background, visible_mask=selected)['render']
     return result
 
 
@@ -67,6 +72,14 @@ def train(dataset, opt, pipe, save_iterations, test_iterations, preview_config=N
           publish=False, start_checkpoint=None):
     sensed_path = getattr(opt, 'sensed_membership', '')
     static = getattr(opt, 'disable_anchor_pruning', False)
+    hard = getattr(opt, 'indexed_forward_only', False)
+    weight = getattr(opt, 'indexed_opacity_weight', 0.)
+    alpha_target = getattr(opt, 'indexed_opacity_target', .9)
+    if hard and not sensed_path:
+        raise ValueError('Indexed rendering requires per-view membership')
+    if not math.isfinite(weight) or weight < 0 or (weight and (not hard or not 0 < alpha_target <= 1)):
+        raise ValueError('Hit opacity requires indexed rendering, finite nonnegative weight and a target in (0, 1]')
+    render_policy = (hard, weight, alpha_target if weight else None)
     if static and not opt.disable_anchor_growth:
         raise ValueError('Static parent population requires disabled growth')
     if sensed_path and not (opt.freeze_anchors and opt.disable_anchor_growth and static and not dataset.train_test_exp):
@@ -93,10 +106,13 @@ def train(dataset, opt, pipe, save_iterations, test_iterations, preview_config=N
     if static:
         from utils.scaffold_observations import Membership, sensed_step
     if sensed_path:
-        membership = Membership(sensed_path, gaussians.get_anchor, cameras)
+        membership = Membership(sensed_path, gaussians.get_anchor, cameras, with_hits=bool(weight))
     policy = (membership.identity if membership else None, static)
     if start_checkpoint and (gaussians.training_state or {}).get('observation_policy', (None, False)) != policy:
         raise ValueError('Checkpoint uses different parent observations or pruning policy')
+    if start_checkpoint and (gaussians.training_state or {}).get('indexed_render_policy', (False, 0., None)) != render_policy:
+        raise ValueError('Checkpoint uses a different indexed rendering or hit-opacity policy')
+    render_preview = partial(preview_render, membership=membership if hard else None)
     adjust = not (static and opt.disable_anchor_growth)
     previewer = training_previews.create_previewer(scene, dataset,
         preview_config or training_previews.DEFAULTS, start_iteration=start)
@@ -119,7 +135,12 @@ def train(dataset, opt, pipe, save_iterations, test_iterations, preview_config=N
         if static:
             selected = membership.mask(cam.image_name) if membership else torch.ones_like(visible)
             gating = dict(update_anchors=selected)
-        result = render(cam, gaussians, pipe, bg, visible_mask=visible,
+        render_mask = visible & selected if hard else visible
+        hit_ids = None
+        if weight:
+            hit_ids = membership.hit_indices(cam.image_name, cam.image_width, cam.image_height)
+            gating['return_alpha'] = bool(hit_ids.numel())
+        result = render(cam, gaussians, pipe, bg, visible_mask=render_mask,
                         retain_grad=adjust and iteration < opt.update_until, **gating)
         image = result["render"]
         if dataset.train_test_exp:
@@ -136,6 +157,11 @@ def train(dataset, opt, pipe, save_iterations, test_iterations, preview_config=N
         scale_loss = scale.prod(dim=1).mean() if scale.numel() else image.sum()*0
         loss = ((1.0 - opt.lambda_dssim) * ll1 + opt.lambda_dssim * (1.0 - ssim(image, target))
                 + 0.01 * scale_loss)
+        hit_alpha = hit_loss = None
+        if weight and hit_ids.numel():
+            hit_alpha = result['alpha'].flatten()[hit_ids]
+            hit_loss = (alpha_target - hit_alpha).clamp_min(0).square().mean()
+            loss = loss + weight * hit_loss
         loss.backward()
         with torch.no_grad():
             if adjust and opt.start_stat < iteration < opt.update_until:
@@ -163,12 +189,19 @@ def train(dataset, opt, pipe, save_iterations, test_iterations, preview_config=N
                              active=int(result['visibility_filter'].sum()))
                 if membership:
                     stats.update(updated_parents=len(parents), eligible_children=int(result['active_children'].sum()))
+                if hit_alpha is not None:
+                    stats.update(hit_alpha=f'{hit_alpha.detach().mean().item():.3f}')
                 bar.set_postfix(stats)
             if iteration == 1 or iteration % 100 == 0 or iteration == opt.iterations:
                 with (Path(dataset.model_path)/'scaffold_training.jsonl').open('a') as stream:
                     coverage = {} if not membership else dict(image=cam.image_name, observation_source=membership.kind,
                         frustum_parents=int(visible.sum()), eligible_parents_in_frustum=int((selected & visible).sum()),
                         updated_parents=len(parents), eligible_rendered_children=int(result['active_children'].sum()))
+                    if membership:
+                        coverage.update(indexed_forward_only=hard, rendered_parents=int(render_mask.sum()))
+                    if weight:
+                        coverage.update(hit_count=hit_ids.numel(), hit_alpha=hit_alpha.mean().item() if hit_alpha is not None else None,
+                                        hit_opacity_loss=hit_loss.item() if hit_loss is not None else None)
                     stream.write(json.dumps(dict(**coverage, iteration=iteration, anchors=len(gaussians.get_anchor),
                         active_gaussians=int(result['visibility_filter'].sum()), loss=loss.item(),
                         freeze_anchors=gaussians.freeze_anchors, anchor_growth=not gaussians.disable_anchor_growth))+'\n')
@@ -177,12 +210,12 @@ def train(dataset, opt, pipe, save_iterations, test_iterations, preview_config=N
             if previewer and previewer.due(iteration, opt.iterations):
                 gaussians.eval()
                 try:
-                    previewer.capture(iteration, gaussians, preview_render, pipe, bg)
+                    previewer.capture(iteration, gaussians, render_preview, pipe, bg)
                 finally:
                     gaussians.train()
             if iteration in save_iterations:
                 print(f"\n[ITER {iteration}] Saving anchors, networks and optimizer state")
-                gaussians.training_state = dict(observation_policy=policy, python_rng=random.getstate(), numpy_rng=np.random.get_state(),
+                gaussians.training_state = dict(observation_policy=policy, indexed_render_policy=render_policy, python_rng=random.getstate(), numpy_rng=np.random.get_state(),
                     torch_rng=torch.get_rng_state(), cuda_rng=torch.cuda.get_rng_state_all(),
                     pending_views=[c.image_name for c in views])
                 # TorchScript tracing uses random example inputs. Saving must not affect sampling.

@@ -196,11 +196,13 @@ def test_snapshot_requires_matching_mlps_and_rejects_modified_weights(tmp_path):
     with pytest.raises(ValueError): read_snapshot(tmp_path, 10)
 
 
-@pytest.mark.parametrize('sensed', [False, True])
-def test_training_loop_previews_and_complete_checkpoint_publication(tmp_path, sensed):
+@pytest.mark.parametrize('variant', ['fixed', 'sensed', 'indexed-only', 'indexed-opacity'])
+def test_training_loop_previews_and_complete_checkpoint_publication(tmp_path, variant):
     """Execute the actual loop, optimizer and image reports with a CPU RGB probe."""
+    sensed = variant != 'fixed'
+    hard = variant in ('indexed-only', 'indexed-opacity')
     with cpu_backend() as Model, ExitStack() as stack:
-        cameras = [SimpleNamespace(image_name=name, original_image=torch.ones(3, 16, 16)*.4)
+        cameras = [SimpleNamespace(image_name=name, image_width=16, image_height=16, original_image=torch.ones(3, 16, 16)*.4)
                    for name in ('train.png', 'test.png')]
         class Scene:
             def __init__(self, dataset, gaussians):
@@ -215,17 +217,24 @@ def test_training_loop_previews_and_complete_checkpoint_publication(tmp_path, se
                 self.gaussians.save_mlp_checkpoints(str(folder))
         def prefilter(camera, model, pipe, bg):
             return torch.ones(len(model.get_anchor), dtype=torch.bool)
-        def render(camera, model, pipe, bg, visible_mask=None, retain_grad=False, update_anchors=None):
+        def render(camera, model, pipe, bg, visible_mask=None, retain_grad=False, update_anchors=None, return_alpha=False):
             points = model.get_anchor.repeat_interleave(model.n_offsets, 0) + model._offset.reshape(-1, 3)
+            points = points[visible_mask.repeat_interleave(model.n_offsets)]
+            if update_anchors is not None and hard:
+                assert torch.equal(visible_mask, update_anchors)
             if retain_grad: points.retain_grad()
             color = (points.mean(0)+model._anchor_feat.mean()).sigmoid()
             result = dict(render=color[:, None, None].expand(3, 16, 16), viewspace_points=points,
                 visibility_filter=torch.ones(len(points), dtype=torch.bool),
                 selection_mask=torch.ones(len(points), dtype=torch.bool),
-                neural_opacity=torch.ones(len(points), 1)*.4, scaling=model.get_scaling[:, 3:].repeat_interleave(model.n_offsets,0))
+                neural_opacity=torch.ones(len(points), 1)*.4, scaling=model.get_scaling[visible_mask, 3:].repeat_interleave(model.n_offsets,0))
             if update_anchors is not None:
                 result.update(active_parents=update_anchors.nonzero().flatten(),
-                              active_children=update_anchors.repeat_interleave(model.n_offsets))
+                              active_children=update_anchors[visible_mask].repeat_interleave(model.n_offsets))
+            if return_alpha:
+                alpha = torch.zeros(16, 16)
+                alpha[0,0], alpha[1,1] = .25, .95
+                result['alpha'] = alpha + color.sum()*0
             return result
         scene_mod = ModuleType('scene'); scene_mod.Scene = Scene
         model_mod = ModuleType('models.scaffold_gaussian'); model_mod.ScaffoldGaussianModel = Model
@@ -241,7 +250,7 @@ def test_training_loop_previews_and_complete_checkpoint_publication(tmp_path, se
             scaffold_n_offsets=2, scaffold_voxel_size=.02, white_background=False, train_test_exp=False,
             keyframe_manifest='', images='images', resolution=1)
         (tmp_path/'keyframes.json').write_text('{"selected_images":["train.png"]}')
-        launch = SimpleNamespace(variant='sensed' if sensed else 'fixed', source=tmp_path, model=tmp_path, point_cloud=tmp_path/'input.ply',
+        launch = SimpleNamespace(variant=variant, source=tmp_path, model=tmp_path, point_cloud=tmp_path/'input.ply',
             keyframes=tmp_path/'keyframes.json', voxel_size=.02, iterations=30000, checkpoint_every=10000,
             anchor_lr_init=.00016, anchor_lr_final=.0000016)
         argv = runner.build_plan(launch)['stages'][0]['argv']
@@ -257,14 +266,24 @@ def test_training_loop_previews_and_complete_checkpoint_publication(tmp_path, se
             xyz = np.array([[i*.2, i*.01, 2.] for i in range(6)], np.float32)
             centers = np.unique(np.round(xyz/.02), axis=0)*.02
             np.save(folder/'parents.npy', np.array([[1]],dtype=np.uint8))
-            (folder/'metadata.json').write_text(json.dumps(dict(names=['train.png'],format='lidar_rows_v1',
-                                                                anchor_sha256=anchor_digest(centers))))
+            meta = dict(names=['train.png'], format='lidar_rows_v1', anchor_sha256=anchor_digest(centers))
+            opt.indexed_forward_only = hard
+            if variant == 'indexed-opacity':
+                opt.indexed_opacity_weight = .05
+                meta['hit_pixels'] = [dict(size=[16,16], count=2, total=2)]
+                np.save(folder/'hit_pixels.npy', np.array([[0,17]], dtype=np.int32))
+            (folder/'metadata.json').write_text(json.dumps(meta))
             opt.sensed_membership = str(folder); opt.disable_anchor_pruning = True
         trainer.train(ds, opt, SimpleNamespace(debug=False, antialiasing=False), {3}, set(),
             dict(every=2, train=1, test=1, seed=0), publish=True)
         history = json.loads((tmp_path/'debug_previews/history.json').read_text())
         assert [s['iteration'] for s in history['snapshots']] == [1, 2, 3]
         assert all(not s['antialiasing'] and len(s['frames']) == 2 for s in history['snapshots'])
+        for frame in history['snapshots'][-1]['frames']:
+            assert ('indexed_render' in frame) == (hard and frame['split'] == 'train')
+            if 'indexed_render' in frame:
+                assert (tmp_path/'debug_previews'/frame['indexed_render']).is_file()
+                assert frame['psnr_db'] != frame['indexed_psnr_db']
         saved = read_snapshot(tmp_path, 3)
         assert saved['anchors'] == 6 and len(saved['files']) == 7
         model = Model(feat_dim=8, n_offsets=2, voxel_size=.02, appearance_dim=0, update_init_factor=16)
@@ -274,6 +293,10 @@ def test_training_loop_previews_and_complete_checkpoint_publication(tmp_path, se
             assert state['tensors']['_offset'][0].any() and not state['tensors']['_offset'][1:].any()
             last = json.loads((tmp_path/'scaffold_training.jsonl').read_text().splitlines()[-1])
             assert last['updated_parents'] == 1 and last['eligible_rendered_children'] == 2
+            assert last['rendered_parents'] == (1 if hard else 6)
+            if variant == 'indexed-opacity':
+                assert last['hit_count'] == 2 and last['hit_alpha'] == pytest.approx(.6)
+                assert last['hit_opacity_loss'] == pytest.approx((.9-.25)**2/2)
         model.restore(state, opt)
         expected = model.get_anchor.detach().clone()
         model.load_ply(str(tmp_path/'point_cloud/iteration_3/point_cloud.ply'))

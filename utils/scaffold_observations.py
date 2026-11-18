@@ -40,7 +40,31 @@ def scanner_voxels(keys, world, size):
     return pos[inside][keys[pos[inside]] == query[inside]]
 
 
-def prepare_membership(out, manifest, cloud, original, names, size, *, mesh_source=None, indexed_viewer=None):
+def indexed_pixels(viewer, frame_id, xyz, limit):
+    """Project original indexed rows with the centered training camera at native image resolution."""
+    from PIL import Image
+    frame = viewer.frames[frame_id]
+    cam = viewer.cameras[frame.camera]
+    if cam.model not in ('SIMPLE_PINHOLE', 'PINHOLE'):
+        raise ValueError(f'Expected an undistorted pinhole camera for {frame.name}')
+    fx = cam.params[0]
+    fy = fx if cam.model == 'SIMPLE_PINHOLE' else cam.params[1]
+    with Image.open(viewer.source/viewer.images/frame.name) as image:
+        width, height = image.size
+    local = xyz @ frame.R.T + frame.t
+    local = local[np.isfinite(local).all(axis=1) & (local[:,2] > .2)]
+    # Raster pixel i covers [i,i+1) in corner coordinates (CUDA ndc2Pix adds -0.5).
+    uv = (local[:,:2] / local[:,2:] * [fx/cam.width, fy/cam.height] + .5) * [width, height]
+    x, y = uv[((uv >= 0) & (uv < [width, height])).all(axis=1)].astype(np.int64).T
+    hits = np.unique(y*width + x)
+    total = len(hits)
+    if total > limit:
+        hits = np.sort(np.random.default_rng(frame_id).choice(hits, limit, replace=False))
+    return hits, dict(size=[width, height], count=len(hits), total=total)
+
+
+def prepare_membership(out, manifest, cloud, original, names, size, *, mesh_source=None, indexed_viewer=None,
+                       prepare_hits=False):
     out = Path(out)
     manifest = Path(manifest) if manifest is not None else None
     meta = json.loads(manifest.read_text()) if manifest else {}
@@ -101,7 +125,14 @@ def prepare_membership(out, manifest, cloud, original, names, size, *, mesh_sour
     if missing:
         raise ValueError(f'No measured scanner association for {len(missing)}/{len(names)} training images, first {missing[:4]}. '
                          'Use explicit image names or supply a synchronized association from the capture.')
+    if prepare_hits and not indexed:
+        raise ValueError('Opacity supervision requires the indexed point rows')
     out.mkdir()
+    if prepare_hits:
+        max_hits = 8192
+        hit_info = []
+        hit_pixels = np.lib.format.open_memmap(out/'hit_pixels.npy', mode='w+', dtype=np.int32,
+                                                shape=(len(names), max_hits))
     packed = np.lib.format.open_memmap(out/'parents.npy', mode='w+', dtype=np.uint8,
                                        shape=(len(names),(len(keys)+7)//8))
     received = np.zeros(len(names), dtype=np.int64)
@@ -130,6 +161,10 @@ def prepare_membership(out, manifest, cloud, original, names, size, *, mesh_sour
                 ids = np.load(manifest.parent/frames[name], allow_pickle=False)
             if ids.ndim != 1 or ids.dtype.kind not in 'iu' or (len(ids) and (ids.min()<0 or ids.max()>=len(points))):
                 raise ValueError(f'Invalid original LiDAR row IDs for {name}')
+            if prepare_hits:
+                hits, info = indexed_pixels(indexed_viewer, frames[name], points[ids], max_hits)
+                hit_pixels[i, :len(hits)] = hits
+                hit_info.append(info)
             raw.update(hashlib.sha256(ids.tobytes()).digest())
             add(name, point_parent[ids], len(ids))
             if i == 0 or (i+1)%100 == 0 or i+1 == len(names):
@@ -165,13 +200,18 @@ def prepare_membership(out, manifest, cloud, original, names, size, *, mesh_sour
         report['viewer_ply'] = str(indexed_viewer.ply_path.resolve())
         report['per_view_source'] = per_view_source
         report['per_view_indexed_rows'] = report.pop('per_view_input_returns')
+    if prepare_hits:
+        if not any(v['count'] for v in hit_info):
+            raise ValueError('No indexed rows project inside any training image')
+        hit_pixels.flush()
+        report['hit_pixels'] = hit_info
     (out/'metadata.json').write_text(json.dumps(report)+'\n')
     print(f'{kind}: {len(names):,} views, median {report["median_sensed_parents"]:,.0f} eligible parents, '
           f'{report["empty_views"]} empty views, {report["ever_sensed_fraction"]:.1%} of parents eligible at least once.', flush=True)
 
 
 class Membership:
-    def __init__(self, directory, anchors, names):
+    def __init__(self, directory, anchors, names, with_hits=False):
         directory = Path(directory)
         meta = json.loads((directory/'metadata.json').read_text())
         if meta['names'] != sorted(names) or meta['anchor_sha256'] != anchor_digest(anchors.detach().cpu().numpy()):
@@ -183,6 +223,26 @@ class Membership:
             raise ValueError('Invalid packed Scaffold parent observations')
         self.count, self.device = len(anchors), anchors.device
         self.identity = (digest(directory/'metadata.json'), digest(directory/'parents.npy'))
+
+        if with_hits:
+            self.hit_info = meta['hit_pixels']
+            self.hits = np.load(directory/'hit_pixels.npy', mmap_mode='r', allow_pickle=False)
+            if (len(self.hit_info) != len(self.index) or self.hits.ndim != 2
+                    or self.hits.shape[0] != len(self.index) or self.hits.dtype != np.int32
+                    or any(not 0 <= info['count'] <= self.hits.shape[1] for info in self.hit_info)):
+                raise ValueError('Invalid projected hit cache')
+            self.identity += (digest(directory/'hit_pixels.npy'),)
+
+    def hit_indices(self, name, width, height):
+        import torch
+        i = self.index[name]
+        info = self.hit_info[i]
+        if info['size'] != [width, height]:
+            raise ValueError(f'Projected hit dimensions differ from training image {name}')
+        pixels = self.hits[i, :info['count']].astype(np.int64)
+        if len(pixels) and (pixels.min() < 0 or pixels.max() >= width * height):
+            raise ValueError(f'Projected hit outside training image {name}')
+        return torch.from_numpy(pixels).to(self.device)
 
     def mask(self, name):
         import torch

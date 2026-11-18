@@ -14,6 +14,23 @@ The stride-3 run trains for 30,000 iterations with full-resolution RGB and AA of
 python scripts/serve_training_previews.py --model "${ORANGE4F_OUTPUT_ROOT:-/data/3dgs_outputs/orange4f/3dgs_finetuning}/stride3_noaa_v1/scaffold_indexed_anchors_v1" --host 0.0.0.0 --port 8096
 ```
 
+## Indexed-only rendering and hit opacity
+
+Run either variant on an available GPU. The two commands use distinct output directories.
+
+```bash
+bash scripts/run_orange4f_scaffold.sh 5 indexed-opacity
+bash scripts/run_orange4f_scaffold.sh 6 indexed-only
+```
+
+Both runs intersect each training camera’s indexed parent set with its frustum before decoding any children. The opacity variant also projects the original red points using the trainer’s centered pinhole convention and stores up to 8,192 distinct in-image pixels per training view. A second differentiable render measures their accumulated opacity with fixed footprints. The auxiliary loss is `0.05 * mean(relu(0.9 - alpha_at_hit)^2)`. Geometry and RGB still learn from the image objective. Empty hit sets skip the auxiliary pass. The target and weight are starting values for the comparison. The term measures coverage along a ray and does not supervise its depth.
+
+Training previews display GT, full-scene RGB and error, and an additional indexed-only RGB with its PSNR. Held-out previews and periodic evaluation always render the full model. Compare the same held-out views and training step across both runs. The training log records mean opacity at supervised pixels (`hit_alpha`), sample count and the unweighted loss.
+
+```bash
+python scripts/serve_training_previews.py --model "${ORANGE4F_OUTPUT_ROOT:-/data/3dgs_outputs/orange4f/3dgs_finetuning}/stride3_noaa_v1/scaffold_indexed-opacity_anchors_v1" --host 0.0.0.0 --port 8097
+```
+
 ## Measured-return and mesh variants
 
 Inspect the capture with `python scripts/inspect_lidar_observations.py`. Use `--source /path/to/raw/capture` when the recording lives outside the prepared COLMAP scene. This lists candidate files, PLY properties, NPZ keys and recognized image associations. Acquisition timestamps require a sensor-specific synchronization or explicit image association.

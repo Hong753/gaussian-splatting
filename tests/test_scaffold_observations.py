@@ -154,8 +154,9 @@ def test_full_forward_and_masked_decoders_and_adam_momentum():
         assert not torch.equal(m._anchor_feat[selected],feat[selected])
 
 
+@pytest.mark.parametrize('variant', ['indexed', 'indexed-only', 'indexed-opacity'])
 @pytest.mark.parametrize('explicit_rows', [False, True])
-def test_indexed_launcher_trains_on_exact_red_rows(tmp_path, explicit_rows):
+def test_indexed_launcher_trains_on_exact_red_rows(tmp_path, explicit_rows, variant):
     import shutil
     import struct
     from test_sparse_observation_viewer import fixture
@@ -185,12 +186,14 @@ def test_indexed_launcher_trains_on_exact_red_rows(tmp_path, explicit_rows):
             frames={'09882.jpg':'rows.npy'}, point_cloud_sha256=digest(path))))
     suite = tmp_path/'suite'
     prepare_orange4f.main(['--source',str(source),'--output',str(suite)])
-    args = ['--suite',str(suite),'--variant','indexed','--gpu','4']
+    args = ['--suite',str(suite),'--variant',variant,'--gpu','4']
     assert runner.main(args) == 0
-    model = suite/'scaffold_indexed_anchors_v1'
+    model = suite/f'scaffold_{variant}_anchors_v1'
     plan = load_plan(model)
     flags = plan['plan']['stages'][0]['argv']
     assert all(v in flags for v in ('--sensed_membership','--freeze_anchors','--disable_anchor_growth','--disable_anchor_pruning'))
+    assert ('--indexed_forward_only' in flags) == (variant != 'indexed')
+    assert ('--indexed_opacity_weight' in flags) == (variant == 'indexed-opacity')
     assert plan['selected'] == ['09882.jpg','empty.jpg']
     assert plan['iterations'] == [10000,20000,30000]
     viewer = Inspector(source, limit=1)
@@ -210,6 +213,16 @@ def test_indexed_launcher_trains_on_exact_red_rows(tmp_path, explicit_rows):
     expected = np.unique(np.round(actual[red]/.02),axis=0)*.02
     np.testing.assert_array_equal(anchors[membership.mask('09882.jpg').numpy()], expected)
     assert not membership.mask('empty.jpg').any()
+    if variant == 'indexed-opacity':
+        hits = Membership(model/'observations', torch.tensor(anchors), plan['selected'], with_hits=True)
+        expected_pixels = [24*64+48] if explicit_rows else [24*64+32, 32*64+32]
+        assert hits.hit_indices('09882.jpg', 64, 48).tolist() == expected_pixels
+        assert not hits.hit_indices('empty.jpg', 64, 48).numel()
+        with pytest.raises(ValueError, match='dimensions'):
+            hits.hit_indices('09882.jpg', 32, 24)
+        assert str(model/'observations/hit_pixels.npy') in plan['input_fingerprints']
+    else:
+        assert not (model/'observations/hit_pixels.npy').exists()
     assert runner.main(args) == 0
     changed = sparse/'rows.npy' if explicit_rows else sparse/'points3D.bin'
     with changed.open('ab') as f:
@@ -264,5 +277,19 @@ def test_same_checkpoint_ablation_measures_actual_occlusion(tmp_path):
             empty_images,empty_stats = audit.compare(cam,gs,pipe,bg,torch.zeros_like(visible))
             assert not empty_images[2].any() and empty_stats['indexed_coverage'] == 0
             assert empty_stats['mean_indexed_weight'] == 0 and empty_stats['fraction_indexed_weight_blocked'] is None
+        gs.train()
+        for bg in (torch.zeros(3), torch.ones(3)):
+            result = backend.render(cam, gs, pipe, bg, visible_mask=visible & selected,
+                                    update_anchors=selected, return_alpha=True)
+            torch.testing.assert_close(result['alpha'], torch.full((4,4), .8))
+            loss = (.9 - result['alpha'][0,0]).clamp_min(0).square()
+            gs.optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            assert gs.mlp_opacity[2].bias.grad[0] < 0 and gs.mlp_opacity[2].bias.grad[1] == 0
+            assert gs._scaling.grad is None and gs._offset.grad is None
+            assert gs.mlp_color[2].bias.grad is None
+        empty = backend.render(cam, gs, pipe, bg, visible_mask=visible & ~visible, return_alpha=True)
+        assert not empty['alpha'].any()
+        empty['alpha'].sum().backward()
         audit.write_report(tmp_path,10000,{'test.jpg':dict(stats,images=['a.png']*4)})
         assert '83.2%' in (tmp_path/'index.html').read_text()

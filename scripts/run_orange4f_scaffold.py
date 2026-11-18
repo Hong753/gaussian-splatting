@@ -16,10 +16,14 @@ from scripts.run_occlusion import invoke
 from utils.checkpoint_snapshots import digest
 
 
+INDEXED_VARIANTS = ("indexed", "indexed-only", "indexed-opacity")
+
+
 def build_plan(args):
     from scripts.run_fixed_lidar import checkpoint_steps
     fixed = args.variant != 'learnable'
-    gated = args.variant in ('indexed','sensed','mesh-visible')
+    hard = args.variant in ('indexed-only', 'indexed-opacity')
+    gated = args.variant in (*INDEXED_VARIANTS, 'sensed', 'mesh-visible')
     static = gated or args.variant == 'fixed-static'
     command = ['models/train_scaffold.py', '--model_type', 'scaffold',
         '-s', str(args.source), '-m', str(args.model), '--initial_point_cloud', str(args.point_cloud),
@@ -36,10 +40,14 @@ def build_plan(args):
         command += ['--disable_anchor_pruning']
     if gated:
         command += ['--sensed_membership', str(Path(args.model)/'observations')]
+    if hard:
+        command += ['--indexed_forward_only']
+    if args.variant == 'indexed-opacity':
+        command += ['--indexed_opacity_weight', '0.05', '--indexed_opacity_target', '0.9']
     return dict(model=str(args.model), source=str(args.source), model_type='scaffold',
         antialiasing=False, freeze_anchors=fixed, anchor_growth=not fixed, pruning=not static,
         voxel_size=args.voxel_size, learned_offsets=True, appearance_dim=0,
-        hard_culling=False, stages=[dict(argv=command)])
+        hard_culling=hard, stages=[dict(argv=command)])
 
 
 def execute_plan(args, plan):
@@ -51,7 +59,10 @@ def execute_plan(args, plan):
     print(f'Reusing simple_knn: {knn.__file__}', flush=True)
     if list(Path(args.model).glob('point_cloud/iteration_*')):
         raise FileExistsError('Saved iterations already exist; use a new --run-version, or resume the trainer explicitly')
-    invoke(['scripts/smoke_scaffold.py'])
+    smoke = ['scripts/smoke_scaffold.py']
+    if args.variant == 'indexed-opacity':
+        smoke.append('--indexed-opacity')
+    invoke(smoke)
     print(json.dumps(plan, indent=2), flush=True)
     invoke(plan['stages'][0]['argv'])
 
@@ -68,7 +79,7 @@ def prepare_indexed(args, suite, staged, manifest, names):
     else:
         canonical_cloud(args.source, cloud, explicit=args.indexed_ply)
     prepare_membership(staged/'observations', viewer.manifest_path, cloud, args.indexed_ply,
-                       names, args.voxel_size, indexed_viewer=viewer)
+                       names, args.voxel_size, indexed_viewer=viewer, prepare_hits=args.variant == 'indexed-opacity')
 
     inputs = [args.indexed_ply, args.point_cloud]
     binary = Path(viewer.summary['model'])/'points3D.bin'
@@ -83,7 +94,7 @@ def prepare_indexed(args, suite, staged, manifest, names):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--suite', type=Path, required=True)
-    p.add_argument('--variant', choices=['learnable', 'fixed', 'fixed-static', 'indexed', 'sensed','mesh-visible'], required=True)
+    p.add_argument('--variant', choices=['learnable', 'fixed', 'fixed-static', *INDEXED_VARIANTS, 'sensed','mesh-visible'], required=True)
     p.add_argument('--gpu', required=True)
     p.add_argument('--observations', type=Path, default=os.environ.get('SCAFFOLD_OBSERVATIONS'),
                    help='Optional viewer row manifest for indexed, measured associations for sensed, or mesh visibility metadata')
@@ -111,7 +122,7 @@ def main(argv=None):
     args.expected_frames, args.report_max_views = suite['frames'], 32
     args.eval_memory_fraction, args.poll_seconds, args.dry_run = .25, 15., False
     manifest = None
-    indexed = args.variant == 'indexed'
+    indexed = args.variant in INDEXED_VARIANTS
     if args.indexed_ply and not indexed:
         p.error('--indexed-ply applies to the indexed variant')
     if indexed:
@@ -166,6 +177,8 @@ def main(argv=None):
         if indexed or manifest:
             directory = args.model/'observations'
             inputs.extend([directory/'metadata.json', directory/'parents.npy'])
+            if args.variant == 'indexed-opacity':
+                inputs.append(directory/'hit_pixels.npy')
         result = periodic.prepare_experiment(args, plan, 'scaffold', inputs, staged_model=staged)
         staged.rename(args.model)
     # Keep the original four-run manifest immutable. Add independent dashboard links.

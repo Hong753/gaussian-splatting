@@ -7,6 +7,9 @@ class ScaffoldOptimizationParams(ParamGroup):
         self.disable_anchor_growth = False
         self.disable_anchor_pruning = False
         self.sensed_membership = ""
+        self.indexed_forward_only = False
+        self.indexed_opacity_weight = 0.0
+        self.indexed_opacity_target = 0.9
         self.position_lr_init = 0.0
         self.position_lr_final = 0.0
         self.position_lr_delay_mult = 0.01

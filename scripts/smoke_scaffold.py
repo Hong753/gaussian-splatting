@@ -18,6 +18,9 @@ def main():
     from models.scaffold_gaussian import ScaffoldGaussianModel
     from models.scaffold_renderer import render, prefilter_voxel
     from utils.graphics_utils import BasicPointCloud, getProjectionMatrix
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--indexed-opacity', action='store_true')
+    check_opacity = parser.parse_args().indexed_opacity
     if not torch.cuda.is_available():
         raise RuntimeError('Scaffold preflight requires CUDA')
     print('Scaffold synthetic preflight: 9 test anchors; real dataset loads afterwards.', flush=True)
@@ -71,6 +74,17 @@ def main():
             model.optimizer.zero_grad(set_to_none=True)
             assert torch.equal(model._offset[~active], rows[~active])
             assert torch.equal(model.optimizer.state[model._offset]['exp_avg'][~active], moment[~active])
+        if fixed and check_opacity:
+            strict = render(camera, model, pipe, bg, visible_mask=visible & eligible,
+                            update_anchors=eligible, return_alpha=True)
+            alpha = strict['alpha']
+            assert alpha.shape == (32, 32) and torch.isfinite(alpha).all() and alpha.max() > 0
+            strict_hit = alpha.detach().argmax()
+            (1 - alpha.flatten()[strict_hit]).square().backward()
+            grad = model.mlp_opacity[2].bias.grad
+            assert grad is not None and torch.isfinite(grad).all() and grad.abs().sum() > 0
+            assert model._scaling.grad is None and model._offset.grad is None
+            model.optimizer.zero_grad(set_to_none=True)
         restored = ScaffoldGaussianModel(feat_dim=8, n_offsets=2, voxel_size=.02, appearance_dim=0, update_init_factor=16)
         restored.restore(model.capture(), opt)
         model.eval(); restored.eval()
