@@ -8,6 +8,7 @@ import time
 import types
 import unittest
 import urllib.request
+import zipfile
 from unittest.mock import patch
 import numpy as np
 
@@ -49,6 +50,40 @@ class ScaffoldViewerTests(unittest.TestCase):
         self.assertEqual(viewer.call_args.args[1], self.root)
         self.assertEqual(captured[-1], "stopped")
 
+    def test_catalog_includes_complete_checkpoints_in_numeric_order(self):
+        for step in (4, 20, 90):
+            folder = self.run / f"point_cloud/iteration_{step}"
+            folder.mkdir()
+            (folder / "point_cloud.ply").write_bytes(b"ply")
+            for name in viewer_mod.MLP_FILES:
+                with zipfile.ZipFile(folder / name, "w") as archive:
+                    archive.writestr("weights", "example")
+        (self.run / "point_cloud/iteration_90/color_mlp.pt").write_bytes(b"in progress")
+        other = self.root / "baseline"
+        other.mkdir()
+        (other / "cfg_args").write_text("Namespace(model_type='3dgs')")
+        upstream = self.root / "preparing"
+        upstream.mkdir()
+        (upstream / "upstream.json").write_text("{}")
+        runs = viewer_mod.discover_checkpoints(self.root)
+        self.assertEqual(tuple(runs), ("preparing", "run"))
+        self.assertEqual(tuple(runs["run"]), (20, 4))
+        self.assertEqual(runs["preparing"], {})
+        (self.run / "periodic_evaluation").mkdir()
+        (self.run / "periodic_evaluation/plan.json").touch()
+        (self.run / "point_cloud/iteration_4/ready.json").write_text("{}")
+        self.assertEqual(tuple(viewer_mod.discover_checkpoints(self.root)["run"]), (4,))
+
+    def test_projected_child_radii_and_orientation(self):
+        from scripts.scaffold_viewer_render import projected_axes, projected_centers
+        ids, uv, local = projected_centers(np.array([[0,0,2], [2,0,2], [0,0,-1]]), np.eye(4), 100, 80, 60)
+        np.testing.assert_array_equal(ids, [0])
+        np.testing.assert_allclose(uv, [[39.5, 29.5]])
+        for quaternion, angle in (([1,0,0,0], 0), ([2**-.5,0,0,2**-.5], 90)):
+            radii, degrees = projected_axes(local, np.array([[.2,.1,.05]]), np.array([quaternion]), np.eye(3), 100.)
+            np.testing.assert_allclose(radii, [[10, 5]])
+            self.assertAlmostEqual(degrees[0] % 180, angle)
+
     def test_model_selection_requires_matching_mlp_and_config(self):
         ply, root, cfg = viewer_mod.model_paths(self.ply)
         self.assertEqual(ply, self.ply)
@@ -89,10 +124,11 @@ class ScaffoldViewerTests(unittest.TestCase):
         class Backend:
             def __init__(self, ply, cfg): self.ply = ply
             def close(self): pass
-            def render_image(self, wxyz, pos, fov, width, height, aa):
-                renders.append((width, height, aa))
+            def render_image(self, wxyz, pos, fov, width, height, aa, mode):
+                renders.append((width, height, aa, mode))
                 return np.zeros((height, width, 3), dtype=np.uint8)
         app = viewer_mod.Viewer(server, self.folder, backend_factory=Backend)
+        self.addCleanup(app.close)
         self.assertIn("point_cloud.ply", app.entries.options)
         app.directory.value = str(self.root)
         app.refresh()
@@ -113,7 +149,7 @@ class ScaffoldViewerTests(unittest.TestCase):
         deadline = time.monotonic() + 3
         while not frames and time.monotonic() < deadline:
             time.sleep(0.01)
-        self.assertEqual(renders, [(960, 480, True)])
+        self.assertEqual(renders, [(960, 480, True, "RGB")])
         self.assertEqual(frames[0].shape, (480, 960, 3))
         # Loading a no-AA checkpoint must also switch the interactive viewer off.
         (self.run / 'cfg_args').write_text("Namespace(model_type='scaffold', scaffold_n_offsets=10, antialiasing=False)")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Browse and view saved Scaffold-GS models on localhost.
+"""Explore saved Scaffold-GS checkpoints in a browser.
 
 The file picker browses the viewer machine's filesystem; it does not upload PLYs.
 The selected point_cloud.ply must have the Scaffold MLP files beside it.
@@ -12,13 +12,14 @@ from pathlib import Path
 import sys
 import threading
 import time
-from types import SimpleNamespace
+import zipfile
 
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from eval_all_frames import read_config
+from scripts.eval_all_frames import read_config
+from scripts.scaffold_viewer_render import MODES, ScaffoldBackend, UpstreamBackend, camera_matrices
 
 MLP_FILES = ("opacity_mlp.pt", "cov_mlp.pt", "color_mlp.pt")
 
@@ -39,93 +40,155 @@ def model_paths(ply):
     return ply, root, cfg
 
 
-def first_camera(path):
-    """Get the initial OpenCV camera-to-world pose saved by camera_to_JSON."""
-    data = json.loads(Path(path).read_text())
-    if not data:
-        raise ValueError("cameras.json contains no camera poses")
-    camera = data[0]
+def camera_pose(camera, distance):
     pos = np.asarray(camera["position"], dtype=float)
     rot = np.asarray(camera["rotation"], dtype=float)
     if pos.shape != (3,) or rot.shape != (3, 3) or not np.isfinite(pos).all() or not np.isfinite(rot).all():
-        raise ValueError("Invalid first camera pose in cameras.json")
+        raise ValueError("Invalid camera pose in cameras.json")
     fy, height = float(camera["fy"]), float(camera["height"])
-    if fy <= 0 or height <= 0:
+    if not (fy > 0 and height > 0):
         raise ValueError("Invalid camera intrinsics in cameras.json")
-    fovy = 2 * math.atan(height / (2 * fy))
-    # A look-at distance in the scale of the training camera trajectory.
-    positions = np.asarray([c["position"] for c in data if "position" in c], dtype=float)
-    distance = float(np.median(np.linalg.norm(positions - pos, axis=1))) if len(positions) else 1.0
-    if not math.isfinite(distance) or distance < 1e-4:
-        distance = 1.0
-    return pos, rot, fovy, distance
+    return pos, rot, 2*math.atan(height/(2*fy)), distance
 
 
-def camera_matrices(wxyz, position, fovy, width, height):
-    """Convert Viser's OpenCV camera-to-world pose to 3DGS matrices."""
-    import viser.transforms as vtf
-    c2w = np.eye(4, dtype=np.float64)
-    c2w[:3, :3] = vtf.SO3(np.asarray(wxyz)).as_matrix()
-    c2w[:3, 3] = position
-    fovx = 2 * math.atan(math.tan(fovy / 2) * width / height)
-    return np.linalg.inv(c2w).astype(np.float32), fovx
+def saved_cameras(path):
+    data = json.loads(Path(path).read_text())
+    if not data:
+        raise ValueError("cameras.json contains no poses")
+    positions = np.array([c["position"] for c in data], dtype=float)
+    distance = float(np.median(np.linalg.norm(positions - positions[0], axis=1)))
+    if not np.isfinite(distance) or distance < 1e-4:
+        distance = 1.
+    return {f'{i+1} · {c.get("img_name", "camera")}': camera_pose(c, distance) for i,c in enumerate(data)}
 
 
-class ScaffoldBackend:
-    def __init__(self, ply, cfg):
-        import torch
-        from models.scaffold_gaussian import ScaffoldGaussianModel
-        from models.scaffold_renderer import prefilter_voxel, render
-        from scene.cameras import MiniCam
-        from utils.graphics_utils import getProjectionMatrix
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is required to render Scaffold-GS on this machine")
-        self.torch, self.render, self.prefilter = torch, render, prefilter_voxel
-        self.MiniCam, self.projection = MiniCam, getProjectionMatrix
-        self.model = ScaffoldGaussianModel(feat_dim=cfg.get("scaffold_feat_dim", 32),
-                    n_offsets=cfg.get("scaffold_n_offsets", 10),
-                    voxel_size=cfg.get("scaffold_voxel_size", 0.001),
-                    update_init_factor=16, appearance_dim=0)
-        self.model.load_ply(str(ply))
-        self.model.eval()
-        self.background = torch.tensor([1, 1, 1] if cfg.get("white_background", False) else [0, 0, 0],
-                                       dtype=torch.float32, device="cuda")
+def first_camera(path):
+    return next(iter(saved_cameras(path).values()))
 
-    def render_image(self, wxyz, pos, fovy, width, height, antialiasing):
-        torch = self.torch
-        w2c, fovx = camera_matrices(wxyz, pos, fovy, width, height)
-        with torch.no_grad():
-            view = torch.as_tensor(w2c, device="cuda").T.contiguous()
-            proj = self.projection(0.01, 100.0, fovx, fovy).T.cuda()
-            cam = self.MiniCam(width, height, fovy, fovx, 0.01, 100.0, view, view @ proj)
-            pipe = SimpleNamespace(debug=False, antialiasing=antialiasing, compute_cov3D_python=False)
-            visible = self.prefilter(cam, self.model, pipe, self.background)
-            if not bool(visible.any()):
-                bg = np.rint(self.background.cpu().numpy() * 255).astype(np.uint8)
-                return np.broadcast_to(bg, (height, width, 3)).copy()
-            rgb = self.render(cam, self.model, pipe, self.background, visible_mask=visible)["render"]
-            return (rgb.clamp(0, 1).permute(1, 2, 0).mul(255).byte().cpu().numpy())
 
-    def close(self):
-        del self.model
-        self.torch.cuda.empty_cache()
+def discover_checkpoints(suite):
+    """Discover model directories and complete iteration bundles, newest step first."""
+    runs = {}
+    for root in sorted(suite.iterdir(), key=lambda path: path.name):
+        if not root.is_dir() or not root.resolve().is_relative_to(suite):
+            continue
+        cfg = root/'cfg_args'
+        if cfg.is_file():
+            try:
+                if read_config(cfg).get('model_type') != 'scaffold':
+                    continue
+            except (OSError, ValueError, SyntaxError):
+                continue
+        elif not (root/'upstream.json').is_file():
+            continue
+        steps = {}
+        runs[root.name] = steps
+        if not cfg.is_file() or not (root / "cameras.json").is_file():
+            continue
+        for folder in (root/'point_cloud').glob('iteration_*'):
+            number = folder.name.removeprefix('iteration_')
+            ply = folder/'point_cloud.ply'
+            if not number.isdecimal() or not ply.is_file() or not ply.stat().st_size:
+                continue
+            if (root/'periodic_evaluation/plan.json').is_file() and not (folder/'ready.json').is_file():
+                continue
+            # A traced MLP is a zip archive. Its closing directory is written last.
+            if all((folder/n).is_file() and zipfile.is_zipfile(folder/n) for n in MLP_FILES):
+                steps[int(number)] = ply
+        runs[root.name] = dict(sorted(steps.items(), reverse=True))
+    return runs
+
+
+def backend_for(ply, cfg):
+    return (UpstreamBackend if cfg.get("scaffold_upstream") else ScaffoldBackend)(ply, cfg)
 
 
 class Viewer:
-    def __init__(self, server, start_dir, backend_factory=ScaffoldBackend):
+    def __init__(self, server, start_dir, backend_factory=backend_for, *, suite=None):
         self.server, self.backend_factory = server, backend_factory
         self.backend = None
         self.generation = 0
         self.model_lock = threading.RLock()
         self.work_lock = threading.Lock()
         self.pending = {}
-        self.seq = {}
+        self.active_clients = set()
         self.wakeup = threading.Event()
         self.last_camera = None
+        self.camera_poses = {}
+        self.scene_source = None
+        self.suite = Path(suite).resolve() if suite is not None else None
+        self.catalog_lock = threading.RLock()
+        self.runs = {}
+        self.attempted = None
+        self.closed = False
 
         gui = server.gui
-        gui.add_markdown("## Scaffold-GS Viewer\nBrowse the viewer machine's files and open a saved Scaffold PLY. "
-                         "Enter a folder below, or paste the PLY path directly.")
+        gui.configure_theme(dark_mode=True, control_layout="collapsible", show_share_button=False)
+        with gui.add_folder("Scene"):
+            if self.suite is None:
+                self.add_file_picker(start_dir)
+            else:
+                self.run = gui.add_dropdown("Run", ("Waiting for runs",))
+                self.step = gui.add_dropdown("Checkpoint", ("Waiting for checkpoint",))
+                self.load_step = gui.add_button("Open checkpoint")
+                self.refresh_runs = gui.add_button("Refresh runs")
+                self.run.on_update(lambda _: self.refresh_steps())
+                self.load_step.on_click(lambda _: self.open_selected_step())
+                self.refresh_runs.on_click(lambda _: self.refresh_catalog())
+            self.status = gui.add_markdown("Choose a saved Scaffold checkpoint.")
+        with gui.add_folder("Viewport"):
+            self.mode = gui.add_dropdown("Display", MODES, hint="Rings show sampled one-sigma child footprints. Centers show sampled voxel anchors.")
+            self.resolution = gui.add_slider("Render width", min=320, max=1920, step=32, initial_value=960)
+            self.antialiasing = gui.add_checkbox("Anti-aliasing", initial_value=True)
+            self.lossless = gui.add_checkbox("Lossless PNG", initial_value=False,
+                                             hint="Preserve fine texture when inspecting blur.")
+        with gui.add_folder("Cameras"):
+            self.bookmark = gui.add_dropdown("Saved view", ("No checkpoint",))
+            self.jump = gui.add_button("Go to saved view")
+            self.reset_camera = gui.add_button("Go to first camera")
+        gui.add_markdown("Drag to orbit · Right-drag to pan · Scroll to zoom")
+
+        @self.mode.on_update
+        @self.resolution.on_update
+        @self.antialiasing.on_update
+        @self.lossless.on_update
+        def _settings(_):
+            self.schedule_all()
+
+        @self.reset_camera.on_click
+        def _reset(event):
+            if self.last_camera is not None and event.client is not None:
+                self.set_initial_camera(event.client)
+
+        @self.jump.on_click
+        def _jump(event):
+            pose = self.camera_poses.get(self.bookmark.value)
+            if pose is not None and event.client is not None:
+                self.set_initial_camera(event.client, pose)
+
+        @server.on_client_connect
+        def _connect(client):
+            if self.last_camera is not None:
+                self.set_initial_camera(client)
+            @client.camera.on_update
+            def _camera(_):
+                self.schedule(client)
+            self.schedule(client)
+
+        @server.on_client_disconnect
+        def _disconnect(client):
+            with self.work_lock:
+                self.pending.pop(client.client_id, None)
+                self.active_clients.discard(client.client_id)
+
+        if self.suite is None:
+            self.refresh()
+        else:
+            self.refresh_catalog()
+        threading.Thread(target=self.worker, name="scaffold-renderer", daemon=True).start()
+
+    def add_file_picker(self, start_dir):
+        gui = self.server.gui
         self.directory = gui.add_text("Folder", str(Path(start_dir).expanduser().resolve()),
                                       hint="Enter a folder path, then click Open folder")
         self.entries = gui.add_dropdown("Folder / PLY", ("(empty)",), initial_value="(empty)")
@@ -134,14 +197,6 @@ class Viewer:
         self.refresh_button = gui.add_button("Open folder / refresh")
         self.path_text = gui.add_text("Or enter PLY path", "", hint="Path on the machine running this viewer")
         self.load_button = gui.add_button("Load PLY path")
-        self.status = gui.add_markdown("Choose a `point_cloud.ply` to begin.")
-        self.resolution = gui.add_slider("Render width", min=320, max=1920, step=32, initial_value=960)
-        self.antialiasing = gui.add_checkbox("Anti-aliasing", initial_value=True,
-                                            hint="Match the setting used when training the run")
-        self.reset_camera = gui.add_button("Go to first training camera")
-        self.gui_help = gui.add_markdown("Drag to orbit; scroll to zoom. This viewer renders on the GPU.\n\n"
-                         "Select a saved PLY with the three MLP files in the same folder.")
-
         @self.open_button.on_click
         def _open(_):
             chosen = self.entries.value
@@ -168,33 +223,40 @@ class Viewer:
         def _load(_):
             self.load(Path(self.path_text.value).expanduser())
 
-        @self.resolution.on_update
-        @self.antialiasing.on_update
-        def _settings(_):
-            self.schedule_all()
+    def refresh_catalog(self):
+        with self.catalog_lock:
+            self.runs = discover_checkpoints(self.suite)
+            names = tuple(self.runs) or ("Waiting for runs",)
+            if tuple(self.run.options) != names:
+                previous = self.run.value
+                self.run.options = names
+                preferred = next((n for n in ("scaffold_upstream_fixed_v1", "scaffold_upstream_adaptive_v1")
+                                  if self.runs.get(n)), next((n for n in names if self.runs.get(n)), names[0]))
+                self.run.value = previous if previous in names else preferred
+            self.refresh_steps()
+            steps = self.runs.get(self.run.value, {})
+            if self.backend is None and steps:
+                latest = next(iter(steps.values()))
+                if latest != self.attempted:
+                    self.load(latest)
+            elif self.backend is None and not steps:
+                self.status.content = "Waiting for a saved 3D checkpoint. Orange4F saves at 10k, 20k and 30k."
 
-        @self.reset_camera.on_click
-        def _reset(event):
-            if self.last_camera is not None and event.client is not None:
-                self.set_initial_camera(event.client)
+    def refresh_steps(self):
+        with self.catalog_lock:
+            steps = tuple(map(str, self.runs.get(self.run.value, {})))
+            options = steps or ("Waiting for checkpoint",)
+            if tuple(self.step.options) != options:
+                self.step.options = options
+                self.step.value = options[0]
+            self.load_step.disabled = not bool(steps)
 
-        @server.on_client_connect
-        def _connect(client):
-            if self.last_camera is not None:
-                self.set_initial_camera(client)
-            @client.camera.on_update
-            def _camera(_):
-                self.schedule(client)
-            self.schedule(client)
-
-        @server.on_client_disconnect
-        def _disconnect(client):
-            with self.work_lock:
-                self.pending.pop(client.client_id, None)
-                self.seq.pop(client.client_id, None)
-
-        self.refresh()
-        threading.Thread(target=self.worker, name="scaffold-renderer", daemon=True).start()
+    def open_selected_step(self):
+        with self.catalog_lock:
+            if self.step.value.isdecimal():
+                ply = self.runs.get(self.run.value, {}).get(int(self.step.value))
+                if ply is not None:
+                    self.load(ply)
 
     def refresh(self):
         try:
@@ -214,27 +276,39 @@ class Viewer:
     def load(self, selected):
         try:
             ply, root, cfg = model_paths(selected)
-            cameras = first_camera(root / "cameras.json")
+            if self.suite is not None and (root.parent != self.suite or ply not in self.runs.get(root.name, {}).values()):
+                raise ValueError("Choose a checkpoint from the suite")
+            self.attempted = selected
+            poses = saved_cameras(root / "cameras.json")
+            source = cfg.get("source_path")
             self.status.content = f"Loading `{ply}` on the GPU…"
-            self.antialiasing.value = bool(cfg.get('antialiasing', True))
             with self.model_lock:
+                keep_pose = self.backend is not None and source is not None and source == self.scene_source
                 if self.backend is not None:
                     self.backend.close()
                     self.backend = None
                 self.generation += 1
                 self.last_camera = None
+                self.camera_poses = {}
+                self.bookmark.options = ("No checkpoint",)
                 self.backend = self.backend_factory(ply, cfg)
-                self.last_camera = cameras
-            for client in self.server.get_clients().values():
-                self.set_initial_camera(client)
-            self.status.content = f"**Loaded:** `{ply}`\n\nAA is controlled below. Showing base appearance."
+                self.antialiasing.disabled = bool(cfg.get("scaffold_upstream"))
+                self.antialiasing.value = bool(cfg.get("antialiasing", True)) and not self.antialiasing.disabled
+                self.camera_poses = poses
+                self.last_camera = next(iter(poses.values()))
+                self.scene_source = source
+                self.bookmark.options = tuple(poses)
+            if not keep_pose:
+                for client in self.server.get_clients().values():
+                    self.set_initial_camera(client)
+            self.status.content = f"**Loaded** · {root.name} · {ply.parent.name}"
             self.schedule_all()
         except Exception as exc:
             self.status.content = f"**Load failed:** {type(exc).__name__}: {exc}"
             print(f"Load failed: {type(exc).__name__}: {exc}", flush=True)
 
-    def set_initial_camera(self, client):
-        pos, rot, fovy, distance = self.last_camera
+    def set_initial_camera(self, client, pose=None):
+        pos, rot, fovy, distance = self.last_camera if pose is None else pose
         client.camera.position = pos
         client.camera.up_direction = -rot[:, 1]
         client.camera.look_at = pos + rot[:, 2] * distance
@@ -253,47 +327,65 @@ class Viewer:
             width = int(self.resolution.value)
             height = max(1, min(2160, round(width / aspect)))
             task = (client, np.asarray(camera.wxyz).copy(), np.asarray(camera.position).copy(),
-                    float(camera.fov), width, height, bool(self.antialiasing.value), self.generation)
+                    float(camera.fov), width, height, bool(self.antialiasing.value), self.generation, self.mode.value, self.lossless.value)
             with self.work_lock:
                 client_id = client.client_id
-                self.seq[client_id] = self.seq.get(client_id, 0) + 1
-                self.pending[client_id] = (self.seq[client_id], task)
+                self.active_clients.add(client_id)
+                self.pending[client_id] = task
                 self.wakeup.set()
         except (AttributeError, ValueError):
             return
 
     def worker(self):
-        while True:
+        while not self.closed:
             self.wakeup.wait()
             with self.work_lock:
                 tasks = list(self.pending.items())
                 self.pending.clear()
                 self.wakeup.clear()
-            for client_id, (seq, task) in tasks:
-                client, wxyz, pos, fov, width, height, aa, generation = task
+            for client_id, task in tasks:
+                client, wxyz, pos, fov, width, height, aa, generation, mode, lossless = task
                 try:
                     with self.model_lock:
                         if self.backend is None or generation != self.generation:
                             continue
-                        image = self.backend.render_image(wxyz, pos, fov, width, height, aa)
-                    with self.work_lock:
-                        current = self.seq.get(client_id) == seq
-                    if current and generation == self.generation:
-                        client.scene.set_background_image(image, format="jpeg", jpeg_quality=85)
+                        image = self.backend.render_image(wxyz, pos, fov, width, height, aa, mode)
+                        # Deliver the finished frame during motion. The next pass picks up the newest pose.
+                        with self.work_lock:
+                            connected = client_id in self.active_clients
+                        if connected:
+                            client.scene.set_background_image(image, format="png" if lossless else "jpeg", jpeg_quality=85)
                 except Exception as exc:
                     self.status.content = f"**Render failed:** {type(exc).__name__}: {exc}"
                     print(f"Render failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+    def close(self):
+        self.closed = True
+        self.wakeup.set()
+        with self.model_lock:
+            if self.backend is not None:
+                self.backend.close()
+                self.backend = None
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpu", default="0", help="CUDA GPU index")
     parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--browse-root", type=Path, default=None,
+    parser.add_argument("--host", default="127.0.0.1", help="Listen address. Use 0.0.0.0 with --suite for LAN access.")
+    group = parser.add_mutually_exclusive_group()
+    default_suite = Path(os.environ.get("ORANGE4F_OUTPUT_ROOT", "/data/3dgs_outputs/orange4f/3dgs_finetuning"))/"stride3_noaa_v1"
+    group.add_argument("--suite", nargs="?", type=Path, const=default_suite, help="Pick saved runs and iterations (default Orange4F suite)")
+    group.add_argument("--browse-root", type=Path, default=None,
                         help="Optional initial folder (default: home directory)")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
+    if args.host not in ("127.0.0.1", "::1", "localhost") and args.suite is None:
+        parser.error("Use --suite for a remote viewer and select from its saved models.")
+    if args.suite is not None and not args.suite.expanduser().is_dir():
+        parser.error(f"Suite directory does not exist: {args.suite}")
     start_dir = args.browse_root.expanduser() if args.browse_root is not None else Path.home()
     if not start_dir.is_dir():
         fallback = Path.cwd()
@@ -304,13 +396,29 @@ def main():
         import viser
     except ImportError:
         parser.exit(1, "Install the viewer dependency: python -m pip install 'viser==1.0.30'\n")
-    server = viser.ViserServer(host="127.0.0.1", port=args.port, label="Scaffold-GS Viewer")
-    Viewer(server, start_dir)
-    print(f"Open http://127.0.0.1:{server.get_port()} in a browser on this machine.", flush=True)
+    server = viser.ViserServer(host=args.host, port=args.port, label="Scaffold-GS Viewer")
+    viewer = Viewer(server, start_dir, suite=args.suite.expanduser() if args.suite else None)
+    host = "<server-ip>" if args.host == "0.0.0.0" else args.host
+    port = server.get_port()
+    print(f"Open http://{host}:{port}/", flush=True)
+    if args.suite and args.host == "0.0.0.0" and (args.suite.expanduser() / "suite.json").is_file():
+        from scripts.refresh_orange4f_dashboard import refresh
+        try:
+            refresh(args.suite.expanduser(), viewer_port=port)
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"Could not add the viewer link to the suite dashboard: {exc}", flush=True)
     try:
         while True:
-            time.sleep(1)
+            time.sleep(10)
+            if args.suite:
+                try:
+                    viewer.refresh_catalog()
+                except OSError as exc:
+                    print(f"Could not refresh checkpoints: {exc}", flush=True)
     except KeyboardInterrupt:
+        pass
+    finally:
+        viewer.close()
         server.stop()
 
 

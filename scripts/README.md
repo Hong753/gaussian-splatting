@@ -427,32 +427,18 @@ python scripts/train.py --data-root /path/to/data --scenes my_scene \
 
 ### Interactive Scaffold-GS viewer
 
-Install the browser viewer dependency once in the existing `3dgs` environment:
+On the Orange4F server, start the viewer in the `3dgs` environment. Choose a GPU with spare memory.
 
 ```bash
 python -m pip install 'viser==1.0.30'
+python -u scripts/view_scaffold.py --suite --gpu 6 --host 0.0.0.0 --port 8099
 ```
 
-Run `python scripts/view_scaffold.py --gpu 0 --port 8080` and open
-`http://127.0.0.1:8080` in a browser on the **same machine**. The viewer binds
-to localhost and the file picker browses the viewer machine's filesystem.
-The file picker starts in your home directory; enter a different folder in the
-GUI and click **Open folder / refresh**. On a remote headless machine, forward the port over SSH
-from your computer (`ssh -L 8080:127.0.0.1:8080 USER@HOST`) and open the same
-URL in your local browser. A GPU on the machine running Python does the rendering.
+Open `http://SERVER:8099/` or reload the suite dashboard and click **Open Scaffold 3D viewer**. The suite picker lists saved native and upstream Scaffold runs. Choose a **Run** and **Checkpoint**, then click **Open checkpoint**. The list refreshes every ten seconds. A run needs a complete saved PLY and the opacity, covariance and color MLPs. The upstream Orange4F runs save at 10k, 20k and 30k.
 
-In the left panel, enter a folder path and click **Open folder / refresh**, or
-select a folder from the list and click **Open selected** to navigate. Select
-`point_cloud.ply` and click **Open selected** to load it. Alternatively paste
-its full path and click **Load PLY path**. The PLY must be from a Scaffold run
-in this repository and have `opacity_mlp.pt`, `cov_mlp.pt`, and `color_mlp.pt`
-beside it; its model run directory must retain `cfg_args` and `cameras.json`.
-The starting camera comes from that file. Drag to orbit and scroll to zoom; use
-**Go to first training camera** to reset. Toggle AA to match training and adjust
-render width to trade quality for responsiveness. The viewer uses the base
-appearance without per-training-image exposure compensation. Rendering a saved
-iteration is separate from training; select a different PLY to inspect another.
+Drag to orbit, right-drag to pan and scroll to zoom. **Cameras → Saved view** jumps to a recorded pose. Switching checkpoints from the same scene preserves the current viewpoint. **Display → RGB** renders the full scene with the saved view-dependent networks. Enable **Lossless PNG** when inspecting fine texture. **Child rings** overlays one-sigma projected ellipses from up to 400 frustum-visible parents. **Anchor centers** overlays up to 12,000 voxel anchors. The overlays can show geometry behind visible surfaces. Free-camera views of indexed runs use ordinary inference across frustum-visible parents. Per-image training masks apply only in the corresponding training protocol.
 
+Use `--suite /path/to/suite` to browse a different suite. The local filesystem picker is available with `python scripts/view_scaffold.py --gpu 0 --port 8080` at `http://127.0.0.1:8080/`. Select a Scaffold `point_cloud.ply` with its MLP files, `cfg_args` and `cameras.json` in their original locations. For upstream runs, keep the checkout and rasterizer referenced in `upstream.json` available.
 
 
 ### Compare 3DGS and Scaffold-GS along one camera trajectory

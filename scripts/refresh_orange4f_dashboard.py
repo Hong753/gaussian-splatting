@@ -19,6 +19,12 @@ UPSTREAM = re.compile(r'scaffold_upstream_(fixed|adaptive)_[a-zA-Z0-9_-]+')
 DEFAULTS = ('scaffold_upstream_fixed_v1', 'scaffold_upstream_adaptive_v1')
 
 POLL = """<script>
+const viewerLink = document.querySelector('a[data-scaffold-viewer-port]');
+if (viewerLink) {
+  const url = new URL('/', location.href);
+  url.port = viewerLink.dataset.scaffoldViewerPort;
+  viewerLink.href = url.href;
+}
 async function refreshPreview(row) {
   try {
     const url = row.dataset.preview;
@@ -53,7 +59,7 @@ def status(model):
     return False, 'No preview saved yet'
 
 
-def refresh(root, *, native=None):
+def refresh(root, *, native=None, viewer_port=None):
     root = Path(root)
     index = root/'index.html'
     if not (index.is_file() or (root/'suite.json').is_file()):
@@ -105,7 +111,16 @@ def refresh(root, *, native=None):
             url = name + '/debug_previews'
             href = f' href="{url}/index.html"' if ready else ''
             rows.append(f'<li data-preview="{url}"><a{href}>{name}</a> · <span>{label}</span></li>')
-        content = before + BEGIN + '<h2>Upstream Scaffold-GS</h2><ul>' + ''.join(rows) + '</ul>' + POLL + END + after
+        previous_port = re.search(r'<a data-scaffold-viewer-port="(\d+)">', old)
+        port = viewer_port
+        if port is None and previous_port:
+            port = int(previous_port[1])
+        viewer = ''
+        if port is not None:
+            if not 1 <= port <= 65535:
+                raise ValueError('Invalid Scaffold viewer port')
+            viewer = f'<p><a data-scaffold-viewer-port="{port}">Open Scaffold 3D viewer</a></p>'
+        content = before + BEGIN + viewer + '<h2>Upstream Scaffold-GS</h2><ul>' + ''.join(rows) + '</ul>' + POLL + END + after
         if content != old:
             atomic_write(index, lambda path: path.write_text(content))
     return states

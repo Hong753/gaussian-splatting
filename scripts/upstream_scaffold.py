@@ -207,14 +207,18 @@ def train(api, model, plan, dataset, opt, pipe, records, selected, views):
     atomic_json(model/'trained.json', dict(iteration=opt.iterations, revision=REVISION))
 
 
-def saved_renderer(api, model, dataset, pipe, iteration):
-    import torch
+def load_saved_model(api, dataset, folder):
     gs = api.scene.GaussianModel(feat_dim=dataset.feat_dim, n_offsets=dataset.n_offsets,
                                  voxel_size=dataset.voxel_size, appearance_dim=dataset.appearance_dim)
-    folder = model/f'point_cloud/iteration_{iteration}'
     gs.load_ply_sparse_gaussian(str(folder/'point_cloud.ply'))
     gs.load_mlp_checkpoints(str(folder))
     gs.eval()
+    return gs
+
+
+def saved_renderer(api, model, dataset, pipe, iteration):
+    import torch
+    gs = load_saved_model(api, dataset, model/f'point_cloud/iteration_{iteration}')
     bg = torch.zeros(3, device='cuda')
     def draw(camera):
         visible = api.renderer.prefilter_voxel(camera, gs, pipe, bg)
