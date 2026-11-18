@@ -57,3 +57,20 @@ Example scan entry:
 The run saves per-view parent counts and aggregate coverage in `observations/metadata.json`, actual eligible render counts in `scaffold_training.jsonl`, and RGB comparisons in `debug_previews/index.html`. Evaluate on the same held-out views at 10k, 20k and 30k. A low ever-sensed fraction indicates that many parents receive no local updates.
 
 For a separate estimated-visibility comparison, set `SCAFFOLD_OBSERVATIONS` to the existing mesh cache’s `visibility/metadata.json` and use the `mesh-visible` variant. This reads the cached `visible_ids` and verifies each training camera signature and the cloud row identity. Its eligibility derives from first-hit mesh agreement.
+
+## Full-scene reference runs using the authors’ code
+
+“Indexed parents only” selects a voxel anchor whenever at least one of its LiDAR rows is red in the current camera. All children of that anchor can be decoded, including children with learned offsets away from the red point. The usual frustum and positive-opacity tests still apply.
+
+For a matched pair using the original Scaffold-GS training loop, decoder, CUDA visibility filter and rasterizer, run each command in a separate terminal on a free GPU.
+
+```bash
+bash scripts/run_orange4f_upstream_scaffold.sh 4 fixed
+bash scripts/run_orange4f_upstream_scaffold.sh 7 adaptive
+```
+
+Both use the full viewer cloud (or the suite initialization if the viewer PLY is unavailable), 2 cm voxelization, the same stride-3 sharp frames and original poses, native RGB resolution, 10 offsets per anchor, base appearance, no AA, and 30,000 iterations. Both train offsets, features, scales and the view-dependent networks with full-image RGB. Neither reads per-image point indices or uses a LiDAR opacity loss. The upstream anchor position LR is zero in both. The adaptive run uses the authors’ growth and pruning schedule. The fixed run disables those adjustments with `--update_until 0`.
+
+The launcher pins [the released implementation](https://github.com/city-super/Scaffold-GS/tree/59c833b56bbbf510f3f64d40f81721995caced66). It builds the upstream rasterizer once in a private cache using the active 3dgs environment and reuses its simple_knn. The adapter supplies the suite’s cameras, split, cloud and reporting callbacks to the original training function. It bypasses the upstream command-line GPU selector. Source data is read-only. Set `SCAFFOLD_RUN_VERSION` for an additional fresh run. The launcher accepts an optional source directory as its third argument.
+
+Outputs are `stride3_noaa_v1/scaffold_upstream_{fixed,adaptive}_v1`. Each run saves live train and held-out previews in `debug_previews/`, upstream PLY and MLPs at 10k/20k/30k, and final all-frame PSNR plus browsable train and held-out comparisons. The live preview follows the original loop’s pre-update reporting point. Reports use the same upstream renderer as training.

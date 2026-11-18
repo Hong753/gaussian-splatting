@@ -214,7 +214,7 @@ class TrainingPreviewer:
                 occlusion_mode=getattr(pipe, 'occlusion_mode', 'off'),
                 exposure='base appearance; per-image exposure off',
                 metric='mean per-channel PSNR (ROI-only when frame.metric says ROI); not all-frame evaluation',
-                state_timing='end of training iteration')
+                state_timing=self.manifest.get('state_timing', 'end of training iteration'))
             atomic_json(temporary / 'frames.json', snapshot)
             os.replace(temporary, folder)
             history_path = self.root / 'history.json'

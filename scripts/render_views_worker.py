@@ -4,6 +4,8 @@ import argparse
 import hashlib
 import json
 import math
+import subprocess
+import tempfile
 from functools import partial
 from pathlib import Path
 import sys
@@ -26,13 +28,18 @@ def load_record_camera(args, record, index):
 
 
 def render_views(spec, names, iteration, output, antialiasing=None):
-    import numpy as np
-    import torch
-    from PIL import Image
-    from tqdm import tqdm
     cfg = spec["cfg"]
-    pose_cache=pose_options.load_cache(spec,iteration)
-    dataset_labels=pose_options.dataset_pose_labels(cfg['source_path'])
+    pose_cache = pose_options.load_cache(spec, iteration)
+    if cfg.get('scaffold_upstream'):
+        if antialiasing or pose_cache is not None:
+            raise ValueError('Upstream Scaffold renders require original cameras and AA off')
+        with tempfile.TemporaryDirectory() as tmp:
+            selection = Path(tmp)/'selection.json'
+            selection.write_text(json.dumps(dict(names=names)))
+            subprocess.run([sys.executable, str(ROOT/'scripts/upstream_scaffold.py'), 'render',
+                            '--model', str(spec['path']), '--iteration', str(iteration),
+                            '--selection', str(selection), '--output', str(output)], check=True)
+        return
     if spec["type"] == "proxygs":
         if antialiasing:
             raise ValueError("Proxy-GS does not support Graphdeco AA; use --no-antialiasing")
@@ -51,6 +58,15 @@ def render_views(spec, names, iteration, output, antialiasing=None):
         camera_args = SimpleNamespace(resolution=cfg.get("resolution", -1), data_device="cpu", train_test_exp=False,
                                       loss_mask_dir=cfg.get('loss_mask_dir',''))
         make_camera = partial(load_record_camera, camera_args)
+    save_rendered_views(spec, names, output, render, make_camera, pose_cache)
+
+
+def save_rendered_views(spec, names, output, render, make_camera, pose_cache):
+    import numpy as np
+    import torch
+    from PIL import Image
+    from tqdm import tqdm
+    dataset_labels = pose_options.dataset_pose_labels(spec['cfg']['source_path'])
     output = Path(output)
     for name in ("gt", "renders", "errors", "comparisons"):
         (output / name).mkdir(parents=True, exist_ok=True)
