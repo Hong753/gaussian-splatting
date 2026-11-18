@@ -104,6 +104,10 @@ def test_http_serves_registered_frame_and_overlay(tmp_path):
             assert b"Stored image pixels" in urlopen(url + "/").read()
             assert json.load(urlopen(url + "/summary"))["initial"] == 31
             assert json.load(urlopen(url + "/frame/31"))["matched"] == 2
+            assert b"drawElements" in urlopen(url + "/sparse_scene.js").read()
+            assert len(urlopen(url + "/cloud/0").read()) == 5 * 12
+            assert urlopen(url + "/indexed/31").read() == inspector.frame_data(31)[1]
+            assert urlopen(url + "/indexed/11").read() == bytes(8)
             assert urlopen(url + "/photo/31").read().startswith(b"\xff\xd8")
             assert len(json.load(urlopen(url + "/context/31"))) > 0
             with pytest.raises(HTTPError):
@@ -121,3 +125,60 @@ def test_distorted_camera_still_displays_saved_feature_pixels(tmp_path):
     assert not f["can_project"] and f["camera_model"] == "SIMPLE_RADIAL"
     assert f["samples"][0][3:5] == [[31, 23], None] and f["reciprocal_ply"] == 1
     assert viewer.context(31) == []
+
+
+def test_3d_scene_and_indices_use_every_original_row(tmp_path, monkeypatch):
+    from scripts import view_sparse_observations as viewer
+
+    monkeypatch.setattr(viewer, "CLOUD_CHUNK", 2)
+    fixture(tmp_path)
+    v = Inspector(tmp_path, limit=1)
+    # Last partial chunk, duplicate vertices, and stored PLY order are preserved.
+    cloud = np.frombuffer(b"".join(v.cloud_chunk(i) for i in range(3)), "<f4").reshape(-1, 3)
+    np.testing.assert_allclose(cloud + v.origin, v.ply.coords(slice(None)))
+    with pytest.raises(KeyError):
+        v.cloud_chunk(3)
+    frame, data = v.frame_data(31)
+    assert struct.unpack_from("<II", data) == (2, 1)
+    np.testing.assert_array_equal(np.frombuffer(data, "<u4", count=2, offset=8), [0, 2])
+    np.testing.assert_allclose(np.frombuffer(data, "<f4", offset=16) + v.origin, [1, 0, 2])
+    assert len(frame["samples"]) == 1 and frame["indexed_rows"] == 2
+    assert v.frame_data(11)[1] == bytes(8)  # plenty of points in the frustum, none indexed
+    # Off-center principal point and nonidentity COLMAP world-to-camera pose.
+    pose = v.frames[11]
+    pose.R = np.array([[0.0, -1.0, 0.0], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0]])
+    pose.t = np.array([2.0, -3.0, 5.0])
+    g = viewer.camera_geometry(pose, v.cameras[1], v.origin)
+    center = np.asarray(g["center"]) + v.origin
+    np.testing.assert_allclose(pose.R @ center + pose.t, 0)
+    rays = np.asarray(g["rays"])
+    uv, _ = viewer.project(center + rays, pose, v.cameras[1])
+    np.testing.assert_allclose(uv, [[0, 0], [64, 0], [64, 48], [0, 48]], atol=1e-10)
+
+
+def test_stored_lidar_rows_override_track_matches(tmp_path):
+    from utils.checkpoint_snapshots import digest
+
+    model = fixture(tmp_path)
+    path = model / "lidar_observations.json"
+    source = {
+        "format": "lidar_rows_v1",
+        "point_cloud_sha256": digest(model / "points3D.ply"),
+        "frames": {"09882.jpg": "rows.npy", "empty.jpg": "empty.npy"},
+    }
+    path.write_text(json.dumps(source))
+    np.save(model / "rows.npy", np.array([4, 1, 4], dtype=np.uint32))
+    np.save(model / "empty.npy", np.array([], dtype=np.uint32))
+    v = Inspector(tmp_path, limit=1)
+    f, data = v.frame_data(31)
+    assert f["indexed_source"] == "per-image LiDAR row indices" and f["indexed_rows"] == 2
+    assert len(f["manifest_xy"]) == 1
+    np.testing.assert_array_equal(np.frombuffer(data, "<u4", count=2, offset=8), [1, 4])
+    assert v.frame_data(11)[1] == bytes(8)
+    np.save(model / "rows.npy", np.array([5]))
+    with pytest.raises(ValueError, match="Invalid LiDAR row indices"):
+        Inspector(tmp_path).frame(31)
+    source["point_cloud_sha256"] = "wrong"
+    path.write_text(json.dumps(source))
+    with pytest.raises(ValueError, match="different PLY"):
+        Inspector(tmp_path)

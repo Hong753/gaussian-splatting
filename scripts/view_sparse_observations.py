@@ -3,6 +3,7 @@
 
 import argparse
 from dataclasses import dataclass
+from functools import lru_cache
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -23,9 +24,11 @@ from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from utils.checkpoint_snapshots import digest
 from utils.colmap_paths import colmap_model_dir
 from utils.read_write_model import qvec2rotmat, read_cameras_binary
 
+CLOUD_CHUNK = 262144
 FEATURE = np.dtype([("xy", "<f8", 2), ("id", "<i8")])
 HEADER = np.dtype([("id", "<u8"), ("xyz", "<f8", 3), ("rgb", "u1", 3), ("error", "<f8"), ("count", "<u8")])
 TRACK = np.dtype([("image", "<i4"), ("feature", "<i4")])
@@ -156,12 +159,27 @@ class PlyIndex:
         self.vertices = PlyData.read(str(path), mmap="r")["vertex"].data
         self.dtype = np.result_type(*[self.vertices[k].dtype for k in "xyz"])
         self.sorted_keys = self.order = None
-        if index_coords and len(self.vertices):
-            print(f"Indexing exact XYZ for {len(self.vertices):,} PLY rows …", flush=True)
-            key = np.empty(len(self.vertices), dtype=np.dtype((np.void, self.dtype.itemsize * 3)))
-            for start in range(0, len(key), 500000):
-                part = slice(start, start + 500000)
-                key[part] = keys(self.coords(part), self.dtype)
+        count = len(self.vertices)
+        if count > np.iinfo(np.uint32).max:
+            raise ValueError("PLY exceeds the 32-bit row range supported by the 3D viewer")
+        key = None
+        if index_coords and count:
+            key = np.empty(count, dtype=np.dtype((np.void, self.dtype.itemsize * 3)))
+        self.bounds = None
+        minimum, maximum = np.full(3, np.inf), np.full(3, -np.inf)
+        for start in tqdm(range(0, count, CLOUD_CHUNK), desc="Indexing scene PLY", unit="chunk"):
+            part = slice(start, start + CLOUD_CHUNK)
+            xyz = self.coords(part)
+            finite = xyz[np.isfinite(xyz).all(axis=1)]
+            if len(finite):
+                minimum = np.minimum(minimum, finite.min(axis=0))
+                maximum = np.maximum(maximum, finite.max(axis=0))
+            if key is not None:
+                key[part] = keys(xyz, self.dtype)
+        if np.isfinite(minimum).all():
+            self.bounds = [minimum.tolist(), maximum.tolist()]
+        if key is not None:
+            print(f"Sorting {count:,} PLY coordinates for exact row matching …", flush=True)
             self.order = np.argsort(key, kind="stable")
             self.sorted_keys = key[self.order]
 
@@ -180,6 +198,43 @@ class PlyIndex:
             result[one] = self.order[lo[one]]
             result[(hi - lo > 1) & finite] = -2
         return result
+
+
+def camera_geometry(frame, cam, origin):
+    if cam.model.startswith("SIMPLE_") or cam.model.startswith("RADIAL"):
+        fx, cx, cy = cam.params[:3]
+        fy = fx
+    else:
+        fx, fy, cx, cy = cam.params[:4]
+    corners = np.array([[0, 0], [cam.width, 0], [cam.width, cam.height], [0, cam.height]])
+    rays = np.column_stack(((corners - [cx, cy]) / [fx, fy], np.ones(4))) @ frame.R
+    return dict(
+        center=(-frame.R.T @ frame.t - origin).tolist(),
+        rays=rays.tolist(),
+        up=(-frame.R[1]).tolist(),
+        forward=frame.R[2].tolist(),
+    )
+
+
+def row_manifest(source, model, ply_path, explicit):
+    candidates = (
+        [Path(explicit).expanduser()]
+        if explicit
+        else [folder / "lidar_observations.json" for folder in (model, model.parent, source)]
+    )
+    for path in dict.fromkeys(candidates):
+        if not explicit and not path.is_file():
+            continue
+        meta = json.loads(path.read_text())
+        if meta.get("format") != "lidar_rows_v1":
+            if explicit:
+                raise ValueError(f"Expected lidar_rows_v1 in {path}")
+            continue
+        print(f"Checking PLY row identity for {path} …", flush=True)
+        if not ply_path.is_file() or meta.get("point_cloud_sha256") != digest(ply_path):
+            raise ValueError(f"{path} indexes a different PLY. Use --ply with its original point cloud.")
+        return {name: path.parent / rows for name, rows in meta["frames"].items()}
+    return {}
 
 
 def project(xyz, frame, camera):
@@ -208,7 +263,7 @@ def finite_xy(xy):
 
 
 class Inspector:
-    def __init__(self, source, ply_path=None, images="images", limit=5000):
+    def __init__(self, source, ply_path=None, images="images", limit=5000, manifest=None):
         self.source, self.images, self.limit = Path(source), images, limit
         model = colmap_model_dir(self.source)
         self.cameras = read_cameras_binary(model / "cameras.bin")
@@ -228,6 +283,15 @@ class Inspector:
             if ply_path.is_file()
             else None
         )
+        self.manifest = row_manifest(self.source, model, ply_path, manifest)
+        centers = np.asarray([-f.R.T @ f.t for f in self.frames.values()])
+        bounds = (
+            [np.min(centers, axis=0), np.max(centers, axis=0)]
+            if not self.ply or self.ply.bounds is None
+            else self.ply.bounds
+        )
+        self.origin = np.mean(bounds, axis=0)
+        self.frame_data = lru_cache(maxsize=2)(self._frame_data)
         rev_names, rev_counts = np.unique(self.points.reverse["image"], return_counts=True)
         counts = dict(zip(rev_names.tolist(), rev_counts.tolist()))
         listing = [
@@ -236,6 +300,9 @@ class Inspector:
         ]
         self.summary = dict(
             frames=listing,
+            chunk_rows=CLOUD_CHUNK,
+            bounds=(np.asarray(bounds) - self.origin).tolist(),
+            manifest_frames=len(self.manifest),
             with_forward=sum(f.linked > 0 for f in self.frames.values()),
             with_reverse=sum(i in self.frames for i in counts),
             forward=total,
@@ -246,7 +313,9 @@ class Inspector:
             ply=str(ply_path) if self.ply else None,
             ply_rows=len(self.ply.vertices) if self.ply else 0,
             model=str(model),
-            initial=max(listing, key=lambda v: max(v["forward"], v["reverse"]))["id"],
+            initial=max(
+                listing, key=lambda v: (v["name"] in self.manifest, max(v["forward"], v["reverse"]))
+            )["id"],
         )
         print(
             f'{len(listing):,} images | {total:,} stored image→point links across {self.summary["with_forward"]:,} images | '
@@ -255,7 +324,7 @@ class Inspector:
             flush=True,
         )
 
-    def frame(self, iid):
+    def _frame_data(self, iid):
         frame = self.frames[iid]
         cam = self.cameras[frame.camera]
         records = np.frombuffer(self.buf, FEATURE, frame.count, frame.offset)
@@ -298,29 +367,68 @@ class Inspector:
                     finite_xy(xyz[i]) if resolved[i] else None,
                 ]
             )
-        return dict(
-            id=iid,
-            name=frame.name,
-            width=cam.width,
-            height=cam.height,
-            features=frame.count,
-            camera_model=cam.model,
-            can_project=can_project,
-            reciprocal_ply=len(np.unique(per_pair[(flags == 3) & (ply[per_pair] >= 0)])),
-            forward=len(forward),
-            reverse=len(back),
-            reciprocal=int((flags == 3).sum()),
-            forward_only=int((flags == 1).sum()),
-            reverse_only=int((flags == 2).sum()),
-            pairs=len(pairs),
-            distinct=len(ids),
-            resolved=int(resolved.sum()),
-            matched=int((ply >= 0).sum()),
-            ambiguous=int((ply == -2).sum()),
-            missing_xyz=int((~resolved).sum()),
-            median_error_px=float(np.median(residual)) if len(residual) else None,
-            samples=samples,
+        # Red indexes always address the original PLY vertex buffer in file order.
+        red = np.unique(ply[ply >= 0]).astype("<u4")
+        source = "COLMAP tracks matched by unique XYZ"
+        manifest_xy = []
+        if frame.name in self.manifest:
+            raw = np.load(self.manifest[frame.name], allow_pickle=False)
+            if (
+                raw.ndim != 1
+                or raw.dtype.kind not in "iu"
+                or (len(raw) and (raw.min() < 0 or raw.max() >= len(self.ply.vertices)))
+            ):
+                raise ValueError(f"Invalid LiDAR row indices for {frame.name}")
+            red = np.unique(raw).astype("<u4")
+            source = "per-image LiDAR row indices"
+            if can_project and len(red):
+                display = red[np.linspace(0, len(red) - 1, min(len(red), self.limit), dtype=int)]
+                image_xy, _ = project(self.ply.coords(display), frame, cam)
+                manifest_xy = image_xy[np.isfinite(image_xy).all(axis=1)].round(2).tolist()
+        unmatched = xyz[(ply < 0) & np.isfinite(xyz).all(axis=1)]
+        other = np.asarray(unmatched - self.origin, dtype="<f4")
+        payload = struct.pack("<II", len(red), len(other)) + red.tobytes() + other.tobytes()
+        return (
+            dict(
+                geometry=camera_geometry(frame, cam, self.origin),
+                indexed_source=source,
+                indexed_rows=len(red),
+                unmatched_xyz=len(other),
+                manifest_xy=manifest_xy,
+                id=iid,
+                name=frame.name,
+                width=cam.width,
+                height=cam.height,
+                features=frame.count,
+                camera_model=cam.model,
+                can_project=can_project,
+                reciprocal_ply=len(np.unique(per_pair[(flags == 3) & (ply[per_pair] >= 0)])),
+                forward=len(forward),
+                reverse=len(back),
+                reciprocal=int((flags == 3).sum()),
+                forward_only=int((flags == 1).sum()),
+                reverse_only=int((flags == 2).sum()),
+                pairs=len(pairs),
+                distinct=len(ids),
+                resolved=int(resolved.sum()),
+                matched=int((ply >= 0).sum()),
+                ambiguous=int((ply == -2).sum()),
+                missing_xyz=int((~resolved).sum()),
+                median_error_px=float(np.median(residual)) if len(residual) else None,
+                samples=samples,
+            ),
+            payload,
         )
+
+    def frame(self, iid):
+        return self.frame_data(iid)[0]
+
+    def cloud_chunk(self, chunk):
+        start = chunk * CLOUD_CHUNK
+        if not self.ply or not 0 <= start < len(self.ply.vertices):
+            raise KeyError(chunk)
+        xyz = self.ply.coords(slice(start, start + CLOUD_CHUNK))
+        return np.asarray(xyz - self.origin, dtype="<f4").tobytes()
 
     def context(self, iid):
         if self.ply is None or not len(self.ply.vertices):
@@ -354,20 +462,31 @@ class Inspector:
 def handler(inspector):
     page = Path(__file__).with_suffix(".html").read_bytes()
 
+    scene_js = Path(__file__).with_name("sparse_scene.js").read_bytes()
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             url = urlsplit(self.path).path
             try:
                 if url == "/":
                     body, mime = page, "text/html; charset=utf-8"
+                elif url == "/sparse_scene.js":
+                    body, mime = scene_js, "application/javascript"
+                elif url.startswith("/cloud/"):
+                    body, mime = (
+                        inspector.cloud_chunk(int(url.removeprefix("/cloud/"))),
+                        "application/octet-stream",
+                    )
                 elif url == "/summary":
                     body, mime = json.dumps(inspector.summary).encode(), "application/json"
                 else:
                     route, key = url.strip("/").split("/")
                     iid = int(key)
-                    if iid not in inspector.frames or route not in ("frame", "photo", "context"):
+                    if iid not in inspector.frames or route not in ("frame", "photo", "context", "indexed"):
                         raise KeyError(key)
-                    if route == "photo":
+                    if route == "indexed":
+                        body, mime = inspector.frame_data(iid)[1], "application/octet-stream"
+                    elif route == "photo":
                         body, mime = inspector.photo(iid), "image/jpeg"
                     else:
                         value = inspector.frame(iid) if route == "frame" else inspector.context(iid)
@@ -392,11 +511,15 @@ def main():
     p.add_argument("--source", type=Path)
     p.add_argument("--images", default="images")
     p.add_argument("--ply", type=Path)
+    p.add_argument("--manifest", type=Path, help="Optional lidar_rows_v1 manifest for the loaded PLY")
     p.add_argument("--image", help="Initial frame name, e.g. 09882.jpg")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8094)
     p.add_argument(
-        "--max-draw", type=int, default=5000, help="Display cap per layer. Counts use all observations."
+        "--max-draw",
+        type=int,
+        default=5000,
+        help="Photo overlays only. The 3D scene includes every PLY row.",
     )
     args = p.parse_args()
     if args.max_draw < 1:
@@ -410,7 +533,9 @@ def main():
         if suite.is_file()
         else Path("/workspace/colmap_scenes/orange4f")
     )
-    inspector = Inspector(source.expanduser().resolve(), args.ply, args.images, args.max_draw)
+    inspector = Inspector(
+        source.expanduser().resolve(), args.ply, args.images, args.max_draw, args.manifest
+    )
     if args.image:
         candidates = [f.id for f in inspector.frames.values() if f.name == args.image]
         if not candidates:
