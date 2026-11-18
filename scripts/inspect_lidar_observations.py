@@ -60,7 +60,8 @@ def inspect(source, selection=None):
                     print('  first line:', f.readline(250).strip())
     if not recognized or not any(r['associated_image_names'] for r in recognized):
         print('No explicit image-to-return mapping recognized. Inspect the listed acquisition files for frame IDs, '
-              'timestamps and point-row provenance. COLMAP tracks and mesh visible_ids alone do not establish scanner hits.')
+              'timestamps and point-row provenance. To inspect the binary image/point tracks and match them to PLY rows, '
+              f'run python scripts/view_sparse_observations.py --source {str(source)!r}.')
 
 
 def main():

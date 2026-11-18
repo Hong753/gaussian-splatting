@@ -1,0 +1,488 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sparse observations</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101519;
+      --panel: #1a2126;
+      --line: #37434b;
+      --ink: #f0f4f4;
+      --dim: #acb9c1;
+      --obs: #36eee2;
+      --rep: #fc8ac0;
+      --ply: #ffd26e;
+      --ctx: #a2b2bd;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font:
+        15px/1.5 Inter,
+        system-ui,
+        sans-serif;
+    }
+    header,
+    main {
+      max-width: 1520px;
+      margin: auto;
+      padding: 18px clamp(14px, 3vw, 42px);
+    }
+    header {
+      border-bottom: 1px solid var(--line);
+    }
+    h1 {
+      font-size: 24px;
+      letter-spacing: -0.04em;
+      margin: 0 0 2px;
+    }
+    h2 {
+      font-size: 18px;
+      margin: 0 0 8px;
+    }
+    p {
+      margin: 4px 0;
+      color: var(--dim);
+    }
+    nav,
+    .layers {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    input,
+    button {
+      font: inherit;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--ink);
+      padding: 5px 10px;
+      border-radius: 5px;
+    }
+    button {
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: 0.45;
+    }
+    button:hover {
+      border-color: #81949e;
+    }
+    input[type="text"] {
+      width: min(320px, 65vw);
+    }
+    .layers label {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      margin-right: 8px;
+      cursor: pointer;
+    }
+    .layers input {
+      margin: 0;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(240px, 285px);
+      gap: 18px;
+    }
+    #port {
+      background: #06090b;
+      max-height: 78vh;
+      overflow: auto;
+      border: 1px solid var(--line);
+    }
+    #plane {
+      position: relative;
+      width: 100%;
+    }
+    img {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+    canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      cursor: crosshair;
+    }
+    aside {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 16px;
+      height: fit-content;
+    }
+    dl {
+      margin: 10px 0 14px;
+    }
+    dl div {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      border-bottom: 1px solid var(--line);
+      padding: 4px 0;
+    }
+    dt {
+      color: var(--dim);
+    }
+    dd {
+      margin: 0;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+    #detail {
+      overflow-wrap: anywhere;
+    }
+    #status {
+      margin: 8px 0;
+      color: #ffd26e;
+    }
+    @media (max-width: 820px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+      #port {
+        max-height: 65vh;
+      }
+    }
+  </style>
+  <header>
+    <h1>Sparse observations</h1>
+    <p id="dataset">Loading sparse model…</p>
+  </header>
+  <main>
+    <nav>
+      <label for="frame">Image</label
+      ><input
+        id="frame"
+        list="frames"
+        type="text"
+        autocomplete="off"
+        placeholder="Search image name"
+      /><datalist id="frames"></datalist><button id="prev">Previous</button><button id="next">Next</button
+      ><button id="most">Most links</button><button id="zoom">Actual size</button>
+    </nav>
+    <div class="layers" aria-label="Layers">
+      <label style="color: var(--obs)"
+        ><input id="observed" type="checkbox" checked />Stored image pixels</label
+      >
+      <label style="color: var(--rep)"
+        ><input id="reprojected" type="checkbox" checked />3D reprojections</label
+      >
+      <label style="color: var(--ply)"><input id="matches" type="checkbox" checked />Exact PLY matches</label>
+      <label style="color: var(--ctx)"><input id="context" type="checkbox" />Sampled PLY projection</label>
+    </div>
+    <div id="status" role="status"></div>
+    <div class="grid">
+      <section>
+        <div id="port">
+          <div id="plane">
+            <img id="photo" alt="Selected camera image" /><canvas
+              id="overlay"
+              aria-label="Observation overlay"
+            ></canvas>
+          </div>
+        </div>
+        <p id="caption"></p>
+      </section>
+      <aside>
+        <h2 id="name">Selected image</h2>
+        <p id="verdict"></p>
+        <dl id="stats"></dl>
+        <h2>Point details</h2>
+        <p id="detail">Click a colored marker to inspect its point ID and PLY row.</p>
+      </aside>
+    </div>
+  </main>
+  <script>
+    "use strict";
+    const $ = (id) => document.getElementById(id);
+    const fmt = (n) => n.toLocaleString();
+    async function get(path) {
+      const r = await fetch(path);
+      if (!r.ok) throw Error(path + " returned " + r.status);
+      return r.json();
+    }
+    let info,
+      frame,
+      all = [],
+      idx = 0,
+      version = 0,
+      contextData = null,
+      actual = false,
+      pointsOnScreen = [],
+      highlight = -1;
+    function setActual() {
+      if (!frame) return;
+      $("plane").style.width = actual ? $("photo").naturalWidth + "px" : "100%";
+      $("zoom").textContent = actual ? "Fit image" : "Actual size";
+      requestAnimationFrame(draw);
+    }
+    function draw() {
+      if (!frame || !$("photo").naturalWidth) return;
+      const c = $("overlay"),
+        rect = c.getBoundingClientRect(),
+        dpr = window.devicePixelRatio || 1;
+      if (!rect.width || !rect.height) return;
+      c.width = Math.round(rect.width * dpr);
+      c.height = Math.round(rect.height * dpr);
+      const g = c.getContext("2d");
+      g.scale(dpr, dpr);
+      const sx = rect.width / frame.width,
+        sy = rect.height / frame.height;
+      pointsOnScreen = [];
+      if ($("context").checked && contextData) {
+        g.fillStyle = "#abb9c4aa";
+        for (const p of contextData) g.fillRect(p[0] * sx - 1, p[1] * sy - 1, 2, 2);
+      }
+      function marker(xy, i, kind) {
+        if (!xy) return;
+        const x = xy[0] * sx,
+          y = xy[1] * sy;
+        if (x < 0 || y < 0 || x > rect.width || y > rect.height) return;
+        pointsOnScreen.push([x, y, i]);
+        if (kind === "obs") {
+          g.beginPath();
+          g.fillStyle = "#36eee2";
+          g.arc(x, y, 2.4, 0, 2 * Math.PI);
+          g.fill();
+        }
+        if (kind === "rep") {
+          g.strokeStyle = "#fc8ac0";
+          g.lineWidth = 1.2;
+          g.beginPath();
+          g.moveTo(x - 3.9, y);
+          g.lineTo(x + 3.9, y);
+          g.moveTo(x, y - 3.9);
+          g.lineTo(x, y + 3.9);
+          g.stroke();
+        }
+        if (kind === "ply") {
+          g.strokeStyle = "#ffd26e";
+          g.lineWidth = 1.1;
+          g.beginPath();
+          g.arc(x, y, 5.2, 0, 2 * Math.PI);
+          g.stroke();
+        }
+      }
+      frame.samples.forEach((r, i) => {
+        if ($("observed").checked) marker(r[3], i, "obs");
+        if ($("reprojected").checked) marker(r[4], i, "rep");
+        if ($("matches").checked && r[5] >= 0) marker(r[4] || r[3], i, "ply");
+      });
+      if (highlight >= 0) {
+        const s = frame.samples[highlight];
+        g.strokeStyle = "white";
+        g.lineWidth = 2;
+        for (const p of [s[3], s[4]])
+          if (p) {
+            g.beginPath();
+            g.arc(p[0] * sx, p[1] * sy, 9, 0, 2 * Math.PI);
+            g.stroke();
+          }
+      }
+    }
+    function showStats() {
+      const f = frame;
+      $("name").textContent = f.name;
+      let message;
+      if (!f.pairs)
+        message = info.point_file
+          ? "No stored image–point links for this frame."
+          : "images.bin has no linked pixels for this frame. The reverse track table is unavailable.";
+      else if (!info.point_file) message = "Stored image IDs found. The binary 3D point table is missing.";
+      else if (!f.resolved) message = "The stored IDs have no matching 3D record.";
+      else if (!info.ply) message = "3D links found. No PLY was loaded to check coordinates.";
+      else if (f.matched)
+        message =
+          fmt(f.matched) +
+          " of " +
+          fmt(f.distinct) +
+          " distinct linked points match a unique PLY vertex at stored XYZ precision.";
+      else message = "3D links found. None resolves to a unique PLY vertex at stored XYZ precision.";
+      if (!f.can_project)
+        message += " Stored pixels are shown. Reprojection is unavailable for " + f.camera_model + ".";
+      $("reprojected").disabled = !f.can_project;
+      $("context").disabled = !f.can_project || !info.ply;
+      $("verdict").textContent = message;
+      const pairs = [
+        ["Image features", f.features],
+        ["Image → 3D links", f.forward],
+        ["3D → image track entries", f.reverse],
+        ["Pairs agreeing both ways", f.reciprocal],
+        ["Forward only / reverse only", fmt(f.forward_only) + " / " + fmt(f.reverse_only)],
+        ["Distinct point IDs", f.distinct],
+        ["Resolved 3D IDs", f.resolved],
+        ["Unique PLY matches", info.ply ? f.matched : "unavailable"],
+        ["Reciprocal IDs with a PLY row", info.ply ? f.reciprocal_ply : "unavailable"],
+        ["Ambiguous PLY coordinates", info.ply ? f.ambiguous : "unavailable"],
+        [
+          "Median reprojection error",
+          f.median_error_px === null ? "—" : f.median_error_px.toFixed(2) + " px",
+        ],
+      ];
+      $("stats").replaceChildren(
+        ...pairs.map(([k, v]) => {
+          const row = document.createElement("div"),
+            dt = document.createElement("dt"),
+            dd = document.createElement("dd");
+          dt.textContent = k;
+          dd.textContent = typeof v === "number" ? fmt(v) : v;
+          row.append(dt, dd);
+          return row;
+        }),
+      );
+      $("caption").textContent =
+        fmt(f.samples.length) +
+        " of " +
+        fmt(f.pairs) +
+        " stored pairs selected for display. PLY matches identify coordinates. Scanner acquisition requires separate capture records.";
+    }
+    async function loadContext() {
+      if (!frame || !frame.can_project || !$("context").checked || contextData) return;
+      const ticket = version,
+        id = frame.id;
+      try {
+        const data = await get("/context/" + id);
+        if (ticket === version) {
+          contextData = data;
+          draw();
+        }
+      } catch (e) {
+        if (ticket === version) $("status").textContent = e.message;
+      }
+    }
+    async function select(i) {
+      if (i < 0 || i >= all.length) return;
+      idx = i;
+      const ticket = ++version,
+        id = all[i].id;
+      frame = null;
+      contextData = null;
+      highlight = -1;
+      pointsOnScreen = [];
+      $("port").style.visibility = "hidden";
+      $("prev").disabled = i === 0;
+      $("next").disabled = i === all.length - 1;
+      $("frame").value = all[i].name;
+      $("status").textContent = "Loading " + all[i].name + "…";
+      $("detail").textContent = "Click a colored marker to inspect its point ID and PLY row.";
+      try {
+        const img = new Image();
+        img.src = "/photo/" + id;
+        const data = await get("/frame/" + id);
+        if (ticket !== version) return;
+        frame = data;
+        showStats();
+        $("photo").src = img.src;
+        await $("photo").decode();
+        if (ticket !== version) return;
+        $("port").style.visibility = "visible";
+        const shapeRatio = $("photo").naturalWidth / $("photo").naturalHeight / (data.width / data.height);
+        $("status").textContent =
+          Math.abs(shapeRatio - 1) > 0.01
+            ? "Photo and calibration aspect ratios differ. Check resizing or cropping before interpreting the overlay."
+            : "";
+        setActual();
+        await loadContext();
+      } catch (e) {
+        if (ticket === version)
+          $("status").textContent = "Could not display " + all[i].name + ". " + e.message;
+      }
+    }
+    $("frame").onchange = () => {
+      const i = all.findIndex((r) => r.name === $("frame").value);
+      if (i >= 0) select(i);
+      else $("status").textContent = "Choose a registered image from the list.";
+    };
+    $("frame").onkeydown = (e) => {
+      if (e.key === "Enter") $("frame").onchange();
+    };
+    $("prev").onclick = () => select(idx - 1);
+    $("next").onclick = () => select(idx + 1);
+    $("most").onclick = () =>
+      select(
+        all.reduce(
+          (best, r, i) =>
+            Math.max(r.forward, r.reverse) > Math.max(all[best].forward, all[best].reverse) ? i : best,
+          0,
+        ),
+      );
+    $("zoom").onclick = () => {
+      actual = !actual;
+      setActual();
+    };
+    for (const id of ["observed", "reprojected", "matches", "context"])
+      $(id).onchange = () => {
+        draw();
+        loadContext();
+      };
+    $("overlay").onclick = (e) => {
+      const rect = $("overlay").getBoundingClientRect();
+      let dist = 100,
+        chosen = -1;
+      for (const [x, y, i] of pointsOnScreen) {
+        const d = (x - e.clientX + rect.left) ** 2 + (y - e.clientY + rect.top) ** 2;
+        if (d < dist) {
+          dist = d;
+          chosen = i;
+        }
+      }
+      if (chosen < 0) return;
+      highlight = chosen;
+      const [id, feat, flag, xy, uv, row, xyz] = frame.samples[chosen];
+      const source = ["", "images.bin only", "points3D.bin only", "both binary files"][flag];
+      $("detail").textContent =
+        "Point ID " +
+        id +
+        " · feature index " +
+        feat +
+        " · " +
+        source +
+        ". PLY row " +
+        (row >= 0 ? row : row === -2 ? "ambiguous" : "unresolved") +
+        ". XYZ " +
+        (xyz ? xyz.join(", ") : "unavailable") +
+        ". Stored pixel " +
+        (xy ? xy.join(", ") : "—") +
+        " · reprojected " +
+        (uv ? uv.join(", ") : "—") +
+        ".";
+      draw();
+    };
+    new ResizeObserver(draw).observe($("port"));
+    (async () => {
+      info = await get("/summary");
+      all = info.frames;
+      $("dataset").textContent =
+        fmt(all.length) +
+        " registered images · " +
+        fmt(info.with_forward) +
+        " with image → 3D links · " +
+        fmt(info.with_reverse) +
+        " with reverse tracks · " +
+        fmt(info.ply_rows) +
+        " PLY vertices";
+      $("context").disabled = !info.ply;
+      $("frames").replaceChildren(
+        ...all.map((r) => {
+          const o = document.createElement("option");
+          o.value = r.name;
+          return o;
+        }),
+      );
+      await select(all.findIndex((r) => r.id === info.initial));
+    })().catch((e) => ($("status").textContent = e.message));
+  </script>
+</html>
