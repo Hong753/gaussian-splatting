@@ -1,0 +1,15 @@
+--- a/train.py
++++ b/train.py
+@@ -25,0 +26 @@
++from pgsr_depth import DepthSupervisor, cuda_depth_smoke
+@@ -82,0 +84 @@
++    cuda_depth_smoke(pipe, render, lidar.config()['depth_supervision'])
+@@ -93,0 +96 @@
++    depth = DepthSupervisor(lidar.config()['depth_supervision'], scene, first_iter)
+@@ -319 +322 @@
+-        loss.backward()
++        depth.backward(loss, iteration, viewpoint_cam, render_pkg, pipe, background, render)
+--- a/gaussian_renderer/__init__.py
++++ b/gaussian_renderer/__init__.py
+@@ -164,0 +165 @@
++                    "rendered_alpha": rendered_alpha,

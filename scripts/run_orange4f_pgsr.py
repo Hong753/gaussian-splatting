@@ -24,6 +24,7 @@ from scripts.pgsr_lidar import WARMUP, RAMP, STEPS, NORMAL_STEP
 
 PIN = 'de24f1a38b350387e8d8fe381b2cd70c1ae946e7'
 PATCH = ROOT/'scripts/pgsr_orange4f.patch'
+DEPTH_PATCH = ROOT/'scripts/pgsr_depth.patch'
 
 
 def inputs(suite, fresh_source):
@@ -54,7 +55,13 @@ def protocol(args):
         raise FileNotFoundError(missing)
     sparse = colmap_model_dir(source)
     ext = 'bin' if all((sparse/(k+'.bin')).is_file() for k in ('images', 'cameras')) else 'txt'
-    model = (args.output or suite.parent/f'pgsr_lidar_{args.variant}_50k_v1').expanduser().resolve()
+    depth = None
+    suffix = ''
+    if getattr(args, 'depth_supervision', False) or getattr(args, 'scan_manifest', None):
+        from scripts.pgsr_depth import depth_config
+        depth = depth_config(source, getattr(args, 'scan_manifest', None))
+        suffix = '_' + depth['mode'] + '_depth'
+    model = (args.output or suite.parent/f'pgsr_lidar_{args.variant}{suffix}_50k_v1').expanduser().resolve()
     source_dir = model/'dataset'
     links = {source_dir/'images': (source/images).resolve(), source_dir/'sparse/points3D.ply': cloud.resolve()}
     for k in ('images', 'cameras'):
@@ -71,6 +78,10 @@ def protocol(args):
                fingerprints=fingerprints, patch_sha256=digest(PATCH), warmup=WARMUP, ramp=RAMP,
                position_lr_endpoints=[3.2e-6, 3.2e-8], normal_step=NORMAL_STEP if args.variant=='guided' else 1.,
                scale_cap_over_initial_sigma=2., checkpoints=STEPS, exposure=False, pose_refinement=False)
+    if depth:
+        cfg['depth_supervision'] = depth
+        implementation['pgsr_depth.py'] = digest(ROOT/'scripts/pgsr_depth.py')
+        implementation['pgsr_depth.patch'] = digest(DEPTH_PATCH)
     # JSON round-trip gives identical checkpoint schedule types on restart.
     return json.loads(json.dumps(cfg)), links, manifest, dict(train=sorted(selected), test=sorted(set(records)-selected))
 
@@ -104,6 +115,30 @@ def setup_runtime():
     return checkout
 
 
+def depth_runtime(base):
+    # Reuse the installed rasterizer and the frozen upstream checkout. Only two
+    # Python files need a private copy for the depth experiment.
+    checkout = base.with_name(base.name+'-depth-'+digest(DEPTH_PATCH)[:12])
+    with checkout.with_suffix('.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not checkout.exists():
+            with tempfile.TemporaryDirectory(dir=base.parent) as temp:
+                root = Path(temp)/'build'
+                src = root/'src'
+                src.mkdir(parents=True)
+                for item in (base/'src').iterdir():
+                    if item.name == 'train.py':
+                        shutil.copyfile(item, src/item.name)
+                    elif item.name == 'gaussian_renderer':
+                        shutil.copytree(item, src/item.name, ignore=shutil.ignore_patterns('__pycache__'))
+                    elif item.name not in ('.git', '__pycache__'):
+                        (src/item.name).symlink_to(item)
+                subprocess.run(['git', 'apply', '--unidiff-zero', str(DEPTH_PATCH)], cwd=src, check=True)
+                shutil.copytree(base/'extension', root/'extension', copy_function=os.link)
+                root.rename(checkout)
+    return checkout
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--variant', choices=('guided', 'covariance'), default='guided')
@@ -111,6 +146,10 @@ def main(argv=None):
     p.add_argument('--source', type=Path, default=Path('/workspace/colmap_scenes/orange4f'), help='Source for a fresh suite')
     p.add_argument('--output', type=Path)
     p.add_argument('--gpu', help='Physical GPU. Default honors CUDA_VISIBLE_DEVICES or selects a free GPU')
+    p.add_argument('--depth-supervision', action='store_true',
+                   help='Add scanner depth if source/lidar_scans.json exists, otherwise use front-surface fused-cloud targets')
+    p.add_argument('--scan-manifest', type=Path,
+                   help='Explicit scanner_xyz_v1 manifest. Enables measured scanner depth; see scripts/pgsr_depth.md')
     p.add_argument('--plan-only', action='store_true')
     args = p.parse_args(argv)
     cfg, links, manifest, split = protocol(args)
@@ -134,6 +173,8 @@ def main(argv=None):
         os.environ['CUDA_VISIBLE_DEVICES'] = gpu
         print(f'Using CUDA device {gpu}.', flush=True)
         checkout = setup_runtime()
+        if 'depth_supervision' in cfg:
+            checkout = depth_runtime(checkout)
         done = [i for i in STEPS if read_snapshot(model, i)]
         entry = [sys.executable, '-u', str(ROOT/'scripts/pgsr_entry.py')]
         def run(mode, step):
@@ -144,6 +185,10 @@ def main(argv=None):
         for step in STEPS[1:]:
             if not (model/'psnr_all_frames'/f'iteration_{step}'/'summary.json').is_file():
                 run('eval', step)
+            if 'depth_supervision' in cfg:
+                from scripts.pgsr_depth_eval import compare
+                baseline = args.suite.expanduser().resolve().parent/f'pgsr_lidar_{args.variant}_50k_v1'
+                compare(model, baseline, step)
         print(model/'view_comparisons'/f'iteration_{STEPS[-1]}'/'index.html', flush=True)
 
 
