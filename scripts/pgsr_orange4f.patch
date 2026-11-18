@@ -1,0 +1,170 @@
+diff --git a/arguments/__init__.py b/arguments/__init__.py
+index 8cd77f1..f9c9f7a 100644
+--- a/arguments/__init__.py
++++ b/arguments/__init__.py
+@@ -57 +57 @@ class ModelParams(ParamGroup):
+-        self.preload_img = True
++        self.preload_img = False
+diff --git a/scene/__init__.py b/scene/__init__.py
+index 8bedecd..29b1df2 100644
+--- a/scene/__init__.py
++++ b/scene/__init__.py
+@@ -12,0 +13 @@ import os
++import shutil
+@@ -55,2 +56 @@ class Scene:
+-            with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
+-                dest_file.write(src_file.read())
++            shutil.copyfile(scene_info.ply_path, os.path.join(self.model_path, "input.ply"))
+@@ -100 +100 @@ class Scene:
+-            angles = torch.arccos(tmp)*180/3.14159
++            angles = torch.arccos(tmp.clamp(-1, 1))*180/3.14159
+diff --git a/scene/colmap_loader.py b/scene/colmap_loader.py
+index 5986dc7..5ddac81 100644
+--- a/scene/colmap_loader.py
++++ b/scene/colmap_loader.py
+@@ -181 +181 @@ def read_intrinsics_text(path):
+-                assert model == "PINHOLE", "While the loader support other types, the rest of the code assumes PINHOLE"
++                assert model in ("PINHOLE", "SIMPLE_PINHOLE"), "While the loader support other types, the rest of the code assumes PINHOLE"
+diff --git a/scene/dataset_readers.py b/scene/dataset_readers.py
+index 94b6c87..2af8f33 100644
+--- a/scene/dataset_readers.py
++++ b/scene/dataset_readers.py
+@@ -102 +102 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
+-            focal_length_x = intr.params[0]
++            focal_length_x = focal_length_y = intr.params[0]
+@@ -113,2 +113,2 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
+-        image_path = os.path.join(images_folder, os.path.basename(extr.name))
+-        image_name = os.path.basename(image_path).split(".")[0]
++        image_path = os.path.join(images_folder, extr.name)
++        image_name = extr.name
+@@ -128 +128 @@ def fetchPly(path):
+-    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
++    normals = np.zeros_like(positions)  # Local normals are fitted from the LiDAR neighborhood
+@@ -188,14 +188 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
+-    bin_path = os.path.join(path, "sparse/points3D.bin")
+-    txt_path = os.path.join(path, "sparse/points3D.txt")
+-    if not os.path.exists(ply_path) or True:
+-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+-        try:
+-            xyz, rgb, _ = read_points3D_binary(bin_path)
+-            print(f"xyz {xyz.shape}")
+-        except:
+-            xyz, rgb, _ = read_points3D_text(txt_path)
+-        storePly(ply_path, xyz, rgb)
+-    try:
+-        pcd = fetchPly(ply_path)
+-    except:
+-        pcd = None
++    pcd = fetchPly(ply_path)
+diff --git a/scene/gaussian_model.py b/scene/gaussian_model.py
+index e7a691c..5bd204c 100644
+--- a/scene/gaussian_model.py
++++ b/scene/gaussian_model.py
+@@ -23 +23 @@ from utils.general_utils import strip_symmetric, build_scaling_rotation
+-from pytorch3d.transforms import quaternion_to_matrix
++from utils.general_utils import build_rotation as quaternion_to_matrix
+@@ -95,0 +96 @@ class GaussianModel:
++            self.lidar.table, self.lidar.ids,
+@@ -264 +265,2 @@ class GaussianModel:
+-        elements[:] = list(map(tuple, attributes))
++        for column, name in enumerate(elements.dtype.names):
++            elements[name] = attributes[:, column]
+@@ -350 +352,4 @@ class GaussianModel:
+-        valid_points_mask = ~mask
++        if mask.numel() and mask.all():
++            raise RuntimeError("PGSR would prune the entire population")
++        valid_points_mask = ~mask.reshape(-1)
++        self.lidar.ids = self.lidar.ids[valid_points_mask]
+@@ -452 +457,2 @@ class GaussianModel:
+-        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
++        offsets = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1)
++        new_xyz = self.lidar.children(self.get_xyz, selected_pts_mask, offsets, N)
+@@ -487 +493,2 @@ class GaussianModel:
+-            new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask]
++            offsets = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1)
++            new_xyz = self.lidar.children(self.get_xyz, selected_pts_mask, offsets, 1)
+diff --git a/submodules/diff-plane-rasterization/cuda_rasterizer/rasterizer_impl.h b/submodules/diff-plane-rasterization/cuda_rasterizer/rasterizer_impl.h
+index bc3f0ec..9cb6154 100644
+--- a/submodules/diff-plane-rasterization/cuda_rasterizer/rasterizer_impl.h
++++ b/submodules/diff-plane-rasterization/cuda_rasterizer/rasterizer_impl.h
+@@ -13,0 +14 @@
++#include <cstdint>
+diff --git a/submodules/diff-plane-rasterization/diff_plane_rasterization/__init__.py b/submodules/diff-plane-rasterization/diff_plane_rasterization/__init__.py
+index f65a5b2..34840a5 100644
+--- a/submodules/diff-plane-rasterization/diff_plane_rasterization/__init__.py
++++ b/submodules/diff-plane-rasterization/diff_plane_rasterization/__init__.py
+@@ -94 +94 @@ class _RasterizeGaussians(torch.autograd.Function):
+-                num_rendered, color, radii, out_observe, out_all_map, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
++                num_rendered, color, radii, out_observe, out_all_map, out_plane_depth, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
+@@ -110,0 +111,3 @@ class _RasterizeGaussians(torch.autograd.Function):
++        grad_out_color = grad_out_color.contiguous()
++        grad_out_all_map = grad_out_all_map.contiguous()
++        grad_out_plane_depth = grad_out_plane_depth.contiguous()
+diff --git a/train.py b/train.py
+index 29508f0..aab8acb 100644
+--- a/train.py
++++ b/train.py
+@@ -24,0 +25 @@ import cv2
++import pgsr_lidar as lidar
+@@ -84,12 +84,0 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+-    # backup main code
+-    cmd = f'cp ./train.py {dataset.model_path}/'
+-    os.system(cmd)
+-    cmd = f'cp -rf ./arguments {dataset.model_path}/'
+-    os.system(cmd)
+-    cmd = f'cp -rf ./gaussian_renderer {dataset.model_path}/'
+-    os.system(cmd)
+-    cmd = f'cp -rf ./scene {dataset.model_path}/'
+-    os.system(cmd)
+-    cmd = f'cp -rf ./utils {dataset.model_path}/'
+-    os.system(cmd)
+-
+@@ -104,4 +93 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+-    if checkpoint:
+-        (model_params, first_iter) = torch.load(checkpoint)
+-        gaussians.restore(model_params, opt)
+-        app_model.load_weights(scene.model_path)
++    first_iter = lidar.setup(scene, opt, pipe, render, checkpoint)
+@@ -143 +129,2 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+-        gaussians.update_learning_rate(iteration)
++        phase = iteration - lidar.WARMUP
++        xyz_lr = lidar.position_schedule(gaussians, phase)
+@@ -346,0 +334 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
++                    "xyz_lr": f"{xyz_lr:.2g}",
+@@ -356,3 +344 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+-            if (iteration in saving_iterations):
+-                print("\n[ITER {}] Saving Gaussians".format(iteration))
+-                scene.save(iteration)
++
+@@ -361 +347 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+-            if iteration < opt.densify_until_iter:
++            if 0 < phase < opt.densify_until_iter:
+@@ -368,2 +354,2 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
++                if phase > opt.densify_from_iter and phase % opt.densification_interval == 0:
++                    size_threshold = 20 if phase > opt.opacity_reset_interval else None
+@@ -374 +360 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+-            if opt.use_multi_view_trim and iteration % 1000 == 0 and iteration < opt.densify_until_iter:
++            if opt.use_multi_view_trim and phase % 1000 == 0 and 0 < phase < opt.densify_until_iter:
+@@ -386,2 +372,2 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+-            if iteration < opt.densify_until_iter:
+-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
++            if 0 < phase < opt.densify_until_iter:
++                if phase % opt.opacity_reset_interval == 0 or (dataset.white_background and phase == opt.densify_from_iter):
+@@ -391,10 +377,3 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+-            if iteration < opt.iterations:
+-                gaussians.optimizer.step()
+-                app_model.optimizer.step()
+-                gaussians.optimizer.zero_grad(set_to_none = True)
+-                app_model.optimizer.zero_grad(set_to_none = True)
+-
+-            if (iteration in checkpoint_iterations):
+-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
+-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+-                app_model.save_weights(scene.model_path, iteration)
++            gaussians.lidar.step(gaussians)
++            gaussians.optimizer.zero_grad(set_to_none=True)
++            lidar.finish(scene, iteration, pipe, background)
+@@ -402 +380,0 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+-    app_model.save_weights(scene.model_path, opt.iterations)

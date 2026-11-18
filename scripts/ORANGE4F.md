@@ -29,6 +29,51 @@ The probe uses the full input cloud, the same scale ceiling, and the original
 camera and training resolution. It fits only the selected image for 2,000
 steps and writes its own `debug_previews/index.html` and final comparison.
 
+## PGSR with a fixed LiDAR warmup
+
+From the activated `3dgs` environment, launch the guided run and its matched control
+in separate terminals. Use distinct free GPUs if running both at once.
+
+```bash
+python -u scripts/run_orange4f_pgsr.py --variant guided --gpu 4
+python -u scripts/run_orange4f_pgsr.py --variant covariance --gpu 5
+```
+
+Each launch uses the pinned zju3dv/PGSR trainer and builds its plane rasterizer
+in an isolated cache. The active 3dgs environment supplies PyTorch, simple_knn,
+SciPy, OpenCV, Pillow, tqdm and plyfile. Each run uses the fixed baseline's
+input PLY, original camera poses, centered-camera convention, sharp stride-3
+selection, full resolution and disabled exposure compensation. A fresh suite
+uses the usual Orange4F preparation. Run with `--plan-only` to inspect the
+input hashes and schedule before a GPU launch.
+
+- Steps 1–7,000 freeze all centers and the population. Both variants fit
+  24-neighbor LiDAR planes, align each trusted initial shortest axis to the
+  normal, and set its sigma to 0.2 times the initial spacing. Each axis keeps
+  the current fixed run's upper bound of twice its seed's initial 3-NN sigma.
+  Color, opacity, rotation and scale learn during warmup.
+- The XYZ LR ramps over the next 2,000 steps to PGSR's initial position LR
+  divided by 50, multiplied by the training camera extent. It then decays to
+  1/100 of that peak by step 50,000. PGSR's single- and multi-view losses
+  start at 7,001. Its density-control clock starts after warmup, with growth
+  events every 100 steps from 7,600 through 21,900. Pruning, multi-view
+  trimming and opacity resets also use this shifted clock.
+- The covariance control uses PGSR's learned ellipsoids to sample clone and
+  split offsets, with ordinary Adam center updates. The guided run projects
+  both kinds of child offsets onto each supported seed plane and retains 10%
+  of the normal component of each actual Adam displacement. Both use ordinary
+  PGSR updates where PCA confidence is below 0.6 or the parent center falls
+  outside its original 24-neighbor support radius.
+- Default outputs are `pgsr_lidar_guided_50k_v1` and
+  `pgsr_lidar_covariance_50k_v1` under the Orange4F fine-tuning directory.
+  Each writes fixed train and held-out GT/render/error previews at step 1 and
+  every 500 steps. After training, the PGSR renderer evaluates all frames at
+  30k and 50k, with separate split means in `psnr_all_frames` and image
+  galleries in `view_comparisons`. Compare the same held-out views and floor
+  texture across the two variants and the existing fixed-center run.
+  Rerunning the same command resumes from the latest published checkpoint or
+  finishes evaluation if training has completed.
+
 ## Camera trajectory and source-image video
 
 From the activated `3dgs` environment, export the full capture to MP4 with
