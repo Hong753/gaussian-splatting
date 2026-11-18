@@ -34,7 +34,9 @@ from utils.checkpoint_snapshots import publish_snapshot
 def make_model(dataset):
     # Appearance embeddings are disabled: they are per-training-camera and
     # are not defined for novel camera views or the all-frame evaluator.
-    return ScaffoldGaussianModel(feat_dim=dataset.scaffold_feat_dim,
+    from models.scaffold_offset_sh import scaffold_model_class
+    cls = scaffold_model_class(ScaffoldGaussianModel, getattr(dataset, "scaffold_offset_sh_degree", -1))
+    return cls(feat_dim=dataset.scaffold_feat_dim,
                                  n_offsets=dataset.scaffold_n_offsets,
                                  voxel_size=dataset.scaffold_voxel_size,
                                  update_init_factor=16, appearance_dim=0)

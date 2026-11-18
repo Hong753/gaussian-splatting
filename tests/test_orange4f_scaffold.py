@@ -171,6 +171,17 @@ def test_two_plans_reuse_all_inputs_noaa_without_mutating_old_runs(tmp_path, reg
         assert ('--freeze_anchors' in command) == (variant == 'fixed')
         assert ('--disable_anchor_growth' in command) == (variant == 'fixed')
         assert command[command.index('--debug_preview_every')+1] == '500'
+        if variant == 'fixed':
+            runner.main(argv + ['--offset-sh-degree', '1'])
+            sh = suite/'scaffold_fixed_sh1_anchors_v1'
+            sh_plan = periodic.load_plan(sh)
+            assert sh_plan['selected'] == data['selected']
+            assert (sh/'input.ply').resolve() == (model/'input.ply').resolve()
+            sh_argv = sh_plan['plan']['stages'][0]['argv']
+            idx = sh_argv.index('--scaffold_offset_sh_degree')
+            assert sh_argv[idx+1] == '1'
+            assert [s.replace(str(sh), str(model)) for s in sh_argv[:idx]+sh_argv[idx+2:]] == command
+
         with pytest.raises(ValueError, match='settings changed'): runner.main(argv+['--voxel-size', '.03'])
         with patch.object(runner, 'execute_plan') as execute:
             periodic.train(model)

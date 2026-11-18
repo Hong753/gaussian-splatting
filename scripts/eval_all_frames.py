@@ -57,6 +57,7 @@ def main():
     args = parser.parse_args()
     model, source = args.model.resolve(), args.source.resolve()
     cfg = read_config(model / "cfg_args")
+    cfg.setdefault("source_path", str(source))
     if args.antialiasing is None:
         args.antialiasing = bool(cfg.get('antialiasing', True))
     model_type = cfg.get("model_type", "3dgs")

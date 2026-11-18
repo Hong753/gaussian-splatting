@@ -11,7 +11,11 @@ conda activate 3dgs
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 export CUDA_VISIBLE_DEVICES="$gpu"
 suite="${ORANGE4F_OUTPUT_ROOT:-/data/3dgs_outputs/orange4f/3dgs_finetuning}/stride3_noaa_v1"
-model="$suite/scaffold_upstream_${variant}_${version}"
+color_degree="${SCAFFOLD_OFFSET_SH_DEGREE:--1}"
+[[ "$color_degree" =~ ^(-1|[0-3])$ ]] || { echo 'SCAFFOLD_OFFSET_SH_DEGREE must be -1 or 0..3' >&2; exit 2; }
+color_suffix=""
+if [[ "$color_degree" != -1 ]]; then color_suffix="_sh$color_degree"; fi
+model="$suite/scaffold_upstream_${variant}${color_suffix}_${version}"
 mkdir -p "$(dirname "$suite")"
 exec 9>"$suite.lock"
 flock 9
@@ -73,7 +77,7 @@ if [[ ! -f "$deps/complete" ]]; then
 fi
 flock -u 7
 python -u scripts/upstream_scaffold.py prepare --suite "$suite" --model "$model" --variant "$variant" \
-  --source-code "$cache/source" --dependencies "$deps" --voxel-size "${SCAFFOLD_VOXEL_SIZE:-0.02}"
+  --offset-sh-degree "$color_degree" --source-code "$cache/source" --dependencies "$deps" --voxel-size "${SCAFFOLD_VOXEL_SIZE:-0.02}"
 python -u scripts/upstream_scaffold.py train --model "$model" 2>&1 | tee -a "$model/training.log"
 python -u scripts/upstream_scaffold.py score --model "$model"
 exec python -u scripts/render.py --model "$model" --iteration 30000 --split both --eval-set unselected \

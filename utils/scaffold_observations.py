@@ -261,7 +261,7 @@ def sensed_step(optimizer, active):
     from types import SimpleNamespace
     from utils.occlusion_culling import masked_adam_step
     local = [group for group in optimizer.param_groups if group['name'] in
-             ('anchor','offset','anchor_feat','opacity','scaling','rotation')]
+             ('anchor','offset','anchor_feat','opacity','scaling','rotation','offset_sh')]
     masked_adam_step(SimpleNamespace(param_groups=local, state=optimizer.state), active)
     for group in local:
         for p in group['params']:

@@ -9,6 +9,10 @@ scaffold_variant="${2:?Supply a Scaffold variant}"
 case "$scaffold_variant" in learnable|fixed|fixed-static|indexed|indexed-only|indexed-opacity|sensed|mesh-visible) ;; *) echo 'Expected learnable, fixed, fixed-static, indexed, indexed-only, indexed-opacity, sensed or mesh-visible' >&2; exit 2;; esac
 scaffold_suite_version="${4:-v1}"
 scaffold_version="${SCAFFOLD_RUN_VERSION:-v1}"
+scaffold_degree="${SCAFFOLD_OFFSET_SH_DEGREE:--1}"
+[[ "$scaffold_degree" =~ ^(-1|[0-3])$ ]] || { echo 'SCAFFOLD_OFFSET_SH_DEGREE must be -1 or 0..3' >&2; exit 2; }
+scaffold_color=""
+if [[ "$scaffold_degree" != -1 ]]; then scaffold_color="_sh$scaffold_degree"; fi
 [[ "$scaffold_suite_version" != *[!a-zA-Z0-9_-]* && "$scaffold_version" != *[!a-zA-Z0-9_-]* ]] || exit 2
 scaffold_parent="${ORANGE4F_OUTPUT_ROOT:-/data/3dgs_outputs/orange4f/3dgs_finetuning}"
 scaffold_root="$(realpath -m "$scaffold_parent/stride3_noaa_$scaffold_suite_version")"
@@ -26,6 +30,6 @@ scaffold_extra=()
 if [[ -n "${ORANGE4F_POINT_CLOUD:-}" ]]; then scaffold_extra+=(--point-cloud "$ORANGE4F_POINT_CLOUD"); fi
 python -u scripts/prepare_orange4f.py --source "$scaffold_source" --output "$scaffold_root" "${scaffold_extra[@]}"
 python -u scripts/run_orange4f_scaffold.py --suite "$scaffold_root" --variant "$scaffold_variant" \
-  --gpu "$scaffold_gpu" --voxel-size "${SCAFFOLD_VOXEL_SIZE:-0.02}" --run-version "$scaffold_version"
+  --gpu "$scaffold_gpu" --offset-sh-degree "$scaffold_degree" --voxel-size "${SCAFFOLD_VOXEL_SIZE:-0.02}" --run-version "$scaffold_version"
 flock -u 9
-exec bash scripts/run_prepared_reconstruction.sh "$scaffold_root/scaffold_${scaffold_variant}_anchors_$scaffold_version"
+exec bash scripts/run_prepared_reconstruction.sh "$scaffold_root/scaffold_${scaffold_variant}${scaffold_color}_anchors_$scaffold_version"

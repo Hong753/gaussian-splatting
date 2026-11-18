@@ -49,6 +49,7 @@ class ModelParams(ParamGroup):
         self.model_type = "3dgs"
         self.scaffold_voxel_size = 0.001
         self.scaffold_n_offsets = 10
+        self.scaffold_offset_sh_degree = -1
         self.scaffold_feat_dim = 32
         self.sh_degree = 3
         self._source_path = ""

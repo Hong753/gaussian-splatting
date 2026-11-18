@@ -35,6 +35,9 @@ def build_plan(args):
         '--position_lr_max_steps', str(args.iterations), '--publish_snapshots',
         '--save_iterations', *map(str, checkpoint_steps(args)), '--test_iterations', *map(str, checkpoint_steps(args)),
         '--debug_preview_every', '500']
+    degree = getattr(args, 'offset_sh_degree', -1)
+    if degree >= 0:
+        command += ['--scaffold_offset_sh_degree', str(degree)]
     if fixed:
         command += ['--freeze_anchors', '--disable_anchor_growth']
     if static:
@@ -61,6 +64,8 @@ def execute_plan(args, plan):
     if list(Path(args.model).glob('point_cloud/iteration_*')):
         raise FileExistsError('Saved iterations already exist; use a new --run-version, or resume the trainer explicitly')
     smoke = ['scripts/smoke_scaffold.py']
+    if getattr(args, 'offset_sh_degree', -1) >= 0:
+        smoke += ['--offset-sh-degree', str(args.offset_sh_degree)]
     if args.variant == 'indexed-opacity':
         smoke.append('--indexed-opacity')
     invoke(smoke)
@@ -101,6 +106,7 @@ def main(argv=None):
                    help='Optional viewer row manifest for indexed, measured associations for sensed, or mesh visibility metadata')
     p.add_argument('--indexed-ply', type=Path, default=os.environ.get('SCAFFOLD_INDEXED_PLY'),
                    help="Use the PLY selected with the viewer's --ply override")
+    p.add_argument('--offset-sh-degree', type=int, choices=(-1, 0, 1, 2, 3), default=-1)
     p.add_argument('--voxel-size', type=float, default=.02,
                    help='Anchor spacing in input scene units; this is not a Gaussian scale cap')
     p.add_argument('--anchor-lr-init', type=float, default=.00016)
@@ -116,7 +122,8 @@ def main(argv=None):
         if digest(Path(name)) != expected:
             raise ValueError(f'Shared input changed: {name}')
     args.source = Path(suite['source'])
-    args.model = root/f'scaffold_{args.variant}_anchors_{args.run_version}'
+    color = f'_sh{args.offset_sh_degree}' if args.offset_sh_degree >= 0 else ''
+    args.model = root/f'scaffold_{args.variant}{color}_anchors_{args.run_version}'
     args.point_cloud = Path(suite['cloud']['cached'])
     args.keyframes = args.model/'keyframes.json'
     args.iterations, args.checkpoint_every = 30000, 10000

@@ -60,6 +60,7 @@ def main(argv=None):
     parser.add_argument("--textured-max-gaussians", type=int, default=10000)
     parser.add_argument("--textured-resolution", type=int, default=50)
     parser.add_argument("--scaffold-voxel-size", type=float, default=SCAFFOLD_VOXEL_SIZE)
+    parser.add_argument("--scaffold-offset-sh-degree", type=int, choices=(-1, 0, 1, 2, 3), default=-1)
     parser.add_argument("--scaffold-n-offsets", type=int, default=SCAFFOLD_N_OFFSETS)
     parser.add_argument("--scaffold-feat-dim", type=int, default=SCAFFOLD_FEAT_DIM)
     parser.add_argument("--gpu", default=GPU_ID, help="GPU ID passed through CUDA_VISIBLE_DEVICES")
@@ -104,6 +105,8 @@ def main(argv=None):
 
     if not args.scenes:
         parser.error("Set SCENES in scripts/train.py or pass --scenes SCENE [SCENE ...]")
+    if args.scaffold_offset_sh_degree >= 0 and args.model_type != "scaffold":
+        parser.error("--scaffold-offset-sh-degree requires --model-type scaffold")
     if args.absgs and (args.model_type != "3dgs" or args.optimizer_type != "default"):
         parser.error("--absgs requires --model-type 3dgs and --optimizer-type default")
     if args.absgs_split_threshold <= 0:
@@ -204,6 +207,8 @@ def main(argv=None):
         if args.model_type == "scaffold":
             cmd.extend(["--model_type", "scaffold", "--scaffold_voxel_size", str(args.scaffold_voxel_size),
                         "--scaffold_n_offsets", str(args.scaffold_n_offsets), "--scaffold_feat_dim", str(args.scaffold_feat_dim)])
+            if args.scaffold_offset_sh_degree >= 0:
+                cmd.extend(["--scaffold_offset_sh_degree", str(args.scaffold_offset_sh_degree)])
         if args.model_type == "textured":
             cmd.extend(["--model_type", "textured",
                         "--textured_pretrain_iterations", str(args.textured_pretrain_iterations),

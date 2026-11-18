@@ -20,7 +20,11 @@ def main():
     from utils.graphics_utils import BasicPointCloud, getProjectionMatrix
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--indexed-opacity', action='store_true')
-    check_opacity = parser.parse_args().indexed_opacity
+    parser.add_argument('--offset-sh-degree', type=int, choices=(-1, 0, 1, 2, 3), default=-1)
+    args = parser.parse_args()
+    check_opacity = args.indexed_opacity
+    from models.scaffold_offset_sh import scaffold_model_class
+    model_class = scaffold_model_class(ScaffoldGaussianModel, args.offset_sh_degree)
     if not torch.cuda.is_available():
         raise RuntimeError('Scaffold preflight requires CUDA')
     print('Scaffold synthetic preflight: 9 test anchors; real dataset loads afterwards.', flush=True)
@@ -37,7 +41,7 @@ def main():
         parser = argparse.ArgumentParser(); params = ScaffoldOptimizationParams(parser)
         opt = params.extract(parser.parse_args(['--position_lr_init', '.00016', '--position_lr_final', '.0000016',
             *(['--freeze_anchors', '--disable_anchor_growth'] if fixed else [])]))
-        model = ScaffoldGaussianModel(feat_dim=8, n_offsets=2, voxel_size=.02, appearance_dim=0, update_init_factor=16)
+        model = model_class(feat_dim=8, n_offsets=2, voxel_size=.02, appearance_dim=0, update_init_factor=16)
         model.create_from_pcd(cloud, [camera], 1.)
         with torch.no_grad():
             model.mlp_opacity[2].weight.zero_(); model.mlp_opacity[2].bias.fill_(.5)
@@ -50,6 +54,8 @@ def main():
             loss = (result['render']*weights).square().mean()
             loss.backward()
             assert torch.isfinite(loss)
+            if args.offset_sh_degree >= 0:
+                assert model.mlp_color.coefficients.grad.abs().sum() > 0
             assert all(torch.isfinite(p.grad).all() for g in model.optimizer.param_groups for p in g['params'] if p.grad is not None)
             model.training_statis(result['viewspace_points'], result['neural_opacity'],
                 result['visibility_filter'], result['selection_mask'], prefilter_voxel(camera, model, pipe, bg))
@@ -85,7 +91,7 @@ def main():
             assert grad is not None and torch.isfinite(grad).all() and grad.abs().sum() > 0
             assert model._scaling.grad is None and model._offset.grad is None
             model.optimizer.zero_grad(set_to_none=True)
-        restored = ScaffoldGaussianModel(feat_dim=8, n_offsets=2, voxel_size=.02, appearance_dim=0, update_init_factor=16)
+        restored = model_class(feat_dim=8, n_offsets=2, voxel_size=.02, appearance_dim=0, update_init_factor=16)
         restored.restore(model.capture(), opt)
         model.eval(); restored.eval()
         with torch.no_grad():

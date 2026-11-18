@@ -74,3 +74,17 @@ Both use the full viewer cloud (or the suite initialization if the viewer PLY is
 The launcher pins [the released implementation](https://github.com/city-super/Scaffold-GS/tree/59c833b56bbbf510f3f64d40f81721995caced66). It builds the upstream rasterizer once in a private cache using the active 3dgs environment and reuses its simple_knn. The adapter supplies the suite’s cameras, split, cloud and reporting callbacks to the original training function. It bypasses the upstream command-line GPU selector. Source data is read-only. Set `SCAFFOLD_RUN_VERSION` for an additional fresh run. The launcher accepts an optional source directory as its third argument.
 
 Outputs are `stride3_noaa_v1/scaffold_upstream_{fixed,adaptive}_v1`. Each run saves live train and held-out previews in `debug_previews/`, upstream PLY and MLPs at 10k/20k/30k, and final all-frame PSNR plus browsable train and held-out comparisons. The live preview follows the original loop’s pre-update reporting point. Reports use the same upstream renderer as training.
+
+## Independent SH colors per offset
+
+To test whether sharing the color MLP limits fine detail, compare the upstream fixed-anchor MLP run with a fresh degree-1 SH run at the same checkpoint. Both use the same source images, camera poses, anchor initialization, and opacity and covariance decoders.
+
+```bash
+SCAFFOLD_OFFSET_SH_DEGREE=1 bash scripts/run_orange4f_upstream_scaffold.sh 6 fixed
+```
+
+The run appears as `scaffold_upstream_fixed_sh1_v1` in the suite dashboard and the 3D viewer. The same setting works with the upstream `adaptive` launcher and with native variants, e.g. `SCAFFOLD_OFFSET_SH_DEGREE=1 bash scripts/run_orange4f_scaffold.sh 6 indexed-opacity`. Compare each run against its corresponding MLP variant. Native SH runs include the degree before `_anchors_` in the output name.
+
+Each anchor–offset pair owns three sets of `(degree + 1)^2` trainable coefficients. The renderer evaluates them along the camera-to-child direction. Coefficients start at zero (neutral gray), use Adam at 0.0025, and are stored in the color module of each checkpoint. Newly grown anchors get fresh coefficients, and pruning removes their corresponding rows and optimizer moments. The default MLP runs use their existing settings. Degree 0 gives independent view-invariant RGB, and degrees 1 through 3 add angular variation. At degree 1 with ten offsets, the SH weights alone use 480 bytes per anchor in FP32.
+
+At 10k, 20k and 30k, compare the same held-out floor crop and the held-out PSNR against the corresponding MLP run. The live preview shows train and held-out images from step 1. The first upstream interactive 3D checkpoint becomes available at 10k.

@@ -47,6 +47,9 @@ def prepare(args):
                 dependencies=str(args.dependencies.resolve()), voxel_size=args.voxel_size,
                 source=suite['source'], cloud=str(cloud), inputs={**suite['input_fingerprints'], str(cloud):digest(cloud)},
                 iterations=STEPS[-1], train_views=len(names), heldout_views=len(records)-len(names))
+    degree = getattr(args, 'offset_sh_degree', -1)
+    if degree >= 0:
+        plan['offset_sh_degree'] = degree
     path = args.model/'upstream.json'
     if args.model.exists():
         if (not path.is_file() or json.loads(path.read_text()) != plan
@@ -102,6 +105,11 @@ def runtime(plan):
             or not Path(raster.__file__).resolve().is_relative_to(Path(plan['dependencies']))
             or not hasattr(raster.GaussianRasterizer, 'visible_filter')):
         raise ImportError('Expected the upstream Scaffold model, renderer and CUDA visible_filter extension')
+    if plan.get('offset_sh_degree', -1) >= 0:
+        from models.scaffold_decoder import generate_neural_gaussians
+        from models.scaffold_offset_sh import scaffold_model_class
+        scene = SimpleNamespace(Scene=scene.Scene, GaussianModel=scaffold_model_class(scene.GaussianModel, plan['offset_sh_degree']))
+        gaussian_renderer.generate_neural_gaussians = generate_neural_gaussians
     return SimpleNamespace(arguments=arguments, renderer=gaussian_renderer, scene=scene, fetch=fetchPly,
                            norm=getNerfppNorm, load_cam=loadCam, seed=safe_state, l1=l1_loss, ssim=ssim, gui=network_gui, camera_json=camera_to_JSON)
 
@@ -157,6 +165,7 @@ def train(api, model, plan, dataset, opt, pipe, records, selected, views):
     cfg = argparse.Namespace(**vars(dataset))
     cfg.model_type, cfg.scaffold_upstream = 'scaffold', True
     cfg.scaffold_feat_dim, cfg.scaffold_n_offsets, cfg.scaffold_voxel_size = dataset.feat_dim, dataset.n_offsets, dataset.voxel_size
+    cfg.scaffold_offset_sh_degree = plan.get('offset_sh_degree', -1)
     cfg.keyframe_manifest, cfg.antialiasing = str(model/'keyframes.json'), False
     atomic_write(model/'cfg_args', lambda p: p.write_text(str(cfg)))
     preview_names = select_names(selected, set(records)-set(selected), DEFAULTS)
@@ -231,6 +240,7 @@ def main():
     commands = p.add_subparsers(dest='action', required=True)
     prep = commands.add_parser('prepare')
     prep.add_argument('--suite', type=Path, required=True)
+    prep.add_argument('--offset-sh-degree', type=int, choices=(-1, 0, 1, 2, 3), default=-1)
     prep.add_argument('--variant', choices=('fixed','adaptive'), required=True)
     prep.add_argument('--source-code', type=Path, required=True)
     prep.add_argument('--dependencies', type=Path, required=True)
