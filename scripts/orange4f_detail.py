@@ -27,6 +27,7 @@ from utils.checkpoint_snapshots import digest, read_snapshot
 SUITE = Path("/data/3dgs_outputs/orange4f/3dgs_finetuning/stride3_noaa_v1")
 REGIONS = Path("/data/3dgs_outputs/orange_4F/1_full/3dgs_finetuning/regions")
 # Native image pixels and fitted LiDAR plane from the user's saved diagnostic.
+FLOOR_SOURCE = Path("/data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full")
 FRAME = "12569.jpg"
 ROI = (96, 1260, 1275, 267)
 CENTER = np.array([-4.985959985044178, 1.807263625483172, -1.0653450191492186])
@@ -100,16 +101,61 @@ def positive(value):
     return value
 
 
-def check_common_world(base, region):
-    # A cutoff in a separately normalized regional coordinate system cannot be transferred.
-    from scripts.keyframe_pipeline.common import natural_key
-    shared = sorted(base["records"].keys() & region["splits"]["train"], key=natural_key)
+def regional_cutoff(base, region, extent, sigma):
+    """Express a regional length in full-scene units using the same named cameras."""
+    names = region["splits"]["train"]
+    shared = sorted(base["records"].keys() & names)
     if len(shared) < 2:
-        raise ValueError("Need overlapping original cameras to verify regional world units")
+        raise ValueError(f"Only {len(shared)}/{len(names)} regional training views occur in the full model. "
+                         "Select a regional export of the same capture with --regional.")
     def centers(spec):
-        return np.asarray([-np.asarray(spec["records"][n]["R"]) @ spec["records"][n]["T"] for n in shared])
-    if not np.allclose(centers(base), centers(region), rtol=0, atol=1e-4):
-        raise ValueError("Regional and full camera centers differ. Select the original-pose regional experiment.")
+        return np.stack([-np.asarray(spec["records"][n]["R"]) @ spec["records"][n]["T"] for n in shared])
+    full, local = centers(base), centers(region)
+    x, y = local - local.mean(0), full - full.mean(0)
+    if not np.isfinite([x, y]).all() or any(not np.any(p != p[0]) for p in (full, local)):
+        raise ValueError("Shared camera centers must be finite and span a nonzero distance in both exports")
+    # Least-squares similarity with a proper rotation. The residual is relative
+    # to the full trajectory's RMS radius, so it is independent of scene units.
+    u, _, vt = np.linalg.svd(x.T @ y)
+    u[:, -1] *= np.linalg.det(u @ vt)
+    rotated = x @ (u @ vt)
+    scale = float(np.sum(rotated * y) / np.sum(x * x))
+    error = float(np.linalg.norm(scale * rotated - y) / np.linalg.norm(y))
+    info = dict(shared_views=len(shared), regional_train_views=len(names), regional_sigma=sigma,
+                fitted_scale=scale, relative_rms_residual=error)
+    if error <= .05 and scale > 0:
+        if np.allclose(full, local, atol=1e-4, rtol=0) and math.isclose(scale, 1., rel_tol=1e-5):
+            scale = 1.  # Preserve the exact recorded cutoff for an original-pose export.
+        method = "shared-camera baseline length" if len(shared) == 2 else "shared-camera similarity"
+        return positive(sigma * scale), dict(info, method=method, applied_scale=scale)
+
+    # With different trajectories there is no supported physical unit transfer.
+    # Use the regional split fraction on the full-model footprint of the same photos.
+    print(f"Camera trajectories disagree after similarity alignment (relative RMS {error:.1%}). "
+          f"Checking the {len(shared)} shared photos before deriving a full-coordinate cutoff.", flush=True)
+    for index, name in enumerate(shared, 1):
+        a, b = (Path(spec["records"][name]["image_path"]) for spec in (base, region))
+        if not same_photo(a, b):
+            raise ValueError(f"Cannot verify the shared photo {name} across incompatible camera trajectories: "
+                             f"{a} and {b}. Select the corresponding regional capture with --regional.")
+        if index % 100 == 0:
+            print(f"Verified shared photos {index}/{len(shared)}", flush=True)
+    from utils.densification_diagnostics import training_extent
+    footprint = positive(training_extent(base["records"], shared))
+    fraction = sigma / extent
+    return positive(fraction * footprint), dict(info, method="full-coordinate proposal from shared photos",
+                                                 shared_full_extent=footprint, regional_split_fraction=fraction)
+
+
+def same_photo(a, b):
+    if not a.is_file() or not b.is_file():
+        return False
+    if a.samefile(b) or digest(a) == digest(b):
+        return True
+    # Metadata-only changes may leave different file bytes for identical training pixels.
+    from PIL import Image
+    with Image.open(a) as first, Image.open(b) as second:
+        return first.size == second.size and np.array_equal(first.convert("RGB"), second.convert("RGB"))
 
 
 def training_command(base, output, ratio):
@@ -146,7 +192,7 @@ def training_command(base, output, ratio):
                       "--debug-preview-seed", str(cfg.get("debug_preview_options", {}).get("seed", 0))]
 
 
-def roi_indices(xyz, record):
+def roi_indices(xyz, record, center, normal):
     from scripts.keyframe_pipeline.common import project
     x, y, w, h = ROI
     world_to_cam = np.asarray(record["R"]).T
@@ -155,7 +201,7 @@ def roi_indices(xyz, record):
     chunks = []
     for start in range(0, len(xyz), 262144):
         points = xyz[start:start + 262144]
-        plane = np.flatnonzero(np.abs((points - CENTER) @ NORMAL) <= TOLERANCE)
+        plane = np.flatnonzero(np.abs((points - center) @ normal) <= TOLERANCE)
         uv, depth = project(points[plane], world_to_cam, origin, intrinsics)
         u, v = (uv - .5).T
         visible = (depth > .05) & (u >= x) & (u < x+w) & (v >= y) & (v < y+h)
@@ -165,6 +211,26 @@ def roi_indices(xyz, record):
 
 def quantiles(values):
     return dict(zip(("p10", "median", "p90", "p99"), map(float, np.percentile(values, (10, 50, 90, 99)))))
+
+
+def fixed_floor_plane(source, cloud, record):
+    if Path(source).resolve() == FLOOR_SOURCE.resolve():
+        return CENTER, NORMAL, "saved diagnostic"
+    from scripts.diagnose_floor_blur import fit_plane, floor_points, plane_grid
+    from scripts.keyframe_pipeline.common import Camera, Image, project
+    rotation = np.asarray(record["R"])
+    view = Image(0, 0, FRAME, rotation.T, -rotation @ record["T"])
+    intrinsics = np.array([record[k] for k in ("fx", "fy", "cx", "cy")])
+    camera = Camera(0, record["width"], record["height"], intrinsics)
+    points = floor_points(cloud, view, camera, ROI, (.05, float("inf")))
+    center, normal, inliers = fit_plane(points, TOLERANCE)
+    plane_grid(view, camera, ROI, center, normal)  # Check that the plane is in front across the crop.
+    uv, _ = project(inliers, view.R, view.C, intrinsics)
+    cells = np.floor((uv - .5 - ROI[:2]) / ROI[2:] * 4).astype(int).clip(0, 3)
+    coverage = len(np.unique(cells, axis=0))
+    if coverage < 8:
+        raise ValueError(f"Fixed-model plane inliers cover only {coverage}/16 floor crop cells")
+    return center, normal, "dominant plane fitted in the fixed model's floor crop"
 
 
 def spacing_report(model):
@@ -182,9 +248,10 @@ def spacing_report(model):
         v = PlyData.read(str(path), mmap="r")["vertex"].data
         return v, np.column_stack([v[k] for k in "xyz"]).astype(np.float32, copy=False)
     print(f"Measuring floor returns and surviving Gaussians at {iteration:,} ...", flush=True)
+    center, normal, plane_source = fixed_floor_plane(spec["cfg"]["source_path"], model / "input.ply", record)
     source_vertices, xyz = read_xyz(model / "input.ply")
     del source_vertices
-    ids = roi_indices(xyz, record)
+    ids = roi_indices(xyz, record, center, normal)
     if len(ids) < 4:
         raise ValueError("Insufficient original floor anchors in the saved plane and crop")
     tree = cKDTree(xyz)
@@ -195,10 +262,10 @@ def spacing_report(model):
         return distances[:, 1:]
     distances = neighbors(tree, xyz[ids])
     v, learned = read_xyz(ply)
-    live = roi_indices(learned, record)
+    live = roi_indices(learned, record, center, normal)
     result = dict(iteration=iteration, model=str(model), source=spec["cfg"]["source_path"],
-                  frame=FRAME, roi_xywh=ROI, plane_center=CENTER.tolist(), plane_normal=NORMAL.tolist(),
-                  plane_tolerance=TOLERANCE, units="LiDAR scene units (meters for Orange4F)",
+                  frame=FRAME, roi_xywh=ROI, plane_center=center.tolist(), plane_normal=normal.tolist(),
+                  plane_tolerance=TOLERANCE, plane_source=plane_source, units="fixed model scene units",
                   selection="Centers within floor plane tolerance projecting into the crop; occlusion is not tested",
                   input_points_in_crop=len(ids), surviving_centers_in_crop=len(live),
                   input_nearest_neighbor=quantiles(distances[:, 0]), input_third_neighbor=quantiles(distances[:, 2]))
@@ -273,13 +340,14 @@ def floor_render(model, step, output, base, expected_gt):
     return r["target_sha256"], dict(crop_psnr_db=-10*math.log10(mse) if mse else "inf", **edges)
 
 
-def evaluate(base, output, gpu):
+def evaluate(base, output, gpu, transfer):
     report = output / "comparison"
     report.mkdir(exist_ok=True)
     import torch
     rows, gt = [], None
-    for label, model, step in (("Baseline 30k",base["path"],30000), ("Matched 30k",output,30000),
-                               ("Matched 50k",output,50000)):
+    control = "Matched" if "applied_scale" in transfer else "Proposed"
+    for label, model, step in (("Baseline 30k",base["path"],30000), (f"{control} 30k",output,30000),
+                               (f"{control} 50k",output,50000)):
         averages = measured_frames(model, step, str(Path(base["cfg"]["source_path"]).resolve()), base)
         folder = report / label.replace(" ", "_")
         gt, metrics = floor_render(model, step, folder, base, gt)
@@ -291,7 +359,7 @@ def evaluate(base, output, gpu):
     run("scripts/render.py", "--model", output, "--iteration", 50000, "--gpu", gpu,
         "--split", "both", "--eval-set", "unselected", "--max-views", 8, "--output", report/"matched_50k")
     atomic_json(report/"results.json", dict(frame=FRAME, roi=ROI, held_out=FRAME not in base["splits"]["train"],
-                                             identical_original_poses=True, rows=rows))
+                                             identical_original_poses=True, regional_scale_transfer=transfer, rows=rows))
     lines = []
     for r in rows:
         lines.append(f'<tr><td>{r["label"]}</td><td>{r["mean_psnr_db"]["unselected"]:.3f}</td>'
@@ -299,7 +367,9 @@ def evaluate(base, output, gpu):
     pictures = [("Source photograph", "Baseline_30k/gt_crop.png")] + [(r["label"], r["crop_image"]) for r in rows]
     page = ('<!doctype html><meta charset="utf-8"><title>Orange4F detail comparison</title>'
             '<style>body{font:16px system-ui;max-width:1280px;margin:2em auto}td,th{padding:.5em}img{width:100%}</style>'
-            f'<h1>{FRAME} floor comparison</h1><table><tr><th>Run</th><th>Held-out PSNR (dB)</th><th>Floor PSNR (dB)</th>'
+            f'<h1>{FRAME} floor comparison</h1><p>Split cutoff from {html.escape(transfer["method"])}. '
+            '<a href="../detail_plan.json">Training settings</a></p>'
+            '<table><tr><th>Run</th><th>Held-out PSNR (dB)</th><th>Floor PSNR (dB)</th>'
             '<th>Floor edge agreement</th></tr>'+''.join(lines)+'</table>'+''.join(
                 f'<h2>{html.escape(label)}</h2><a href="{img}"><img src="{img}"></a>' for label,img in pictures)
             +'<p><a href="paired_30k/eval/index.html">Shared held-out views at 30k</a> · '
@@ -356,33 +426,41 @@ def main(argv=None):
     output = args.output.expanduser().resolve()
     base = model_info(args.baseline)
     region = regional_reference(regional_model(args.regional))
-    check_common_world(base, region)
     if not (base["path"]/"input.ply").is_file():
         raise FileNotFoundError(base["path"]/"input.ply")
     if FRAME not in base["records"] or FRAME in base["splits"]["train"]:
         raise ValueError("Expected the original split with the saved floor reference held out")
     choose_iteration(base["path"], STEPS[0])
     extent, old_sigma, full_source = split_settings(base)
-    region_extent, target, target_source = split_settings(region)
+    region_extent, regional_sigma, target_source = split_settings(region)
+    target, transfer = regional_cutoff(base, region, region_extent, regional_sigma)
     if math.isclose(old_sigma, target, rel_tol=1e-6):
         print("The physical thresholds already coincide; this run tests the iteration extension only.", flush=True)
     ratio = target / extent
     command = training_command(base, output, ratio)
     plan = dict(baseline=str(base["path"]), regional=str(region["path"]), full_extent=extent,
                 regional_extent=region_extent, extent_source=full_source, target_source=target_source,
+                regional_scale_transfer=transfer,
                 baseline_split_sigma=old_sigma, matched_split_sigma=target, percent_dense=ratio,
                 selected_keyframes_sha256=digest(base["path"]/"keyframes.json"),
                 input_ply_sha256=digest(base["path"]/"input.ply"), command=command)
     print(f"Full extent {extent:.6g}, regional extent {region_extent:.6g}, "
           f"split sigma {old_sigma:.6g} → {target:.6g}, percent_dense={ratio:.8g}.", flush=True)
     print(f"Regional reference: {region['path']} ({target_source})", flush=True)
+    print(f"{transfer['method']}: {transfer['shared_views']}/{transfer['regional_train_views']} views, "
+          f"relative RMS {transfer['relative_rms_residual']:.2%}, regional sigma {regional_sigma:.6g}, "
+          f"full-coordinate target {target:.6g}.", flush=True)
     if args.plan_only:
         print(json.dumps(plan, indent=2))
         return
     with experiment_lock(output) as lock:
         protocol = output / "detail_plan.json"
         if output.exists():
-            if not protocol.is_file() or read_json(protocol) != plan:
+            previous_plan = read_json(protocol) if protocol.is_file() else {}
+            # Earlier successful plans had no transfer metadata and used the raw cutoff.
+            if "regional_scale_transfer" not in previous_plan and transfer.get("applied_scale") == 1.:
+                previous_plan["regional_scale_transfer"] = transfer
+            if previous_plan != plan:
                 raise FileExistsError(f"Unrelated output or different protocol: {output}")
         else:
             output.mkdir()
@@ -397,7 +475,8 @@ def main(argv=None):
             fixed = args.fixed_model.expanduser().resolve()
             iteration, _ = choose_iteration(fixed, -1)
             previous = read_json(floor_out) if floor_out.is_file() else {}
-            if (previous.get("model"), previous.get("iteration")) != (str(fixed), iteration):
+            if ((previous.get("model"), previous.get("iteration")) != (str(fixed), iteration)
+                    or not previous.get("plane_source")):
                 previous = spacing_report(fixed)
                 atomic_json(floor_out, previous)
             print(json.dumps(previous, indent=2), flush=True)
@@ -412,7 +491,7 @@ def main(argv=None):
                 command = command + ["--start_checkpoint", str(output/f"chkpnt{max(snapshots)}.pth")]
             print("Training with live GT/render/error previews", flush=True)
             subprocess.run(command, cwd=ROOT, check=True, pass_fds=(lock.fileno(),))
-        evaluate(base, output, gpu)
+        evaluate(base, output, gpu, transfer)
 
 
 if __name__ == "__main__":

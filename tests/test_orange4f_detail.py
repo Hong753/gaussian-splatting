@@ -3,6 +3,7 @@ from contextlib import redirect_stdout
 import io
 import json
 from pathlib import Path
+from shutil import copytree
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -92,10 +93,84 @@ class Orange4FDetailTest(unittest.TestCase):
             (export/"selection.json").write_text(json.dumps(dict(selection=[
                 dict(name=n, split="train") for n in manifest["selected_images"]])))
             spec = audit.regional_reference(export)
-            audit.check_common_world(audit.model_info(base), spec)
             extent, target, source = audit.split_settings(spec)
+            transferred, info = audit.regional_cutoff(audit.model_info(base), spec, extent, target)
+            self.assertEqual(transferred, target)
+            self.assertEqual(info["applied_scale"], 1.)
             self.assertAlmostEqual(target, extent*.01)
             self.assertIn("proposed", source)
+
+    def test_plan_transfers_cutoff_between_coordinate_systems(self):
+        from scipy.spatial.transform import Rotation
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            base, region, _ = fixture(root)
+            original = root / "capture"
+            local = root / "other-capture"
+            copytree(original, local)
+            cfg_file = region / "cfg_args"
+            cfg_file.write_text(cfg_file.read_text().replace(str(original), str(local)))
+            names = sorted(audit.model_info(base)["records"])
+            (region / "keyframes.json").write_text(json.dumps(dict(selected_images=names[:3])))
+            # Independently logged radius and split threshold from the regional run.
+            (region / "densification.jsonl").write_text('{"scene_extent": 2, "split_sigma_threshold": 0.04}\n')
+            xyz = np.array([[0,0,2], [1,0,2], [0,2,3], [10,0,2.]])
+            def write_poses(path, centers, world_to_cam):
+                q = world_to_cam.as_quat()[[3,0,1,2]]
+                rows = [f"{i} " + " ".join(map(str, [*q, *(-world_to_cam.apply(c))])) + f" 1 {n}\n\n"
+                        for i, (n, c) in enumerate(zip(names, centers), 1)]
+                (path / "sparse/0/images.txt").write_text("".join(rows))
+            rotation = Rotation.from_euler("xyz", [30,70,20], degrees=True)
+            write_poses(original, xyz, Rotation.identity())
+            for scale, noise in ((1., 0.), (4., 0.), (1., .002)):
+                with self.subTest(scale=scale, noise=noise):
+                    local_centers = rotation.apply(xyz / scale) + [7., -3., 5.]
+                    local_centers[2, 1] += noise
+                    write_poses(local, local_centers, rotation.inv())
+                    buf = io.StringIO()
+                    with redirect_stdout(buf):
+                        audit.main(["--baseline", str(base), "--regional", str(region), "--plan-only"])
+                    log = buf.getvalue()
+                    plan = json.loads(log[log.index("{"):])
+                    self.assertAlmostEqual(plan["matched_split_sigma"], .04 * scale, delta=.0001)
+                    transfer = plan["regional_scale_transfer"]
+                    self.assertEqual(transfer["method"], "shared-camera similarity")
+                    self.assertEqual(transfer["shared_views"], 3)
+                    self.assertLess(transfer["relative_rms_residual"], .002)
+                    self.assertAlmostEqual(plan["percent_dense"] * plan["full_extent"], plan["matched_split_sigma"])
+
+    def test_inconsistent_trajectories_use_only_verified_shared_photos(self):
+        from PIL import Image
+        from utils.densification_diagnostics import training_extent
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            base_path, region_path, _ = fixture(root)
+            base, region = (audit.model_info(path) for path in (base_path, region_path))
+            names = sorted(base["records"])[:3]
+            region["splits"]["train"] = set(names + ["regional-only.jpg"])
+            for i, name in enumerate(names):
+                path = root / (name + ".png")
+                Image.new("RGB", (2,2), "red").save(path)
+                base["records"][name]["image_path"] = region["records"][name]["image_path"] = str(path)
+                base["records"][name]["T"] = [i, 0., 0.]
+            region["records"][names[2]]["T"] = [0., 3., 0.]
+            sigma, info = audit.regional_cutoff(base, region, 2., .01)
+            self.assertIn("proposal", info["method"])
+            self.assertEqual((info["shared_views"], info["regional_train_views"]), (3, 4))
+            self.assertAlmostEqual(sigma, .005 * training_extent(base["records"], names))
+            other = root/"other.png"
+            Image.new("RGB", (2,2), "blue").save(other)
+            region["records"][names[1]]["image_path"] = str(other)
+            with self.assertRaisesRegex(ValueError, names[1]):
+                audit.regional_cutoff(base, region, 2., .01)
+            region["splits"]["train"] = {names[0], "regional-only.jpg"}
+            with self.assertRaisesRegex(ValueError, "1/2"):
+                audit.regional_cutoff(base, region, 2., .01)
+            region["splits"]["train"] = set(names)
+            for name in names:
+                region["records"][name]["T"] = [2., 0., 0.]
+            with self.assertRaisesRegex(ValueError, "nonzero distance"):
+                audit.regional_cutoff(base, region, 2., .01)
 
     def test_three_way_gallery_uses_verified_splits_and_same_native_crop(self):
         import cv2
@@ -123,11 +198,12 @@ class Orange4FDetailTest(unittest.TestCase):
                 audit.atomic_json(folder/"frames.json", {audit.FRAME: dict(gt="gt.png", image="image.png",
                                                                           target_sha256="same")})
             with patch("scripts.render_views_worker.render_views", side_effect=render), patch.object(audit, "run") as run:
-                audit.evaluate(base, matched, "0")
+                audit.evaluate(base, matched, "0", dict(method="full-coordinate proposal from shared photos"))
             self.assertEqual(run.call_count, 2)  # Paired 30k and extended 50k galleries.
             report = audit.read_json(matched/"comparison/results.json")
             self.assertTrue(report["held_out"])
             self.assertEqual([r["iteration"] for r in report["rows"]], [30000,30000,50000])
+            self.assertEqual(report["rows"][1]["label"], "Proposed 30k")
             self.assertTrue(all(r["gradient_agreement"] > .9 for r in report["rows"]))
             self.assertTrue((matched/"comparison/index.html").is_file())
 
@@ -139,6 +215,7 @@ class Orange4FDetailTest(unittest.TestCase):
     def test_independent_spacing_from_survivors_original_neighbors_and_scales(self):
         with tempfile.TemporaryDirectory() as temp:
             _, _, fixed = fixture(Path(temp))
+            self.enterContext(patch.object(audit, "FLOOR_SOURCE", Path(temp)/"capture"))
             xyz = np.asarray([audit.CENTER + [.01*x, .01*y, 0] for x in range(5) for y in range(5)]
                              + [audit.CENTER + [0, 0, 1]], dtype=np.float32)
             ids = [0, 2, 4, 10, 12, 14, 20, 22, 24, 25]
@@ -155,6 +232,24 @@ class Orange4FDetailTest(unittest.TestCase):
             ply(fixed/"point_cloud/iteration_30000/point_cloud.ply", moved, np.zeros(len(ids)))
             with self.assertRaisesRegex(ValueError, "differs from"):
                 audit.spacing_report(fixed)
+
+    def test_spacing_fits_plane_in_fixed_model_coordinates(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _, _, fixed = fixture(Path(temp))
+            # Look down at a floor well away from the saved diagnostic's world plane.
+            record = audit.model_info(fixed)["records"][audit.FRAME]
+            origin = -np.asarray(record["R"]) @ record["T"]
+            x, y, w, h = audit.ROI
+            us, vs = np.meshgrid(np.linspace(x+10, x+w-10, 12), np.linspace(y+10, y+h-10, 6))
+            rays = np.column_stack([(us.ravel()-record["cx"])/record["fx"],
+                                    (vs.ravel()-record["cy"])/record["fy"], np.ones(us.size)])
+            xyz = origin + 4 * (rays @ np.asarray(record["R"]).T)
+            ply(fixed/"input.ply", xyz)
+            ply(fixed/"point_cloud/iteration_30000/point_cloud.ply", xyz, np.zeros(len(xyz)))
+            report = audit.spacing_report(fixed)
+            self.assertIn("fitted", report["plane_source"])
+            self.assertAlmostEqual(report["plane_center"][2], origin[2]-4, places=5)
+            self.assertEqual(report["surviving_centers_in_crop"], len(xyz))
 
 
 if __name__ == "__main__":
