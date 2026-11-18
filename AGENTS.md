@@ -32,3 +32,6 @@ Reuse the user's working Git-installed `simple_knn` from the `3dgs` environment
 for third-party methods, including GSPrior. Do not rebuild or replace it using
 their bundled `simple-knn` submodules. Isolated environments should inherit and
 verify the existing extension; build only the method-specific rasterizer.
+
+Commit completed, validated code changes and push the working branch to origin.
+Verify that the remote branch contains the commit before handing the work back.

@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import math
+from functools import partial
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -13,6 +14,15 @@ sys.path.insert(0, str(ROOT))
 from scripts.view_comparisons import atomic_json, image_id, model_info, save_panel
 from scripts.occlusion_options import add_arguments, apply_overrides
 from scripts import pose_options
+
+
+def load_record_camera(args, record, index):
+    import numpy as np
+    from utils.camera_utils import loadCam
+    info = SimpleNamespace(uid=index, image_path=record["image_path"], image_name=record["name"],
+                           R=np.array(record["R"]), T=np.array(record["T"]), FovX=record["fov_x"],
+                           FovY=record["fov_y"], depth_path="", depth_params=None, is_test=False)
+    return loadCam(args, index, info, 1., False, False)
 
 
 def render_views(spec, names, iteration, output, antialiasing=None):
@@ -32,7 +42,6 @@ def render_views(spec, names, iteration, output, antialiasing=None):
         render, make_camera = proxy_renderer(spec, iteration, dynamic_depth=True)
     else:
         from scripts.render_model_comparison import load_renderer
-        from utils.camera_utils import loadCam
         aa = antialiasing if antialiasing is not None else cfg.get("antialiasing", spec["type"] != "textured")
         if antialiasing is None and "antialiasing" not in cfg:
             print(f"Legacy config has no AA setting: using antialiasing={aa}; override with --no-antialiasing if needed.")
@@ -41,12 +50,7 @@ def render_views(spec, names, iteration, output, antialiasing=None):
         render = load_renderer(runtime, aa)
         camera_args = SimpleNamespace(resolution=cfg.get("resolution", -1), data_device="cpu", train_test_exp=False,
                                       loss_mask_dir=cfg.get('loss_mask_dir',''))
-        def make_camera(record, index):
-            info = SimpleNamespace(uid=index, image_path=record["image_path"],
-                    image_name=record["name"], R=np.array(record["R"]), T=np.array(record["T"]),
-                    FovX=record["fov_x"], FovY=record["fov_y"], depth_path="", depth_params=None,
-                    is_test=False)
-            return loadCam(camera_args, index, info, 1., False, False)
+        make_camera = partial(load_record_camera, camera_args)
     output = Path(output)
     for name in ("gt", "renders", "errors", "comparisons"):
         (output / name).mkdir(parents=True, exist_ok=True)
