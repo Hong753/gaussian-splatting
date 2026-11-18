@@ -65,6 +65,12 @@ def preview_render(camera, gaussians, pipe, background, **unused):
 
 def train(dataset, opt, pipe, save_iterations, test_iterations, preview_config=None,
           publish=False, start_checkpoint=None):
+    sensed_path = getattr(opt, 'sensed_membership', '')
+    static = getattr(opt, 'disable_anchor_pruning', False)
+    if static and not opt.disable_anchor_growth:
+        raise ValueError('Static parent population requires disabled growth')
+    if sensed_path and not (opt.freeze_anchors and opt.disable_anchor_growth and static and not dataset.train_test_exp):
+        raise ValueError('Measured updates require fixed parent positions/population and shared image exposure disabled')
     dataset.antialiasing = pipe.antialiasing
     os.makedirs(dataset.model_path, exist_ok=True)
     with open(os.path.join(dataset.model_path, "cfg_args"), "w") as stream:
@@ -83,6 +89,15 @@ def train(dataset, opt, pipe, save_iterations, test_iterations, preview_config=N
         if any((Path(dataset.model_path)/f'point_cloud/iteration_{s}/ready.json').exists()
                for s in save_iterations if s > start):
             raise FileExistsError('Later published checkpoints exist; resume into a fresh model directory')
+    membership = None
+    if static:
+        from utils.scaffold_observations import Membership, sensed_step
+    if sensed_path:
+        membership = Membership(sensed_path, gaussians.get_anchor, cameras)
+    policy = (membership.identity if membership else None, static)
+    if start_checkpoint and (gaussians.training_state or {}).get('observation_policy', (None, False)) != policy:
+        raise ValueError('Checkpoint uses different parent observations or pruning policy')
+    adjust = not (static and opt.disable_anchor_growth)
     previewer = training_previews.create_previewer(scene, dataset,
         preview_config or training_previews.DEFAULTS, start_iteration=start)
     if start_checkpoint and gaussians.training_state:
@@ -100,7 +115,12 @@ def train(dataset, opt, pipe, save_iterations, test_iterations, preview_config=N
             views = scene.getTrainCameras().copy()
         cam = views.pop(randint(0, len(views) - 1))
         visible = prefilter_voxel(cam, gaussians, pipe, bg)
-        result = render(cam, gaussians, pipe, bg, visible_mask=visible, retain_grad=iteration < opt.update_until)
+        gating = {}
+        if static:
+            selected = membership.mask(cam.image_name) if membership else torch.ones_like(visible)
+            gating = dict(update_anchors=selected)
+        result = render(cam, gaussians, pipe, bg, visible_mask=visible,
+                        retain_grad=adjust and iteration < opt.update_until, **gating)
         image = result["render"]
         if dataset.train_test_exp:
             exposure = gaussians.get_exposure_from_name(cam.image_name)
@@ -109,6 +129,8 @@ def train(dataset, opt, pipe, save_iterations, test_iterations, preview_config=N
         target = cam.original_image.cuda()
         ll1 = l1_loss(image, target)
         scale = result["scaling"]
+        if static:
+            scale = scale[result['active_children']]
         if len(gaussians.get_anchor) == 0:
             raise RuntimeError('The entire Scaffold model is empty')
         scale_loss = scale.prod(dim=1).mean() if scale.numel() else image.sum()*0
@@ -116,15 +138,22 @@ def train(dataset, opt, pipe, save_iterations, test_iterations, preview_config=N
                 + 0.01 * scale_loss)
         loss.backward()
         with torch.no_grad():
-            if opt.start_stat < iteration < opt.update_until:
+            if adjust and opt.start_stat < iteration < opt.update_until:
                 gaussians.training_statis(result["viewspace_points"], result["neural_opacity"],
                                           result["visibility_filter"], result["selection_mask"], visible)
-            gaussians.optimizer.step()
+            if static:
+                parents = result['active_parents']
+                if len(parents):
+                    active = torch.zeros_like(visible)
+                    active[parents] = True
+                    sensed_step(gaussians.optimizer, active)
+            else:
+                gaussians.optimizer.step()
             gaussians.optimizer.zero_grad(set_to_none=True)
             if dataset.train_test_exp:
                 gaussians.exposure_optimizer.step()
                 gaussians.exposure_optimizer.zero_grad(set_to_none=True)
-            if opt.update_from < iteration < opt.update_until and iteration % opt.update_interval == 0:
+            if adjust and opt.update_from < iteration < opt.update_until and iteration % opt.update_interval == 0:
                 gaussians.adjust_anchor(check_interval=opt.update_interval,
                                          success_threshold=opt.success_threshold,
                                          grad_threshold=opt.densify_grad_threshold,
@@ -134,7 +163,10 @@ def train(dataset, opt, pipe, save_iterations, test_iterations, preview_config=N
                                 active=int(result['visibility_filter'].sum()))
             if iteration == 1 or iteration % 100 == 0 or iteration == opt.iterations:
                 with (Path(dataset.model_path)/'scaffold_training.jsonl').open('a') as stream:
-                    stream.write(json.dumps(dict(iteration=iteration, anchors=len(gaussians.get_anchor),
+                    coverage = {} if not membership else dict(image=cam.image_name, observation_source=membership.kind,
+                        frustum_parents=int(visible.sum()), eligible_parents_in_frustum=int((selected & visible).sum()),
+                        updated_parents=len(parents), eligible_rendered_children=int(result['active_children'].sum()))
+                    stream.write(json.dumps(dict(**coverage, iteration=iteration, anchors=len(gaussians.get_anchor),
                         active_gaussians=int(result['visibility_filter'].sum()), loss=loss.item(),
                         freeze_anchors=gaussians.freeze_anchors, anchor_growth=not gaussians.disable_anchor_growth))+'\n')
             if iteration in test_iterations:
@@ -147,7 +179,7 @@ def train(dataset, opt, pipe, save_iterations, test_iterations, preview_config=N
                     gaussians.train()
             if iteration in save_iterations:
                 print(f"\n[ITER {iteration}] Saving anchors, networks and optimizer state")
-                gaussians.training_state = dict(python_rng=random.getstate(), numpy_rng=np.random.get_state(),
+                gaussians.training_state = dict(observation_policy=policy, python_rng=random.getstate(), numpy_rng=np.random.get_state(),
                     torch_rng=torch.get_rng_state(), cuda_rng=torch.cuda.get_rng_state_all(),
                     pending_views=[c.image_name for c in views])
                 # TorchScript tracing uses random example inputs. Saving must not affect sampling.

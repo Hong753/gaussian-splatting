@@ -107,7 +107,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     else:
         return xyz, color, opacity, scaling, rot
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, update_anchors=None):
     """
     Render the scene. 
     
@@ -121,8 +121,16 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         xyz, color, opacity, scaling, rot = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
     
 
+    if update_anchors is not None:
+        from utils.scaffold_observations import gate_children
+        if not is_training or visible_mask is None:
+            raise ValueError('Sensed updates require the training parent frustum mask')
+        parent = visible_mask.nonzero(as_tuple=True)[0][mask.nonzero(as_tuple=True)[0] // pc.n_offsets]
+        eligible = update_anchors[parent]
+        xyz, color, opacity, scaling, rot = gate_children((xyz, color, opacity, scaling, rot), eligible)
+
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros_like(xyz, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
+    screenspace_points = torch.zeros_like(xyz, requires_grad=True) + 0
     if retain_grad:
         try:
             screenspace_points.retain_grad()
@@ -172,7 +180,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     if is_training:
-        return {"render": rendered_image,
+        result = {"render": rendered_image,
                 "viewspace_points": screenspace_points,
                 "visibility_filter" : radii > 0,
                 "radii": radii,
@@ -180,6 +188,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "neural_opacity": neural_opacity,
                 "scaling": scaling,
                 }
+        if update_anchors is not None:
+            active = eligible & (radii > 0)
+            result['active_children'] = active
+            result['active_parents'] = parent[active].unique()
+        return result
     else:
         return {"render": rendered_image,
                 "viewspace_points": screenspace_points,

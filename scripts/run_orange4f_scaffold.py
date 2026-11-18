@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -17,7 +18,8 @@ from utils.checkpoint_snapshots import digest
 
 def build_plan(args):
     from scripts.run_fixed_lidar import checkpoint_steps
-    fixed = args.variant == 'fixed'
+    fixed = args.variant != 'learnable'
+    static = args.variant in ('sensed','mesh-visible','fixed-static')
     command = ['models/train_scaffold.py', '--model_type', 'scaffold',
         '-s', str(args.source), '-m', str(args.model), '--initial_point_cloud', str(args.point_cloud),
         '--keyframe_manifest', str(args.keyframes), '--resolution', '1', '--data_device', 'cpu',
@@ -29,8 +31,12 @@ def build_plan(args):
         '--debug_preview_every', '500']
     if fixed:
         command += ['--freeze_anchors', '--disable_anchor_growth']
+    if static:
+        command += ['--disable_anchor_pruning']
+    if args.variant in ('sensed','mesh-visible'):
+        command += ['--sensed_membership', str(Path(args.model)/'observations')]
     return dict(model=str(args.model), source=str(args.source), model_type='scaffold',
-        antialiasing=False, freeze_anchors=fixed, anchor_growth=not fixed, pruning=True,
+        antialiasing=False, freeze_anchors=fixed, anchor_growth=not fixed, pruning=not static,
         voxel_size=args.voxel_size, learned_offsets=True, appearance_dim=0,
         hard_culling=False, stages=[dict(argv=command)])
 
@@ -52,8 +58,10 @@ def execute_plan(args, plan):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--suite', type=Path, required=True)
-    p.add_argument('--variant', choices=['learnable', 'fixed'], required=True)
+    p.add_argument('--variant', choices=['learnable', 'fixed', 'fixed-static', 'sensed','mesh-visible'], required=True)
     p.add_argument('--gpu', required=True)
+    p.add_argument('--observations', type=Path, default=os.environ.get('SCAFFOLD_OBSERVATIONS'),
+                   help='Measured image/return association manifest or explicit mesh visibility metadata')
     p.add_argument('--voxel-size', type=float, default=.02,
                    help='Anchor spacing in input scene units; this is not a Gaussian scale cap')
     p.add_argument('--anchor-lr-init', type=float, default=.00016)
@@ -75,22 +83,44 @@ def main(argv=None):
     args.iterations, args.checkpoint_every = 30000, 10000
     args.expected_frames, args.report_max_views = suite['frames'], 32
     args.eval_memory_fraction, args.poll_seconds, args.dry_run = .25, 15., False
+    manifest = None
+    if args.variant in ('sensed','mesh-visible'):
+        from utils.scaffold_observations import discover, prepare_membership
+        if args.variant == 'mesh-visible' and not args.observations:
+            p.error('For mesh-visible set SCAFFOLD_OBSERVATIONS to visibility/metadata.json from the first-hit mesh cache')
+        manifest = discover(args.source, args.observations)
+        args.observations = str(manifest)
+    elif args.observations:
+        p.error('--observations applies to sensed or mesh-visible')
     plan = build_plan(args)
     if (periodic.directory(args.model)/'plan.json').exists():
         previous = periodic.load_plan(args.model)
-        if previous['plan'] != plan or previous['gpu'] != args.gpu:
+        if (previous['plan'] != plan or previous['gpu'] != args.gpu
+                or (manifest and str(manifest) != previous['training_args'].get('observations'))):
             raise ValueError('Prepared Scaffold settings changed; use another --run-version')
         for name, expected in previous['input_fingerprints'].items():
             if digest(Path(name)) != expected:
                 raise ValueError(f'Prepared Scaffold input changed: {name}')
         print(f'Reusing Scaffold plan: {args.model}', flush=True)
         return 0
-    args.model.mkdir(exist_ok=False)
+    observation_inputs = []
+    if manifest:
+        names = json.loads(Path(suite['selection']).read_text())['selected_images']
+        with tempfile.TemporaryDirectory(dir=root) as temp:
+            prepared = Path(temp)/'observations'
+            prepare_membership(prepared, manifest, args.point_cloud, suite['cloud']['original'], names, args.voxel_size,
+                               mesh_source=args.source if args.variant == 'mesh-visible' else None)
+            args.model.mkdir(exist_ok=False)
+            directory = args.model/'observations'
+            prepared.rename(directory)
+        observation_inputs = [manifest, directory/'metadata.json', directory/'parents.npy']
+    else:
+        args.model.mkdir(exist_ok=False)
     shutil.copyfile(suite['selection'], args.keyframes)
     # Avoid copying the full dense cloud once per model; Scene recognizes this link.
     (args.model/'input.ply').symlink_to(args.point_cloud)
     result = periodic.prepare_experiment(args, plan, 'scaffold',
-        [args.keyframes, *map(Path, suite['input_fingerprints'])])
+        [args.keyframes, *map(Path, suite['input_fingerprints']), *observation_inputs])
     # Keep the original four-run manifest immutable. Add independent dashboard links.
     from utils.checkpoint_snapshots import atomic_write
     index = root/'index.html'

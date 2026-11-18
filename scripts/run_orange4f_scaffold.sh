@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Usage: run_orange4f_scaffold.sh GPU learnable|fixed [SOURCE] [SUITE_VERSION]
+# Usage: run_orange4f_scaffold.sh GPU learnable|fixed|fixed-static|sensed|mesh-visible [SOURCE] [SUITE_VERSION]
 set -euo pipefail
 source "${RECONSTRUCTION_CONDA_SH:-/opt/anaconda3/etc/profile.d/conda.sh}"
 conda activate 3dgs
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-scaffold_gpu="${1:?Supply GPU and learnable or fixed}"
-scaffold_variant="${2:?Supply learnable or fixed}"
-case "$scaffold_variant" in learnable|fixed) ;; *) echo 'Expected learnable or fixed' >&2; exit 2;; esac
+scaffold_gpu="${1:?Supply GPU and a Scaffold variant}"
+scaffold_variant="${2:?Supply a Scaffold variant}"
+case "$scaffold_variant" in learnable|fixed|fixed-static|sensed|mesh-visible) ;; *) echo 'Expected learnable, fixed, fixed-static, sensed or mesh-visible' >&2; exit 2;; esac
 scaffold_source="$(realpath -e "${3:-/workspace/colmap_scenes/orange4f}")"
 scaffold_suite_version="${4:-v1}"
 scaffold_version="${SCAFFOLD_RUN_VERSION:-v1}"

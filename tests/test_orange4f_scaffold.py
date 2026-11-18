@@ -196,7 +196,8 @@ def test_snapshot_requires_matching_mlps_and_rejects_modified_weights(tmp_path):
     with pytest.raises(ValueError): read_snapshot(tmp_path, 10)
 
 
-def test_training_loop_previews_and_complete_checkpoint_publication(tmp_path):
+@pytest.mark.parametrize('sensed', [False, True])
+def test_training_loop_previews_and_complete_checkpoint_publication(tmp_path, sensed):
     """Execute the actual loop, optimizer and image reports with a CPU RGB probe."""
     with cpu_backend() as Model, ExitStack() as stack:
         cameras = [SimpleNamespace(image_name=name, original_image=torch.ones(3, 16, 16)*.4)
@@ -214,14 +215,18 @@ def test_training_loop_previews_and_complete_checkpoint_publication(tmp_path):
                 self.gaussians.save_mlp_checkpoints(str(folder))
         def prefilter(camera, model, pipe, bg):
             return torch.ones(len(model.get_anchor), dtype=torch.bool)
-        def render(camera, model, pipe, bg, visible_mask=None, retain_grad=False):
+        def render(camera, model, pipe, bg, visible_mask=None, retain_grad=False, update_anchors=None):
             points = model.get_anchor.repeat_interleave(model.n_offsets, 0) + model._offset.reshape(-1, 3)
             if retain_grad: points.retain_grad()
             color = (points.mean(0)+model._anchor_feat.mean()).sigmoid()
-            return dict(render=color[:, None, None].expand(3, 16, 16), viewspace_points=points,
+            result = dict(render=color[:, None, None].expand(3, 16, 16), viewspace_points=points,
                 visibility_filter=torch.ones(len(points), dtype=torch.bool),
                 selection_mask=torch.ones(len(points), dtype=torch.bool),
-                neural_opacity=torch.ones(len(points), 1)*.4, scaling=model.get_scaling[:, 3:])
+                neural_opacity=torch.ones(len(points), 1)*.4, scaling=model.get_scaling[:, 3:].repeat_interleave(model.n_offsets,0))
+            if update_anchors is not None:
+                result.update(active_parents=update_anchors.nonzero().flatten(),
+                              active_children=update_anchors.repeat_interleave(model.n_offsets))
+            return result
         scene_mod = ModuleType('scene'); scene_mod.Scene = Scene
         model_mod = ModuleType('models.scaffold_gaussian'); model_mod.ScaffoldGaussianModel = Model
         renderer_mod = ModuleType('models.scaffold_renderer'); renderer_mod.render = render; renderer_mod.prefilter_voxel = prefilter
@@ -236,7 +241,7 @@ def test_training_loop_previews_and_complete_checkpoint_publication(tmp_path):
             scaffold_n_offsets=2, scaffold_voxel_size=.02, white_background=False, train_test_exp=False,
             keyframe_manifest='', images='images', resolution=1)
         (tmp_path/'keyframes.json').write_text('{"selected_images":["train.png"]}')
-        launch = SimpleNamespace(variant='fixed', source=tmp_path, model=tmp_path, point_cloud=tmp_path/'input.ply',
+        launch = SimpleNamespace(variant='sensed' if sensed else 'fixed', source=tmp_path, model=tmp_path, point_cloud=tmp_path/'input.ply',
             keyframes=tmp_path/'keyframes.json', voxel_size=.02, iterations=30000, checkpoint_every=10000,
             anchor_lr_init=.00016, anchor_lr_final=.0000016)
         argv = runner.build_plan(launch)['stages'][0]['argv']
@@ -246,6 +251,15 @@ def test_training_loop_previews_and_complete_checkpoint_publication(tmp_path):
             assert call.call_args.args[3] == {10000, 20000, 30000}
             assert call.call_args.args[6] is True  # complete atomic snapshot publication
         opt = options(True); opt.iterations = 3; opt.start_stat = 0
+        if sensed:
+            from utils.scaffold_observations import anchor_digest
+            folder = tmp_path/'observations'; folder.mkdir()
+            xyz = np.array([[i*.2, i*.01, 2.] for i in range(6)], np.float32)
+            centers = np.unique(np.round(xyz/.02), axis=0)*.02
+            np.save(folder/'parents.npy', np.array([[1]],dtype=np.uint8))
+            (folder/'metadata.json').write_text(json.dumps(dict(names=['train.png'],format='lidar_rows_v1',
+                                                                anchor_sha256=anchor_digest(centers))))
+            opt.sensed_membership = str(folder); opt.disable_anchor_pruning = True
         trainer.train(ds, opt, SimpleNamespace(debug=False, antialiasing=False), {3}, set(),
             dict(every=2, train=1, test=1, seed=0), publish=True)
         history = json.loads((tmp_path/'debug_previews/history.json').read_text())
@@ -256,6 +270,10 @@ def test_training_loop_previews_and_complete_checkpoint_publication(tmp_path):
         model = Model(feat_dim=8, n_offsets=2, voxel_size=.02, appearance_dim=0, update_init_factor=16)
         state, iteration = torch.load(tmp_path/'chkpnt3.pth', weights_only=False)
         assert iteration == 3
+        if sensed:
+            assert state['tensors']['_offset'][0].any() and not state['tensors']['_offset'][1:].any()
+            last = json.loads((tmp_path/'scaffold_training.jsonl').read_text().splitlines()[-1])
+            assert last['updated_parents'] == 1 and last['eligible_rendered_children'] == 2
         model.restore(state, opt)
         expected = model.get_anchor.detach().clone()
         model.load_ply(str(tmp_path/'point_cloud/iteration_3/point_cloud.ply'))

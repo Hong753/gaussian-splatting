@@ -53,6 +53,24 @@ def main():
             model.optimizer.step(); model.optimizer.zero_grad(set_to_none=True)
         assert torch.equal(before, model.get_anchor) == fixed
         assert model._offset.abs().max() > 0
+        if fixed:
+            from utils.scaffold_observations import sensed_step
+            visible = prefilter_voxel(camera, model, pipe, bg)
+            eligible = torch.arange(len(before), device=before.device) % 2 == 0
+            rows = model._offset.detach().clone()
+            moment = model.optimizer.state[model._offset]['exp_avg'].clone()
+            with torch.no_grad():
+                expected_rgb = render(camera, model, pipe, bg, visible_mask=visible)['render']
+            gated = render(camera, model, pipe, bg, visible_mask=visible, update_anchors=eligible)
+            torch.testing.assert_close(gated['render'], expected_rgb)
+            gated['render'].square().mean().backward()
+            assert len(gated['active_parents']) and not model._offset.grad[~eligible].any()
+            active = torch.zeros_like(visible)
+            active[gated['active_parents']] = True
+            sensed_step(model.optimizer, active)
+            model.optimizer.zero_grad(set_to_none=True)
+            assert torch.equal(model._offset[~active], rows[~active])
+            assert torch.equal(model.optimizer.state[model._offset]['exp_avg'][~active], moment[~active])
         restored = ScaffoldGaussianModel(feat_dim=8, n_offsets=2, voxel_size=.02, appearance_dim=0, update_init_factor=16)
         restored.restore(model.capture(), opt)
         model.eval(); restored.eval()
