@@ -216,7 +216,7 @@ def camera_geometry(frame, cam, origin):
     )
 
 
-def row_manifest(source, model, ply_path, explicit):
+def find_row_manifest(source, model, explicit):
     candidates = (
         [Path(explicit).expanduser()]
         if explicit
@@ -230,11 +230,18 @@ def row_manifest(source, model, ply_path, explicit):
             if explicit:
                 raise ValueError(f"Expected lidar_rows_v1 in {path}")
             continue
-        print(f"Checking PLY row identity for {path} …", flush=True)
-        if not ply_path.is_file() or meta.get("point_cloud_sha256") != digest(ply_path):
-            raise ValueError(f"{path} indexes a different PLY. Use --ply with its original point cloud.")
-        return {name: path.parent / rows for name, rows in meta["frames"].items()}
-    return {}
+        return path.resolve(), meta
+    return None, {}
+
+
+def row_manifest(source, model, ply_path, explicit):
+    path, meta = find_row_manifest(source, model, explicit)
+    if path is None:
+        return None, {}
+    print(f"Checking PLY row identity for {path} …", flush=True)
+    if not ply_path.is_file() or meta.get("point_cloud_sha256") != digest(ply_path):
+        raise ValueError(f"{path} indexes a different PLY. Use --ply with its original point cloud.")
+    return path, {name: path.parent / rows for name, rows in meta["frames"].items()}
 
 
 def project(xyz, frame, camera):
@@ -262,6 +269,14 @@ def finite_xy(xy):
     return xy.round(3).tolist() if np.isfinite(xy).all() else None
 
 
+def viewer_cloud_path(source, model, explicit=None):
+    if explicit is not None:
+        return Path(explicit).expanduser().resolve()
+    path = model / "points3D.ply"
+    fallback = source / "input.ply"
+    return fallback if not path.is_file() and fallback.is_file() else path
+
+
 class Inspector:
     def __init__(self, source, ply_path=None, images="images", limit=5000, manifest=None):
         self.source, self.images, self.limit = Path(source), images, limit
@@ -270,20 +285,14 @@ class Inspector:
         self.buf = mapped(model / "images.bin")
         self.frames = read_frames(self.buf)
         self.points = PointIndex(model / "points3D.bin")
-        ply_path = Path(ply_path) if ply_path else model / "points3D.ply"
-        if (
-            not ply_path.is_file()
-            and (self.source / "input.ply").is_file()
-            and ply_path == model / "points3D.ply"
-        ):
-            ply_path = self.source / "input.ply"
+        self.ply_path = ply_path = viewer_cloud_path(self.source, model, ply_path)
         total = sum(f.linked for f in self.frames.values())
         self.ply = (
             PlyIndex(ply_path, bool(len(self.points.ids) and (total or len(self.points.reverse))))
             if ply_path.is_file()
             else None
         )
-        self.manifest = row_manifest(self.source, model, ply_path, manifest)
+        self.manifest_path, self.manifest = row_manifest(self.source, model, ply_path, manifest)
         centers = np.asarray([-f.R.T @ f.t for f in self.frames.values()])
         bounds = (
             [np.min(centers, axis=0), np.max(centers, axis=0)]
@@ -324,6 +333,36 @@ class Inspector:
             flush=True,
         )
 
+    def resolve_ids(self, ids):
+        rows = self.points.rows(ids)
+        xyz = np.full((len(ids), 3), np.nan)
+        resolved = rows >= 0
+        xyz[resolved] = self.points.xyz[rows[resolved]]
+        ply = self.ply.match(xyz) if self.ply else np.full(len(ids), -1)
+        return xyz, resolved, ply
+
+    def indexed_rows(self, iid, matched_rows=None):
+        """Uncapped red PLY row IDs, shared by the viewer and Scaffold training."""
+        frame = self.frames[iid]
+        if frame.name in self.manifest:
+            raw = np.load(self.manifest[frame.name], allow_pickle=False)
+            if (
+                raw.ndim != 1
+                or raw.dtype.kind not in "iu"
+                or (len(raw) and (raw.min() < 0 or raw.max() >= len(self.ply.vertices)))
+            ):
+                raise ValueError(f"Invalid LiDAR row indices for {frame.name}")
+            return np.unique(raw).astype("<u4"), "per-image LiDAR row indices"
+        if matched_rows is None:
+            ids = np.frombuffer(self.buf, FEATURE, frame.count, frame.offset)["id"]
+            back = self.points.for_image(iid)
+            union = np.union1d(ids[ids >= 0].astype("<u8"), self.points.ids[back["row"]])
+            _, _, matched_rows = self.resolve_ids(union)
+        return (
+            np.unique(matched_rows[matched_rows >= 0]).astype("<u4"),
+            "COLMAP tracks matched by unique XYZ",
+        )
+
     def _frame_data(self, iid):
         frame = self.frames[iid]
         cam = self.cameras[frame.camera]
@@ -339,11 +378,7 @@ class Inspector:
         flags[index[len(forward) :]] |= 2
         ids, per_pair = np.unique(pairs["id"], return_inverse=True)
         per_pair = per_pair.ravel()
-        rows = self.points.rows(ids)
-        xyz = np.full((len(ids), 3), np.nan)
-        resolved = rows >= 0
-        xyz[resolved] = self.points.xyz[rows[resolved]]
-        ply = self.ply.match(xyz) if self.ply else np.full(len(ids), -1)
+        xyz, resolved, ply = self.resolve_ids(ids)
         can_project = cam.model in ("PINHOLE", "SIMPLE_PINHOLE")
         uv = project(xyz, frame, cam)[0] if can_project else np.full((len(ids), 2), np.nan)
         both = ((flags & 1) != 0) & np.isfinite(uv[per_pair]).all(axis=1)
@@ -367,20 +402,9 @@ class Inspector:
                     finite_xy(xyz[i]) if resolved[i] else None,
                 ]
             )
-        # Red indexes always address the original PLY vertex buffer in file order.
-        red = np.unique(ply[ply >= 0]).astype("<u4")
-        source = "COLMAP tracks matched by unique XYZ"
+        red, source = self.indexed_rows(iid, matched_rows=ply)
         manifest_xy = []
         if frame.name in self.manifest:
-            raw = np.load(self.manifest[frame.name], allow_pickle=False)
-            if (
-                raw.ndim != 1
-                or raw.dtype.kind not in "iu"
-                or (len(raw) and (raw.min() < 0 or raw.max() >= len(self.ply.vertices)))
-            ):
-                raise ValueError(f"Invalid LiDAR row indices for {frame.name}")
-            red = np.unique(raw).astype("<u4")
-            source = "per-image LiDAR row indices"
             if can_project and len(red):
                 display = red[np.linspace(0, len(red) - 1, min(len(red), self.limit), dtype=int)]
                 image_xy, _ = project(self.ply.coords(display), frame, cam)

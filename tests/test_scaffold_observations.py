@@ -152,3 +152,67 @@ def test_full_forward_and_masked_decoders_and_adam_momentum():
         torch.testing.assert_close(m._anchor_feat[~selected],feat[~selected],rtol=0,atol=0)
         torch.testing.assert_close(m.optimizer.state[m._anchor_feat]['exp_avg'][~selected],mom[~selected],rtol=0,atol=0)
         assert not torch.equal(m._anchor_feat[selected],feat[selected])
+
+
+@pytest.mark.parametrize('explicit_rows', [False, True])
+def test_indexed_launcher_trains_on_exact_red_rows(tmp_path, explicit_rows):
+    import shutil
+    import struct
+    from test_sparse_observation_viewer import fixture
+    from scripts.view_sparse_observations import Inspector
+
+    source = tmp_path/'capture'
+    sparse = fixture(source)
+    images = sparse/'images.bin'
+    with images.open('r+b') as binary:
+        binary.write(struct.pack('<Q', 6))
+        binary.seek(0, 2)
+        for image_id, name in enumerate(('b.jpg', 'c.jpg', 'y.jpg', 'z.jpg'), 40):
+            binary.write(struct.pack('<i7di', image_id, 1,0,0,0, 0,0,0, 1) + name.encode() + bytes(9))
+            shutil.copyfile(source/'images/empty.jpg', source/'images'/name)
+    # The suite uses a different cloud. Indexed training must initialize from the viewed PLY.
+    path = sparse/'points3D.ply'
+    xyz = PlyData.read(path)['vertex'].data
+    vertices = np.zeros(len(xyz), dtype=xyz.dtype.descr + [(k,'u1') for k in ('red','green','blue')])
+    for k in 'xyz':
+        vertices[k] = xyz[k]
+    PlyData([PlyElement.describe(vertices, 'vertex')]).write(path)
+    PlyData([PlyElement.describe(vertices[:1], 'vertex')]).write(source/'input.ply')
+    if explicit_rows:
+        # Explicit rows win for this view, including a row with ambiguous XYZ.
+        np.save(sparse/'rows.npy', [4,1,4])
+        (sparse/'lidar_observations.json').write_text(json.dumps(dict(format='lidar_rows_v1',
+            frames={'09882.jpg':'rows.npy'}, point_cloud_sha256=digest(path))))
+    suite = tmp_path/'suite'
+    prepare_orange4f.main(['--source',str(source),'--output',str(suite)])
+    args = ['--suite',str(suite),'--variant','indexed','--gpu','4']
+    assert runner.main(args) == 0
+    model = suite/'scaffold_indexed_anchors_v1'
+    plan = load_plan(model)
+    flags = plan['plan']['stages'][0]['argv']
+    assert all(v in flags for v in ('--sensed_membership','--freeze_anchors','--disable_anchor_growth','--disable_anchor_pruning'))
+    assert plan['selected'] == ['09882.jpg','empty.jpg']
+    assert plan['iterations'] == [10000,20000,30000]
+    viewer = Inspector(source, limit=1)
+    actual = np.column_stack([PlyData.read(model/'input.ply')['vertex'][k] for k in 'xyz'])
+    np.testing.assert_array_equal(actual, viewer.ply.coords(slice(None)))
+    with cpu_backend() as Model:
+        gs = build(Model, True)
+        anchors = gs.voxelize_sample(actual, .02)
+    membership = Membership(model/'observations', torch.tensor(anchors), plan['selected'])
+    data = json.loads((model/'observations/metadata.json').read_text())
+    assert data['format'] == 'viewer_indexed_rows_v1' and data['empty_views'] == 1
+    assert data['per_view_indexed_rows'] == [2,0]
+    assert data['per_view_source'][0] == viewer.frame(31)['indexed_source']
+    rgb_data, encoded = viewer.frame_data(31)
+    red = np.frombuffer(encoded, '<u4', offset=8, count=rgb_data['indexed_rows'])
+    np.testing.assert_array_equal(red, [1,4] if explicit_rows else [0,2])
+    expected = np.unique(np.round(actual[red]/.02),axis=0)*.02
+    np.testing.assert_array_equal(anchors[membership.mask('09882.jpg').numpy()], expected)
+    assert not membership.mask('empty.jpg').any()
+    assert runner.main(args) == 0
+    changed = sparse/'rows.npy' if explicit_rows else sparse/'points3D.bin'
+    with changed.open('ab') as f:
+        f.write(b'x')
+    with pytest.raises(ValueError,match='input changed'):
+        runner.main(args)

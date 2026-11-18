@@ -159,8 +159,11 @@ def train(dataset, opt, pipe, save_iterations, test_iterations, preview_config=N
                                          grad_threshold=opt.densify_grad_threshold,
                                          min_opacity=opt.min_opacity)
             if iteration % 10 == 0:
-                bar.set_postfix(loss=f"{loss.item():.6f}", anchors=len(gaussians.get_anchor),
-                                active=int(result['visibility_filter'].sum()))
+                stats = dict(loss=f"{loss.item():.6f}", anchors=len(gaussians.get_anchor),
+                             active=int(result['visibility_filter'].sum()))
+                if membership:
+                    stats.update(updated_parents=len(parents), eligible_children=int(result['active_children'].sum()))
+                bar.set_postfix(stats)
             if iteration == 1 or iteration % 100 == 0 or iteration == opt.iterations:
                 with (Path(dataset.model_path)/'scaffold_training.jsonl').open('a') as stream:
                     coverage = {} if not membership else dict(image=cam.image_name, observation_source=membership.kind,

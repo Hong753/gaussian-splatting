@@ -48,7 +48,7 @@ def prepare(argv):
     return prepare_experiment(args, plan, 'soft_surface', [args.keyframes, args.scene_geometry])
 
 
-def prepare_experiment(args, plan, experiment, input_paths):
+def prepare_experiment(args, plan, experiment, input_paths, *, staged_model=None):
     """Shared durable checkpoint queue; experiment launchers own their training plan."""
     records = read_colmap_records(Path(plan['source']))
     if len(records) != args.expected_frames:
@@ -56,7 +56,14 @@ def prepare_experiment(args, plan, experiment, input_paths):
     missing = [n for n, r in records.items() if not Path(r['image_path']).is_file()]
     if missing:
         raise FileNotFoundError(f'Missing source images: {missing[:5]}')
-    selected = json.loads(args.keyframes.read_text())['selected_images']
+    model = Path(plan['model'])
+
+    def prepared_path(path):
+        if staged_model is not None and path.is_relative_to(model):
+            return staged_model / path.relative_to(model)
+        return path
+
+    selected = json.loads(prepared_path(args.keyframes).read_text())['selected_images']
     if not selected or len(selected) != len(set(selected)) or not set(selected) <= set(records):
         raise ValueError('Training manifest is empty, duplicated or outside the source cameras')
     from scripts.run_fixed_lidar import checkpoint_steps
@@ -66,17 +73,17 @@ def prepare_experiment(args, plan, experiment, input_paths):
         expected_frames=args.expected_frames, report_max_views=args.report_max_views,
         memory_fraction=args.eval_memory_fraction, poll_seconds=args.poll_seconds,
         training_args={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
-        plan=plan, input_fingerprints={str(path.resolve()): digest(path) for path in input_paths})
+        plan=plan, input_fingerprints={str(path.resolve()): digest(prepared_path(path)) for path in input_paths})
     if args.dry_run:
         print(json.dumps(data, indent=2))
         return 0
-    folder = directory(plan['model'])
+    folder = directory(staged_model or model)
     # Exclusive creation prevents accidental reuse of an old run/worker state.
     folder.mkdir(parents=True, exist_ok=False)
     atomic_json(folder/'plan.json', data)
     atomic_json(folder/'training.json', dict(state='prepared'))
     print(f'Prepared {len(steps)} checkpoints; {len(records)} frames each; GPU {args.gpu}.', flush=True)
-    print(f'Plan: {folder / "plan.json"}', flush=True)
+    print(f'Plan: {directory(model) / "plan.json"}', flush=True)
     return 0
 
 

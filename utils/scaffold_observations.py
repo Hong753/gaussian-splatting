@@ -40,20 +40,34 @@ def scanner_voxels(keys, world, size):
     return pos[inside][keys[pos[inside]] == query[inside]]
 
 
-def prepare_membership(out, manifest, cloud, original, names, size, *, mesh_source=None):
-    out, manifest = Path(out), Path(manifest)
-    meta = json.loads(manifest.read_text())
+def prepare_membership(out, manifest, cloud, original, names, size, *, mesh_source=None, indexed_viewer=None):
+    out = Path(out)
+    manifest = Path(manifest) if manifest is not None else None
+    meta = json.loads(manifest.read_text()) if manifest else {}
     points = read_xyz(cloud)
     keys, point_parent = np.unique(np.round(points/size), axis=0, return_inverse=True)
     anchors = (keys*size).astype(np.float32)
     point_parent = point_parent.reshape(-1)
     names = sorted(names)
     view_index = {n:i for i,n in enumerate(names)}
-    kind = meta.get('format')
+    indexed = indexed_viewer is not None
+    kind = 'viewer_indexed_rows_v1' if indexed else meta.get('format')
     mesh = mesh_source is not None
     if mesh != (kind == 'scene_occlusion_mesh_v1'):
         raise ValueError('Measured LiDAR and first-hit mesh visibility require separate experiment variants')
-    if kind == 'lidar_rows_v1' or mesh:
+    if indexed:
+        # The indexed launcher canonicalizes this exact viewer PLY, keeping vertex order.
+        if Path(original).resolve() != indexed_viewer.ply_path.resolve() or len(indexed_viewer.ply.vertices) != len(points):
+            raise ValueError('Indexed rows and Scaffold initialization refer to different point clouds')
+        for start in range(0, len(points), 262144):
+            part = slice(start, start+262144)
+            if not np.array_equal(points[part], indexed_viewer.ply.coords(part).astype(points.dtype, copy=False)):
+                raise ValueError('Scaffold initialization changed the indexed PLY vertex order or coordinates')
+        frames = {f.name:f.id for f in indexed_viewer.frames.values()}
+        missing = sorted(set(names)-frames.keys())
+        if missing:
+            raise ValueError(f'Training images missing from the viewer sparse model: {missing[:4]}')
+    elif kind == 'lidar_rows_v1' or mesh:
         # The canonical suite may have added normals to the PLY. Accept the raw
         # PLY digest as well only when its XYZ rows match one-for-one.
         if meta['point_cloud_sha256'] != digest(cloud):
@@ -99,9 +113,13 @@ def prepare_membership(out, manifest, cloud, original, names, size, *, mesh_sour
         received[row] += total
 
     raw = hashlib.sha256()
-    if kind == 'lidar_rows_v1' or mesh:
+    per_view_source = []
+    if indexed or kind == 'lidar_rows_v1' or mesh:
         for i,name in enumerate(names):
-            if mesh:
+            if indexed:
+                ids, source = indexed_viewer.indexed_rows(frames[name])
+                per_view_source.append(source)
+            elif mesh:
                 with np.load(manifest.parent/frames[name], allow_pickle=False) as frame:
                     signature = camera_signature(record_camera(records[name], meta['resolution'], 'cpu'), 1)
                     if (str(frame['image']) != name or str(frame['camera_signature']) != signature
@@ -114,7 +132,8 @@ def prepare_membership(out, manifest, cloud, original, names, size, *, mesh_sour
                 raise ValueError(f'Invalid original LiDAR row IDs for {name}')
             raw.update(hashlib.sha256(ids.tobytes()).digest())
             add(name, point_parent[ids], len(ids))
-            if (i+1)%100 == 0: print(f'Indexed per-view rows {i+1}/{len(names)}', flush=True)
+            if i == 0 or (i+1)%100 == 0 or i+1 == len(names):
+                print(f'Indexed {i+1}/{len(names)} training views · {name} · {len(ids):,} LiDAR rows', flush=True)
     else:
         dtype = np.dtype([(dim,'<i8') for dim in 'xyz'])
         lookup = np.ascontiguousarray(keys, dtype='<i8').view(dtype).ravel()
@@ -136,15 +155,19 @@ def prepare_membership(out, manifest, cloud, original, names, size, *, mesh_sour
     union = np.bitwise_or.reduce(packed, axis=0)
     if not counts.any():
         raise ValueError('No observations matched any training anchor. Check units, frame associations and scan poses.')
-    report = dict(format=kind, manifest=str(manifest.resolve()), manifest_sha256=digest(manifest),
+    report = dict(format=kind, manifest=str(manifest.resolve()) if manifest else None, manifest_sha256=digest(manifest) if manifest else None,
                   input_data_sha256=raw.hexdigest(), names=names, anchor_count=len(anchors), voxel_size=size,
                   anchor_sha256=anchor_digest(anchors), point_cloud_sha256=digest(cloud),
                   empty_views=int((counts==0).sum()), median_sensed_parents=float(np.median(counts)),
                   ever_sensed_fraction=float(np.unpackbits(union).sum()/len(anchors)),
                   per_view_parents=counts.tolist(), per_view_input_returns=received.tolist())
+    if indexed:
+        report['viewer_ply'] = str(indexed_viewer.ply_path.resolve())
+        report['per_view_source'] = per_view_source
+        report['per_view_indexed_rows'] = report.pop('per_view_input_returns')
     (out/'metadata.json').write_text(json.dumps(report)+'\n')
-    print(f'{kind}: {len(names):,} views, median {report["median_sensed_parents"]:,.0f} sensed parents, '
-          f'{report["empty_views"]} empty views, {report["ever_sensed_fraction"]:.1%} of parents sensed at least once.', flush=True)
+    print(f'{kind}: {len(names):,} views, median {report["median_sensed_parents"]:,.0f} eligible parents, '
+          f'{report["empty_views"]} empty views, {report["ever_sensed_fraction"]:.1%} of parents eligible at least once.', flush=True)
 
 
 class Membership:

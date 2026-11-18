@@ -1,4 +1,20 @@
-# Fixed Scaffold parents with per-view measured updates
+# Fixed Scaffold parents with per-view updates
+
+For the red LiDAR points in the 3D sparse-observation viewer, run:
+
+```bash
+bash scripts/run_orange4f_scaffold.sh 4 indexed
+```
+
+The indexed run takes the viewer's full per-image PLY row list. It uses explicit row indices when present and otherwise the same unique XYZ matches for stored COLMAP tracks. Set `SCAFFOLD_INDEXED_PLY` or `SCAFFOLD_OBSERVATIONS` only if you used the viewer's `--ply` or `--manifest` overrides. The launcher voxelizes the viewed cloud at 2 cm by default and freezes the parent positions and population. For each training image, a parent qualifies if any of its LiDAR rows is red. All normally emitted Gaussians composite the image. Only eligible rendered children contribute gradients to their local parameters and the shared decoders.
+
+The stride-3 run trains for 30,000 iterations with full-resolution RGB and AA off. `observations/metadata.json` records the source, red-row count and eligible-parent count for every training image. The terminal reports updated parents and eligible children. To view train and held-out RGB previews after step 1, run:
+
+```bash
+python scripts/serve_training_previews.py --model "${ORANGE4F_OUTPUT_ROOT:-/data/3dgs_outputs/orange4f/3dgs_finetuning}/stride3_noaa_v1/scaffold_indexed_anchors_v1" --host 0.0.0.0 --port 8096
+```
+
+## Measured-return and mesh variants
 
 Inspect the capture with `python scripts/inspect_lidar_observations.py`. Use `--source /path/to/raw/capture` when the recording lives outside the prepared COLMAP scene. This lists candidate files, PLY properties, NPZ keys and recognized image associations. Acquisition timestamps require a sensor-specific synchronization or explicit image association.
 
