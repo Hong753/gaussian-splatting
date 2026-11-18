@@ -12,6 +12,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts import run_soft_surface_long as periodic
+from scripts.refresh_orange4f_dashboard import refresh
 from scripts.run_occlusion import invoke
 from utils.checkpoint_snapshots import digest
 
@@ -154,6 +155,7 @@ def main(argv=None):
         for name, expected in previous['input_fingerprints'].items():
             if digest(Path(name)) != expected:
                 raise ValueError(f'Prepared Scaffold input changed: {name}')
+        refresh(root, native=(args.model.name, args.gpu))
         print(f'Reusing Scaffold plan: {args.model}', flush=True)
         return 0
     if args.model.exists():
@@ -181,14 +183,7 @@ def main(argv=None):
                 inputs.append(directory/'hit_pixels.npy')
         result = periodic.prepare_experiment(args, plan, 'scaffold', inputs, staged_model=staged)
         staged.rename(args.model)
-    # Keep the original four-run manifest immutable. Add independent dashboard links.
-    from utils.checkpoint_snapshots import atomic_write
-    index = root/'index.html'
-    link = f'{args.model.name}/debug_previews/index.html'
-    content = index.read_text()
-    if link not in content:
-        content += f'<p>GPU {args.gpu}: <a href="{link}">{args.model.name}</a></p>'
-        atomic_write(index, lambda path: path.write_text(content))
+    refresh(root, native=(args.model.name, args.gpu))
     return result
 
 

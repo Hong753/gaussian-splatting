@@ -29,6 +29,8 @@ flock -u 9
 exec 8>"$model.lock"
 flock -n 8 || { echo "Another process is running $model" >&2; exit 1; }
 
+python scripts/refresh_orange4f_dashboard.py --suite "$suite"
+
 # Keep the authors' CUDA rasterizer private. Both renderers have the same Python import name.
 revision="$(python -c 'from scripts.upstream_scaffold import REVISION; print(REVISION)')"
 cache="${SCAFFOLD_UPSTREAM_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/orange4f-scaffold}/$revision"

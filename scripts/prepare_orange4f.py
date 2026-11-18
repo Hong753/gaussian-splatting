@@ -16,6 +16,7 @@ from scripts.view_comparisons import read_colmap_records
 from scripts import run_native_lidar as native, run_soft_surface_long as periodic
 from utils.colmap_paths import colmap_model_dir
 from utils.checkpoint_snapshots import atomic_json, digest
+from scripts.refresh_orange4f_dashboard import refresh
 
 RUNS = ('3dgs', '3dgs_fixed_lidar', 'gsprior', 'gsprior_fixed_lidar')
 DEFAULT_OUTPUT_ROOT = '/data/3dgs_outputs/orange4f/3dgs_finetuning'
@@ -122,6 +123,7 @@ def main(argv=None):
             raise ValueError('TSDF configuration changed; use a new suite version')
         for name, expected in old['input_fingerprints'].items():
             if digest(Path(name)) != expected: raise ValueError(f'Prepared input changed: {name}')
+        refresh(output)
         print(f'Reusing prepared suite: {output}', flush=True); return 0
     if output.exists(): raise FileExistsError(f'Incomplete/existing output: {output}; use a fresh --version')
     records = read_colmap_records(source)
@@ -178,8 +180,7 @@ def main(argv=None):
                  frames=len(records), train_frames=len(selected), heldout_frames=len(records)-len(selected),
                  selection=str(manifest), grid=grid, runs=entries)
     atomic_json(output/'suite.json', suite)
-    links = ''.join(f'<li>GPU {r["gpu"]}: <a href="{r["name"]}/debug_previews/index.html">{r["name"]}</a></li>' for r in entries)
-    (output/'index.html').write_text('<!doctype html><meta charset="utf-8"><h1>orange4f · stride 3 · AA off</h1><ul>'+links+'</ul>')
+    refresh(output)
     print(json.dumps(suite, indent=2), flush=True)
     return 0
 
