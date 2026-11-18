@@ -34,6 +34,7 @@ CENTER = np.array([-4.985959985044178, 1.807263625483172, -1.0653450191492186])
 NORMAL = np.array([-0.009408616379497275, 0.010765564382005217, 0.9998977850567328])
 TOLERANCE = .025
 STEPS = (30000, 50000)
+PROBE_STEPS = (2000,)
 
 
 def read_json(path):
@@ -158,7 +159,7 @@ def same_photo(a, b):
         return first.size == second.size and np.array_equal(first.convert("RGB"), second.convert("RGB"))
 
 
-def training_command(base, output, ratio=None, fixed_scale_ratio=None):
+def training_command(base, output, ratio=None, fixed_scale_ratio=None, *, steps=STEPS):
     """Recreate the actual native model and optimizer settings, including the 30k LR horizon."""
     from arguments import ModelParams, OptimizationParams, PipelineParams
     parser = argparse.ArgumentParser()
@@ -175,7 +176,7 @@ def training_command(base, output, ratio=None, fixed_scale_ratio=None):
         raise ValueError("Expected a native, full-scene RGB keyframe baseline (30k for the adaptive comparison)")
     settings = {**cfg, **opt, "source_path": str(Path(cfg["source_path"]).resolve()),
                 "model_path": str(output), "initial_point_cloud": str(base["path"] / "input.ply"),
-                "keyframe_manifest": str(output / "keyframes.json"), "iterations": STEPS[-1]}
+                "keyframe_manifest": str(output / "keyframes.json"), "iterations": steps[-1]}
     if fixed_scale_ratio is None:
         settings["percent_dense"] = positive(ratio)
     else:
@@ -194,7 +195,7 @@ def training_command(base, output, ratio=None, fixed_scale_ratio=None):
             elif not value:
                 raise ValueError(f"Cannot disable true-by-default option {key}")
     return command + ["--disable_viewer", "--publish_checkpoint_snapshots", "--test_iterations", "-1",
-                      "--save_iterations", *map(str, STEPS), "--checkpoint_iterations", *map(str, STEPS),
+                      "--save_iterations", *map(str, steps), "--checkpoint_iterations", *map(str, steps),
                       "--debug-preview-every", "500", "--debug-preview-train", "2", "--debug-preview-test", "2",
                       "--debug-preview-seed", str(cfg.get("debug_preview_options", {}).get("seed", 0))]
 
@@ -486,6 +487,7 @@ def main(argv=None):
     mode.add_argument("--spacing-only", action="store_true", help="Audit the fixed checkpoint's saved floor crop")
     mode.add_argument("--estimate-fixed-scale", action="store_true", help="Estimate per-anchor sigma from input.ply on CPU")
     mode.add_argument("--train-fixed-scale", action="store_true", help="Train fixed centers with per-anchor KNN scale caps")
+    mode.add_argument("--probe-image", help="Fit one original training image for 2,000 steps with the fixed-center recipe")
     parser.add_argument("--fixed-scale-ratio", type=float, default=2., help="Per-axis sigma ceiling / native 3-NN sigma")
     parser.add_argument("--plan-only", action="store_true", help="Print measured extents and training command without training")
     args = parser.parse_args(argv)
@@ -496,21 +498,37 @@ def main(argv=None):
     if args.spacing_only:
         print(json.dumps(spacing_report(args.fixed_model.resolve()), indent=2))
         return
-    default_model = (f"fixed_lidar_knn{args.fixed_scale_ratio:g}x_50k_v1"
-                     if args.train_fixed_scale else "matched_split_50k_v1")
+    probe = args.probe_image
+    fixed = args.train_fixed_scale or probe is not None
+    steps = PROBE_STEPS if probe is not None else STEPS
+    base = model_info(args.fixed_model if fixed else args.baseline)
+    if probe is not None:
+        if probe not in base["splits"]["train"]:
+            parser.error(f"--probe-image must exactly match a saved training image: {probe!r}")
+        source_image = Path(base["records"][probe]["image_path"])
+        if not source_image.is_file():
+            raise FileNotFoundError(source_image)
+        default_model = f"fixed_lidar_one_view_{Path(probe).stem}_knn{args.fixed_scale_ratio:g}x"
+    elif fixed:
+        default_model = f"fixed_lidar_knn{args.fixed_scale_ratio:g}x_50k_v1"
+    else:
+        default_model = "matched_split_50k_v1"
     output = (args.output or SUITE.parent/default_model).expanduser().resolve()
-    base = model_info(args.fixed_model if args.train_fixed_scale else args.baseline)
     if not (base["path"]/"input.ply").is_file():
         raise FileNotFoundError(base["path"]/"input.ply")
-    name, floor_status = floor_reference(base)
-    print(f"Floor crop {name or FRAME}: {floor_status}.", flush=True)
-    if args.train_fixed_scale:
+    if probe is None:
+        name, floor_status = floor_reference(base)
+        print(f"Floor crop {name or FRAME}: {floor_status}.", flush=True)
+    if fixed:
         ratio = positive(args.fixed_scale_ratio)
         transfer = dict(method=f"Fixed LiDAR, each principal sigma capped at {ratio:g} times its initial 3-NN sigma",
                         label="Fixed cap", max_scale_ratio=ratio, constant_population=True, opacity_resets=False)
         print(f"{transfer['method']}. All input anchors are retained.", flush=True)
-        command = training_command(base, output, fixed_scale_ratio=ratio)
+        command = training_command(base, output, fixed_scale_ratio=ratio, steps=steps)
         plan = dict(fixed_scale_policy=transfer)
+        if probe is not None:
+            print(f"One-view fit of {probe} for {steps[-1]:,} steps using the original image and pose.", flush=True)
+            plan["probe_keyframes"] = {"selected_images": [probe]}
     else:
         choose_iteration(base["path"], STEPS[0])
         region = regional_reference(regional_model(args.regional))
@@ -549,18 +567,27 @@ def main(argv=None):
             atomic_json(protocol, plan)
         manifest = output / "keyframes.json"
         if not manifest.exists():
-            shutil.copyfile(base["path"]/"keyframes.json", manifest)
-        elif digest(manifest) != plan["selected_keyframes_sha256"]:
+            if probe is None:
+                shutil.copyfile(base["path"]/"keyframes.json", manifest)
+            else:
+                atomic_json(manifest, plan["probe_keyframes"])
+        elif (digest(manifest) != plan["selected_keyframes_sha256"] if probe is None
+              else read_json(manifest) != plan["probe_keyframes"]):
             raise ValueError(f"Training manifest changed: {manifest}")
         gpu = select_gpu(args.gpu)
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu
         print(f"Using CUDA device {gpu}.", flush=True)
-        snapshots = [step for step in STEPS if read_snapshot(output,step)]
-        if 50000 not in snapshots:
+        snapshots = [step for step in steps if read_snapshot(output, step)]
+        if steps[-1] not in snapshots:
             if snapshots:
                 command = command + ["--start_checkpoint", str(output/f"chkpnt{max(snapshots)}.pth")]
             print("Training with live GT/render/error previews", flush=True)
             subprocess.run(command, cwd=ROOT, check=True, pass_fds=(lock.fileno(),))
+        if probe is not None:
+            run("scripts/render.py", "--model", output, "--iteration", steps[-1], "--gpu", gpu,
+                "--split", "both", "--eval-set", "unselected", "--max-views", 2, "--output", output/"comparison")
+            print(output/"debug_previews/index.html", flush=True)
+            return
         floor_out = output/"fixed_floor_spacing.json"
         try:
             fixed = args.fixed_model.expanduser().resolve()

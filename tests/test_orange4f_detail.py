@@ -127,6 +127,34 @@ class Orange4FDetailTest(unittest.TestCase):
                     self.assertEqual(render.call_count, 3 if available else 0)
                     self.assertEqual("crop_psnr_db" in report["rows"][0], available)
 
+    def test_one_view_probe_keeps_fixed_geometry_and_limits_supervision(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, fixed = fixture(root)
+            output = root/"probe"
+            image = root/"capture/images/12560.jpg"
+            image.parent.mkdir()
+            image.touch()
+            original_manifest = (fixed/"keyframes.json").read_bytes()
+            args = ["--probe-image", image.name, "--fixed-model", str(fixed), "--output", str(output), "--gpu", "0"]
+            with patch.object(audit.subprocess, "run") as train, patch.object(audit, "run") as compare, \
+                    patch.object(audit, "evaluate", side_effect=AssertionError), patch.dict("os.environ"):
+                audit.main(args)
+            command = train.call_args.args[0]
+            parser = argparse.ArgumentParser()
+            ModelParams(parser)
+            OptimizationParams(parser)
+            PipelineParams(parser)
+            opt, extra = parser.parse_known_args(command[3:])
+            self.assertEqual((opt.iterations, opt.fixed_lidar, opt.max_scale_ratio), (2000, True, 2.))
+            self.assertEqual(opt.densify_until_iter, 0)
+            self.assertEqual(opt.resolution, 1)
+            self.assertEqual(audit.read_json(output/"keyframes.json"), {"selected_images": [image.name]})
+            self.assertEqual(original_manifest, (fixed/"keyframes.json").read_bytes())
+            self.assertEqual(extra[extra.index("--save_iterations")+1], "2000")
+            self.assertEqual(compare.call_args.args[0], "scripts/render.py")
+            self.assertIn("both", compare.call_args.args)
+
     def test_two_checkpoints_keep_original_schedules_and_use_measured_split(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

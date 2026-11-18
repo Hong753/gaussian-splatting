@@ -18,6 +18,17 @@ Running the script without these options runs the adaptive split comparison.
 Both comparisons report the actual split of the saved floor photograph and
 omit its crop if it cannot be identified.
 
+To check whether the fixed-anchor recipe can fit an individual training image
+with repeated supervision, run
+
+```bash
+python -u scripts/orange4f_detail.py --probe-image 09882.jpg
+```
+
+The probe uses the full input cloud, the same scale ceiling, and the original
+camera and training resolution. It fits only the selected image for 2,000
+steps and writes its own `debug_previews/index.html` and final comparison.
+
 ## Camera trajectory and source-image video
 
 From the activated `3dgs` environment, export the full capture to MP4 with
