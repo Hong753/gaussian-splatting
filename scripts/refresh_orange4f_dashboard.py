@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Add upstream Scaffold previews to an existing Orange4F suite homepage."""
+"""Publish Scaffold and one-view training previews on the Orange4F suite homepage."""
 import argparse
 import fcntl
 from html import escape
@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import sys
+from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -59,8 +60,42 @@ def status(model):
     return False, 'No preview saved yet'
 
 
+def preview_row(model, url, states):
+    ready, label = status(model)
+    states[model.name] = label
+    href = f' href="{url}/index.html"' if ready else ''
+    return f'<li data-preview="{url}"><a{href}>{escape(model.name)}</a> · <span>{label}</span></li>'
+
+
+def one_view_section(root, states):
+    rows = []
+    for plan_path in sorted(root.parent.glob('*/detail_plan.json')):
+        try:
+            plan = json.loads(plan_path.read_text())
+        except (OSError, ValueError) as exc:
+            print(f'Skipping unreadable detail plan {plan_path}: {exc}', file=sys.stderr)
+            continue
+        if not plan.get('probe_keyframes') or Path(plan['baseline']).parent.resolve() != root:
+            continue
+        model = plan_path.parent
+        # Only publish the preview tree. The trainer may create or rotate it after registration.
+        alias = root/'one_view'/model.name
+        alias.parent.mkdir(exist_ok=True)
+        preview = model/'debug_previews'
+        try:
+            alias.symlink_to(os.path.relpath(preview, alias.parent), target_is_directory=True)
+        except FileExistsError:
+            if not alias.is_symlink() or alias.resolve() != preview.resolve():
+                print(f'Skipping one-view preview: another entry exists at {alias}', file=sys.stderr)
+                continue
+        rows.append(preview_row(model, 'one_view/' + quote(model.name, safe=''), states))
+    if not rows:
+        return ''
+    return '<h2>One-view training previews</h2><ul>' + ''.join(rows) + '</ul>'
+
+
 def refresh(root, *, native=None, viewer_port=None):
-    root = Path(root)
+    root = Path(root).resolve()
     index = root/'index.html'
     if not (index.is_file() or (root/'suite.json').is_file()):
         raise FileNotFoundError(f'Orange4F suite missing at {root}. Use the directory served on port 8098.')
@@ -104,13 +139,9 @@ def refresh(root, *, native=None, viewer_port=None):
             if UPSTREAM.fullmatch(name):
                 names.add(name)
         states = {}
-        rows = []
-        for name in [*DEFAULTS, *sorted(names - set(DEFAULTS))]:
-            ready, label = status(root/name)
-            states[name] = label
-            url = name + '/debug_previews'
-            href = f' href="{url}/index.html"' if ready else ''
-            rows.append(f'<li data-preview="{url}"><a{href}>{name}</a> · <span>{label}</span></li>')
+        rows = [preview_row(root/name, name + '/debug_previews', states)
+                for name in [*DEFAULTS, *sorted(names - set(DEFAULTS))]]
+        probes = one_view_section(root, states)
         previous_port = re.search(r'<a data-scaffold-viewer-port="(\d+)">', old)
         port = viewer_port
         if port is None and previous_port:
@@ -120,7 +151,7 @@ def refresh(root, *, native=None, viewer_port=None):
             if not 1 <= port <= 65535:
                 raise ValueError('Invalid Scaffold viewer port')
             viewer = f'<p><a data-scaffold-viewer-port="{port}">Open Scaffold 3D viewer</a></p>'
-        content = before + BEGIN + viewer + '<h2>Upstream Scaffold-GS</h2><ul>' + ''.join(rows) + '</ul>' + POLL + END + after
+        content = before + BEGIN + viewer + probes + '<h2>Upstream Scaffold-GS</h2><ul>' + ''.join(rows) + '</ul>' + POLL + END + after
         if content != old:
             atomic_write(index, lambda path: path.write_text(content))
     return states

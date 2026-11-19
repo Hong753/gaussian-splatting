@@ -130,9 +130,11 @@ class Orange4FDetailTest(unittest.TestCase):
     def test_one_view_probe_keeps_fixed_geometry_and_limits_supervision(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            _, _, fixed = fixture(root)
+            suite = root/"suite"
+            _, _, fixed = fixture(suite)
+            (suite/"index.html").write_text("<h1>Orange4F</h1>")
             output = root/"probe"
-            image = root/"capture/images/12560.jpg"
+            image = suite/"capture/images/12560.jpg"
             image.parent.mkdir()
             image.touch()
             original_manifest = (fixed/"keyframes.json").read_bytes()
@@ -140,6 +142,8 @@ class Orange4FDetailTest(unittest.TestCase):
             with patch.object(audit.subprocess, "run") as train, patch.object(audit, "run") as compare, \
                     patch.object(audit, "evaluate", side_effect=AssertionError), patch.dict("os.environ"):
                 audit.main(args)
+            self.assertEqual((suite/"one_view/probe").resolve(), output/"debug_previews")
+            self.assertIn('data-preview="one_view/probe"', (suite/"index.html").read_text())
             command = train.call_args.args[0]
             parser = argparse.ArgumentParser()
             ModelParams(parser)

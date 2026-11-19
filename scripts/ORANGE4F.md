@@ -53,6 +53,11 @@ python -u scripts/orange4f_detail.py --probe-image 09882.jpg
 The probe uses the full input cloud, the same scale ceiling, and the original
 camera and training resolution. It fits only the selected image for 2,000
 steps and writes its own `debug_previews/index.html` and final comparison.
+On the port 8098 suite dashboard, open **One-view training previews** after the
+first snapshot. For an already running or completed probe, run
+`python scripts/refresh_orange4f_dashboard.py` once and reload the dashboard.
+The default probe page is `/one_view/fixed_lidar_one_view_09882_knn2x/index.html`
+on that same server.
 
 ## PGSR with a fixed LiDAR warmup
 

@@ -4,6 +4,32 @@ from concurrent.futures import ThreadPoolExecutor
 from scripts.refresh_orange4f_dashboard import DEFAULTS, refresh
 
 
+def test_existing_one_view_run_becomes_browsable_through_suite(tmp_path):
+    suite = tmp_path/'stride3_noaa_v1'
+    suite.mkdir()
+    (suite/'index.html').write_text('<html><body>Training</body></html>')
+    model = tmp_path/'fixed_lidar_one_view_09882_knn2x'
+    model.mkdir()
+    plan = dict(baseline=str(suite/'3dgs_fixed_lidar'), probe_keyframes={'selected_images': ['09882.jpg']})
+    (model/'detail_plan.json').write_text(json.dumps(plan))
+    other = tmp_path/'other_probe'
+    other.mkdir()
+    (other/'detail_plan.json').write_text(json.dumps(dict(plan, baseline=str(tmp_path/'other_suite/fixed'))))
+    url = 'one_view/' + model.name
+    assert refresh(suite)[model.name] == 'No preview saved yet'
+    assert not (suite/'one_view'/other.name).exists()
+    assert f'data-preview="{url}"' in (suite/'index.html').read_text()
+    preview = model/'debug_previews'
+    preview.mkdir()
+    (preview/'index.html').write_text('live')
+    (preview/'latest.json').write_text('{"iteration":500}')
+    assert (suite/url/'index.html').read_text() == 'live'
+    assert (suite/url/'latest.json').samefile(preview/'latest.json')
+    assert not (suite/url/'detail_plan.json').exists()
+    assert refresh(suite)[model.name] == 'Latest preview at step 500'
+    assert (suite/'index.html').read_text().count(f'href="{url}/index.html"') == 1
+
+
 def test_repair_existing_live_suite_without_touching_models(tmp_path):
     index = tmp_path/'index.html'
     original = '<html><body><p>GPU 0: <a href="scaffold_indexed_anchors_v1/debug_previews/index.html">indexed</a></p>'

@@ -574,6 +574,16 @@ def main(argv=None):
         elif (digest(manifest) != plan["selected_keyframes_sha256"] if probe is None
               else read_json(manifest) != plan["probe_keyframes"]):
             raise ValueError(f"Training manifest changed: {manifest}")
+        if probe is not None:
+            suite = base["path"].parent
+            if output.parent == suite.parent and ((suite/"suite.json").is_file() or (suite/"index.html").is_file()):
+                from scripts.refresh_orange4f_dashboard import refresh
+                try:
+                    if output.name in refresh(suite):
+                        print(f"One-view previews on the suite dashboard: {suite/'one_view'/output.name/'index.html'}",
+                              flush=True)
+                except (OSError, ValueError) as exc:
+                    print(f"Could not update the preview dashboard: {exc}", flush=True)
         gpu = select_gpu(args.gpu)
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu
         print(f"Using CUDA device {gpu}.", flush=True)
