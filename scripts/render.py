@@ -52,6 +52,7 @@ def main(argv=None):
     parser.add_argument("--iteration", type=int, default=-1, help="-1: latest common saved iteration")
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--frames", nargs="+", help="Limit comparison to these exact registered image names")
     parser.add_argument("--max-views", type=int, default=0, help="0: all views; otherwise evenly spaced")
     parser.add_argument('--eval-set', choices=('saved', 'unselected'), default='saved',
                         help='unselected: preview frames outside the training manifest, including when --eval was disabled')
@@ -94,15 +95,25 @@ def main(argv=None):
             labels = [str(p) for p in paths]
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=args.gpu)
         completed = []
-        for split_name in (["train", "eval"] if mode == "both" else [mode]):
+        split_names = ["train", "eval"] if mode == "both" else [mode]
+        if args.frames:
+            eligible = set().union(*(set.intersection(*(s["splits"][n] for s in specs)) for n in split_names))
+            missing = set(args.frames) - eligible
+            if missing:
+                raise ValueError(f"Requested frames outside the shared {mode} split: {sorted(missing)}")
+        for split_name in split_names:
             sets = [s["splits"][split_name] for s in specs]
             names = sorted(set.intersection(*sets))
+            total = len(names)
+            if args.frames:
+                names = [name for name in names if name in args.frames]
+                if not names:
+                    continue
             if not names:
                 if mode == "both" and split_name == "eval" and all(not s for s in sets):
                     print("No held-out eval views in these runs; train report only.")
                     continue
                 raise ValueError(f"No shared {split_name} views in the supplied models")
-            total = len(names)
             if args.max_views and len(names) > args.max_views:
                 names = [names[round(i * (len(names)-1) / max(1, args.max_views-1))]
                          for i in range(args.max_views)]

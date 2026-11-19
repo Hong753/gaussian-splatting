@@ -41,6 +41,26 @@ floor band (red). The measurements use front-to-back compositing weights and
 the mutually LiDAR-supported pixels in the two photos. The results apply to
 this floor patch and these checkpoints.
 
+## Test floor weighting in one view
+
+Run `python -u scripts/orange4f_one_view_weight.py` from the `3dgs` environment.
+Use `--gpu 6` for a specific GPU. This runs two fresh adaptive fits sequentially on
+`09882.jpg`, each for 2,000 steps from the same LiDAR cloud and seed with the
+full stride-3 scene extent. The full photograph retains RGB supervision.
+In the weighted arm the floor pixels used in the footprint audit receive extra
+L1 weight. For a pixel covering area A on the LiDAR plane the weight is
+`1 + min(1, A10 / A)`, where A10 is the 10th percentile on the supported patch.
+All other pixels have weight 1. The weights are normalized to mean 1 over the image.
+Both arms use the same SSIM loss. The weight map uses LiDAR geometry and camera
+calibration. The neighbor's colors are used only to score its render.
+
+Open `one_view_floor_weight_v1/index.html` on the stride-3 dashboard for live
+previews, matched training crops and the final transfer check on `09884.jpg`.
+The report includes the actual weight range, so nearly constant floor weights
+can be interpreted as extra emphasis on the patch. This tests within-photo
+weighting. Comparing close and distant observations of the same patch requires
+a multi-view run.
+
 ## Fixed-LiDAR scale
 
 Run `python -u scripts/orange4f_detail.py --estimate-fixed-scale` to print the

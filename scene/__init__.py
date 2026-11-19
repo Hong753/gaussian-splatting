@@ -11,6 +11,7 @@
 
 import os
 import random
+import math
 import json
 import shutil
 from utils.system_utils import searchForMaxIteration
@@ -80,7 +81,10 @@ class Scene:
             random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
             random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 
-        self.cameras_extent = scene_info.nerf_normalization["radius"]
+        extent = getattr(args, "training_scene_extent", 0.)
+        if not math.isfinite(extent) or extent < 0:
+            raise ValueError("training_scene_extent must be finite and nonnegative")
+        self.cameras_extent = extent or scene_info.nerf_normalization["radius"]
 
         for resolution_scale in resolution_scales:
             print("Loading Training Cameras")

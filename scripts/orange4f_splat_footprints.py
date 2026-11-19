@@ -209,6 +209,18 @@ def summarize(weights, minor, major, depth, offset, diameter, pixels):
     return dict(row, verdict=verdict)
 
 
+def validate_audit_camera(record, name, patch):
+    view, cam = patch["view"], patch["cam"]
+    if (
+        Path(record["image_path"]).resolve() != patch["path"]
+        or (record["width"], record["height"]) != (cam.width, cam.height)
+        or not np.allclose([record[k] for k in ("fx", "fy", "cx", "cy")], cam.params, rtol=0, atol=1e-6)
+        or not np.allclose(record["R"], view.R.T, rtol=0, atol=1e-6)
+        or not np.allclose(record["T"], -view.R @ view.C, rtol=0, atol=1e-6)
+    ):
+        raise ValueError(f"Model camera or image differs from the original {name}")
+
+
 def run_model(spec, step, data, plane, output):
     import torch
     from gaussian_renderer import render
@@ -237,14 +249,7 @@ def run_model(spec, step, data, plane, output):
     for name, patch in data.items():
         record = spec["records"][name]
         view, cam = patch["view"], patch["cam"]
-        if (
-            Path(record["image_path"]).resolve() != patch["path"]
-            or (record["width"], record["height"]) != (cam.width, cam.height)
-            or not np.allclose([record[k] for k in ("fx", "fy", "cx", "cy")], cam.params, rtol=0, atol=1e-6)
-            or not np.allclose(record["R"], view.R.T, rtol=0, atol=1e-6)
-            or not np.allclose(record["T"], -view.R @ view.C, rtol=0, atol=1e-6)
-        ):
-            raise ValueError(f"Model camera or image differs from the original {name}")
+        validate_audit_camera(record, name, patch)
         camera = load_record_camera(args, record, 0)
         rect, mask = patch["rect"], patch["mask"]
         x, y, w, h = rect

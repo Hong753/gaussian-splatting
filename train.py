@@ -136,6 +136,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
+    rgb_weights = {}
+    if getattr(opt, "rgb_loss_weight_dir", ""):
+        from utils.region_loss import load_rgb_weight
+        if dataset.loss_mask_dir:
+            raise ValueError("Choose either a regional mask or full-image RGB weights")
+        for camera in scene.getTrainCameras():
+            rgb_weights[camera.image_name] = load_rgb_weight(opt.rgb_loss_weight_dir, camera)
     prepare_training_geometry(dataset, scene.getTrainCameras())
     configure_pipeline(pipe, dataset)
     evaluation_pipe = inference_pipeline(pipe, dataset)
@@ -346,12 +353,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if getattr(viewpoint_cam, 'loss_mask', None) is not None:
             from utils.region_loss import photometric_terms
             Ll1, ssim_value = photometric_terms(image, gt_image, viewpoint_cam.loss_mask)
-        elif FUSED_SSIM_AVAILABLE:
-            Ll1 = l1_loss(image, gt_image)
-            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         else:
-            Ll1 = l1_loss(image, gt_image)
-            ssim_value = ssim(image, gt_image)
+            if rgb_weights:
+                from utils.region_loss import weighted_l1
+                Ll1 = weighted_l1(image, gt_image, rgb_weights[viewpoint_cam.image_name])
+            else:
+                Ll1 = l1_loss(image, gt_image)
+            ssim_value = (fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+                          if FUSED_SSIM_AVAILABLE else ssim(image, gt_image))
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 

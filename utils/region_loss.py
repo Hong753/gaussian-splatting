@@ -64,3 +64,23 @@ def display(image, mask):
     if mask is None:
         return image
     return image * (.2 + .8*mask.to(device=image.device, dtype=image.dtype))
+
+
+
+def load_rgb_weight(directory, camera):
+    """A native-resolution 8-bit map encodes 1x (black) to 2x (white) RGB supervision."""
+    import numpy as np
+    from PIL import Image
+    import torch
+    path = mask_path(directory, camera.image_name)
+    with Image.open(path) as image:
+        if image.mode != "L" or image.size != (camera.image_width, camera.image_height):
+            raise ValueError(f"Expected a native-resolution grayscale loss weight map at {path}")
+        array = np.asarray(image).copy()
+    weights = 1 + torch.from_numpy(array).float() / 255.
+    return weights / weights.mean()
+
+
+def weighted_l1(image, target, normalized_weight):
+    """Use the whole image and preserve the mean scale of the usual RGB loss."""
+    return ((image - target).abs() * normalized_weight.to(image.device)).mean()

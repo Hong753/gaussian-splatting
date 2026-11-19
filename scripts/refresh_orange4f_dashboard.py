@@ -159,6 +159,9 @@ def refresh(root, *, native=None, viewer_port=None):
         footprint = 'floor_splat_audit_v1/index.html'
         if (root/footprint).is_file():
             floor_link += f'<p><a href="{footprint}">3DGS floor footprint audit</a></p>'
+        weighted_probe = 'one_view_floor_weight_v1/index.html'
+        if (root/weighted_probe).is_file():
+            floor_link += f'<p><a href="{weighted_probe}">One-view floor weighting · 09882.jpg</a></p>'
         content = before + BEGIN + viewer + probes + floor_link + '<h2>Upstream Scaffold-GS</h2><ul>' + ''.join(rows) + '</ul>' + POLL + END + after
         if content != old:
             atomic_write(index, lambda path: path.write_text(content))
