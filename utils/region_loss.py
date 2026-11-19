@@ -5,6 +5,8 @@ rasterizer. SSIM windows must fit inside the mask, preventing outside-image
 supervision from leaking across the selected region boundary.
 """
 import hashlib
+import json
+import math
 from pathlib import Path
 
 
@@ -84,3 +86,14 @@ def load_rgb_weight(directory, camera):
 def weighted_l1(image, target, normalized_weight):
     """Use the whole image and preserve the mean scale of the usual RGB loss."""
     return ((image - target).abs() * normalized_weight.to(image.device)).mean()
+
+
+
+def load_view_weights(path, names):
+    """Load scalars for the complete training split without per-view renormalization."""
+    weights = json.loads(Path(path).read_text())
+    if not isinstance(weights, dict) or set(weights) != set(names):
+        raise ValueError("View loss weights must name every training image exactly once and exclude held-out views")
+    if not all(type(v) in (float, int) and math.isfinite(v) and v > 0 for v in weights.values()):
+        raise ValueError("View loss weights must be finite positive numbers")
+    return weights

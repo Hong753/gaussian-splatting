@@ -143,6 +143,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             raise ValueError("Choose either a regional mask or full-image RGB weights")
         for camera in scene.getTrainCameras():
             rgb_weights[camera.image_name] = load_rgb_weight(opt.rgb_loss_weight_dir, camera)
+    view_weights = {}
+    if getattr(opt, "view_loss_weights", ""):
+        from utils.region_loss import load_view_weights
+        view_weights = load_view_weights(opt.view_loss_weights, [c.image_name for c in scene.getTrainCameras()])
     prepare_training_geometry(dataset, scene.getTrainCameras())
     configure_pipeline(pipe, dataset)
     evaluation_pipe = inference_pipeline(pipe, dataset)
@@ -363,6 +367,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                           if FUSED_SSIM_AVAILABLE else ssim(image, gt_image))
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+
+        if view_weights:
+            loss = loss * view_weights[viewpoint_cam.image_name]
 
         # Depth regularization
         Ll1depth_pure = 0.0

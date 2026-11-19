@@ -82,6 +82,12 @@ def create_previewer(scene, dataset, config, *, start_iteration=0, subdirectory=
         records = read_colmap_records(dataset.source_path, dataset.images or 'images')
         test_names = set(records) - set(train)
         protocol = 'All registered COLMAP frames not selected for training (keyframe complement)'
+        preview_names = json.loads(Path(dataset.keyframe_manifest).read_text()).get('preview_heldout_images')
+        if preview_names is not None:
+            if not preview_names or len(set(preview_names)) != len(preview_names) or not set(preview_names) <= test_names:
+                raise ValueError('preview_heldout_images must be distinct registered images outside the training split')
+            test_names = set(preview_names)
+            protocol = 'Held-out preview frames listed in the keyframe manifest'
     else:
         test_names = set(test)
     selected = select_names(train, test_names, config)

@@ -41,7 +41,25 @@ floor band (red). The measurements use front-to-back compositing weights and
 the mutually LiDAR-supported pixels in the two photos. The results apply to
 this floor patch and these checkpoints.
 
-## Test floor weighting in one view
+## Compare uniform and distance-weighted multiview floor training
+
+Run `python -u scripts/orange4f_multiview_floor_distance.py` in the `3dgs`
+environment. This fits two adaptive 3DGS models with identical original
+cameras, initialization, crop masks, and numbers of visits per camera. Both
+use only the LiDAR-supported part of the `09882.jpg` floor patch that the
+selected views share. The launcher targets four training cameras with a range
+of distances and reserves `09884.jpg` for evaluation. Each run uses 2,000
+steps per selected training view. Use `--gpu 6` to choose a GPU or
+`--prepare-only` to inspect the view selection on CPU.
+
+The uniform run gives each camera's mean RGB loss equal weight. The distance
+run multiplies that same loss, including L1 and SSIM, by inverse-squared distance
+to the center of the common floor patch, normalized to a mean of one over the
+training cameras. Open `multiview_floor_distance_v1/index.html` on the suite
+dashboard for the distances, weights, live previews, and final side-by-side
+crops. The page puts the reference and held-out photos first.
+
+## Single-photo control
 
 Run `python -u scripts/orange4f_one_view_weight.py` from the `3dgs` environment.
 Use `--gpu 6` for a specific GPU. This runs two fresh adaptive fits sequentially on
