@@ -81,20 +81,22 @@ def candidate_pairs(images, spatial_neighbors=6, temporal_neighbors=2):
     return sorted(pairs)
 
 
-def match_pair(a, b, image_a, image_b, args, stats=None):
-    if stats is not None:
-        stats["mutual"] = 0
-    if min(len(a["uv"]), len(b["uv"])) < 2:
+def mutual_descriptor_matches(a, b, ratio):
+    if min(len(a), len(b)) < 2:
         return np.empty((0, 2), dtype=int)
     matcher = cv2.FlannBasedMatcher(dict(algorithm=1, trees=4), dict(checks=64))
 
     def ratio_matches(x, y):
         return {m.queryIdx: m.trainIdx for pair in matcher.knnMatch(x, y, k=2)
-                if len(pair) == 2 for m, n in [pair] if m.distance < args.ratio * n.distance}
+                if len(pair) == 2 for m, n in [pair] if m.distance < ratio * n.distance}
 
-    ab = ratio_matches(a["descriptors"], b["descriptors"])
-    ba = ratio_matches(b["descriptors"], a["descriptors"])
-    matches = np.array([(i, j) for i, j in ab.items() if ba.get(j) == i], dtype=int).reshape(-1, 2)
+    ab = ratio_matches(a, b)
+    ba = ratio_matches(b, a)
+    return np.array([(i, j) for i, j in ab.items() if ba.get(j) == i], dtype=int).reshape(-1, 2)
+
+
+def match_pair(a, b, image_a, image_b, args, stats=None):
+    matches = mutual_descriptor_matches(a["descriptors"], b["descriptors"], args.ratio)
     if stats is not None:
         stats["mutual"] = len(matches)
     if args.image_first:

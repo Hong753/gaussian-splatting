@@ -62,8 +62,18 @@ on that same server.
 To compare the real speckled floor in `09882.jpg` with nearby original training
 photos, run `python -u scripts/orange4f_floor_neighbors.py` on the Orange4F host.
 The CPU test uses the suite's original poses, intrinsics and cloud. Open
-`/floor_neighbors_09882_v1/index.html` on port 8098. Clicking a crop opens its
+`/floor_neighbors_09882_v2/index.html` on port 8098. Clicking a crop opens its
 native pixels. The JSON includes all examined neighbors and their rejection reasons.
+
+The plane fit uses the nearest return per occupied 4 px reference cell, with
+free orientation in the saved coordinate system. The report overlays the
+accepted and rejected frontmost samples and lists their camera depths. A plane
+needs agreement with 60% of those samples and support in 12 of 16 crop regions.
+If fewer than three views yield LiDAR-warp measurements, the report also checks
+RGB repeatability. It fits a homography to half the mutual descriptor matches in
+each quadrant and scores separate matches in reference pixels. The original-pose
+epipolar error on these matches measures cross-line disagreement. A successful
+RGB warp alone leaves the LiDAR depth and absolute alignment undetermined.
 
 The test examines stride-3 training cameras within 48 registered frames on either
 side, closest camera centers first. It checks crop overlap and similar sampling

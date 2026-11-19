@@ -24,6 +24,7 @@ CELL = 8
 TOLERANCE = .025
 WINDOW = 48  # Registered images in natural filename order, on either side.
 MAX_VIEWS = 6
+REPORT_DIR = "floor_neighbors_09882_v2"
 
 
 def candidates(images, cams, ref_index, selected, world):
@@ -158,20 +159,75 @@ def analyze(suite, output):
     report = dict(reference=REFERENCE, roi_xywh=roi, source=str(source), cloud=str(cloud),
                   keyframes=meta["selection"], search_radius_px=SEARCH, frame_window=WINDOW,
                   visibility_cell_px=CELL, max_sharp_neighbors=MAX_VIEWS, views=rows)
-    print(f"Fitting the floor in {REFERENCE} from {cloud}", flush=True)
-    points = floor_points(cloud, ref, cam, roi, (.05, np.inf))
+    report = compare_lidar(report, cloud, source, folder, images, cameras, ref_index, selected, roi, rgb, gray, output)
+    if sum("p90_px" in row for row in rows) < 3:
+        from scripts.floor_photo_matches import photo_check
+        print(f"{report['verdict']} Checking real photo matches independently of LiDAR.", flush=True)
+        report["photo_check"] = photo_check(source, folder, images, cameras, ref_index, selected, roi, gray,
+                                           WINDOW, MAX_VIEWS, output)
+    return report
+
+
+def fit_visible_patch(points, ref, cam, roi, rgb, output):
+    # Give each small patch of image comparable weight; points behind the nearest
+    # return in that cell cannot establish the visible floor's orientation.
+    uv, depth = project(points, ref.R, ref.C, cam.params)
+    xy = uv - .5 - roi[:2]
+    cells = np.floor(xy/4).astype(int)
+    keys = cells[:, 1] * ((roi[2]+3)//4) + cells[:, 0]
+    order = np.lexsort((depth, keys))
+    _, first = np.unique(keys[order], return_index=True)
+    ids = order[first]
+    stats = dict(projected_returns=len(points), front_cells=len(ids), tolerance_m=TOLERANCE)
+    overlay = rgb.copy()
+    pixels = np.rint(xy[ids]).astype(int)
+    for px, py in pixels:
+        cv2.circle(overlay, (int(px), int(py)), 1, (0, 155, 255), -1)
+    stats["overlay"] = save_image(output, "plane_support.png", overlay)
+    if not len(ids):
+        return None, stats, "No LiDAR returns project into the reference crop."
+    stats["front_depth_p10_p50_p90"] = np.percentile(depth[ids], [10,50,90]).tolist()
+    if len(ids) < 30:
+        return None, stats, "Fewer than 30 frontmost LiDAR cells cover the crop."
+    front = points[ids]
     try:
-        center, normal, inliers = fit_plane(points, TOLERANCE, np.array([0., 0., 1.]))
+        center, normal, _ = fit_plane(front, TOLERANCE)
         world = plane_grid(ref, cam, roi, center, normal)
-    except ValueError as exc:
-        return dict(report, verdict=f"Inconclusive. {exc}")
-    uv, _ = project(inliers, ref.R, ref.C, cam.params)
-    cells = np.floor((uv - .5 - [x,y]) / roi[2:] * 4).astype(int).clip(0, 3)
-    cover = len(np.unique(cells, axis=0))
-    report["plane"] = dict(center=center.tolist(), normal=normal.tolist(), inliers=len(inliers),
-                           covered_cells=cover, tolerance_m=TOLERANCE)
-    if cover < 12:
-        return dict(report, verdict=f"Inconclusive. The floor plane has support in {cover}/16 crop cells.")
+    except ValueError:
+        return None, stats, "The frontmost returns do not define a supported plane in front of the camera across this crop."
+    # Check observed camera depths as well as perpendicular plane distance. A
+    # nearly edge-on plane can have small normal errors even at wildly different depths.
+    rays = (front - ref.C) / depth[ids, None]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        predicted_depth = ((center-ref.C) @ normal) / (rays @ normal)
+    keep = ((np.abs((front-center) @ normal) <= TOLERANCE)
+            & (np.abs(predicted_depth-depth[ids]) <= np.maximum(.06, .03*depth[ids])))
+    quadrants = np.floor(xy[ids][keep]/roi[2:]*4).astype(int).clip(0, 3)
+    cover = len(np.unique(quadrants, axis=0))
+    stats.update(center=center.tolist(), normal=normal.tolist(), inliers=int(keep.sum()),
+                 fraction=float(keep.mean()), covered_cells=cover)
+    for px, py in pixels[keep]:
+        cv2.circle(overlay, (int(px), int(py)), 1, (0, 255, 0), -1)
+    save_image(output, stats["overlay"], overlay)
+    if keep.sum() < 30 or keep.mean() < .6 or cover < 12:
+        return None, stats, (f"The fitted plane agrees with {keep.sum()}/{len(ids)} frontmost cells "
+                             f"and covers {cover}/16 crop regions.")
+    return (center, normal, world), stats, None
+
+
+def compare_lidar(report, cloud, source, folder, images, cameras, ref_index, selected, roi, rgb, gray, output):
+    ref = images[ref_index]
+    cam = cameras[ref.camera_id]
+    rows = report["views"]
+    print(f"Fitting the visible floor in {REFERENCE} from {cloud}", flush=True)
+    points = floor_points(cloud, ref, cam, roi, (.05, np.inf))
+    fit, stats, reason = fit_visible_patch(points, ref, cam, roi, rgb, output)
+    report["plane"] = stats
+    print(f"{stats['projected_returns']} projected returns, {stats['front_cells']} frontmost cells, "
+          f"{stats.get('inliers', 0)} accepted plane samples.", flush=True)
+    if fit is None:
+        return dict(report, verdict=f"Inconclusive. {reason}")
+    center, normal, world = fit
     try:
         features = roi_features(gray, SEARCH)
     except ValueError:
@@ -232,11 +288,36 @@ def write_report(output, report):
         panels = "".join(f'<figure><figcaption>{label}</figcaption><a href="{file}"><img src="{file}"></a></figure>'
                          for label, file in pictures.items())
         sections.append(f"<section><h2>{title}</h2><p>{detail}</p><div>{panels}</div></section>")
+    plane = report["plane"]
+    depth = plane.get("front_depth_p10_p50_p90", [])
+    depth_text = ", ".join(f"{z:.2f}" for z in depth)
+    sections.insert(0, f"<h2>Reference LiDAR support</h2><p>{plane['projected_returns']} projected returns · "
+                    f"{plane['front_cells']} occupied 4 px cells · {plane.get('inliers', 0)} accepted plane samples. "
+                    + (f"Camera depth p10, median and p90 in scene units are {depth_text}. " if depth else "")
+                    + 'Green marks plane support. Orange marks other frontmost returns.</p>'
+                    + '<a href="plane_support.png"><img style="max-width:650px" src="plane_support.png"></a>')
+    if "photo_check" in report:
+        photo = report["photo_check"]
+        sections.append(f"<h2>Independent RGB check</h2><p>{escape(photo['verdict'])}</p>"
+                        f"<p>{photo['reference_features']} distinct reference features. The photo warp is fitted "
+                        "from RGB matches and scored on separate matches. The original-pose epipolar error "
+                        "measures only the component perpendicular to the corresponding line.</p>")
+        for row in photo["views"]:
+            text = f"{row['matches']} mutual matches · {row['status']}"
+            if "photo_p90_px" in row:
+                text += f" · {row['check_matches']} check matches · photo warp p90 {row['photo_p90_px']:.2f} px"
+            if "epipolar_median_px" in row:
+                text += f" · original-pose epipolar median {row['epipolar_median_px']:.2f} px"
+            sections.append(f"<h3>{escape(row['name'])}</h3><p>{text}</p>")
+            if "overlay" in row:
+                sections.append(f'<a href="{row["overlay"]}">Photo warp overlay</a>')
+    headline = report.get("photo_check", report)["verdict"]
+    lidar_result = f'<p>LiDAR warp · {escape(report["verdict"])}</p>' if "photo_check" in report else ''
     (output/"index.html").write_text('<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
         '<title>Orange4F floor alignment</title><style>body{font:16px system-ui;margin:2vw;background:#18212b;color:#eef}'
         'a{color:#ade}div{display:flex;flex-wrap:wrap;gap:8px}figure{margin:0;width:min(420px,95vw)}img{width:100%}</style>'
-        f'<h1>Nearby floor photos · {REFERENCE}</h1><h2>{escape(report["verdict"])}</h2>'
-        '<p>Click a crop for native pixels. Black in the overlay marks missing LiDAR support or a possible foreground surface in either view. '
+        f'<h1>Nearby floor photos · {REFERENCE}</h1><h2>{escape(headline)}</h2>{lidar_result}'
+        '<p>Click a crop for native pixels. Black in the LiDAR warp overlay marks missing support or a possible foreground surface in either view. '
         'Occluders absent from LiDAR may still pass. Shifts are measured in native reference pixels.</p>'
         '<a href="reference.png">Reference crop</a> · <a href="report.json">Measurements</a>' + ''.join(sections))
 
@@ -248,10 +329,13 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, help="Use a fresh directory to repeat the test")
     args = parser.parse_args(argv)
     suite = args.suite.expanduser().resolve()
-    output = (args.output or suite/"floor_neighbors_09882_v1").expanduser().resolve()
+    output = (args.output or suite/REPORT_DIR).expanduser().resolve()
     if (output/"index.html").is_file() and (output/"report.json").is_file():
         print(f"Existing report: {output/'index.html'}")
-        print(json.loads((output/"report.json").read_text())["verdict"])
+        report = json.loads((output/"report.json").read_text())
+        print(report["verdict"])
+        if "photo_check" in report:
+            print(report["photo_check"]["verdict"])
         return
     if output.exists():
         parser.error(f"Output already exists. Use --output with a new directory: {output}")
@@ -264,13 +348,15 @@ def main(argv=None):
         report = analyze(suite, stage)
         write_report(stage, report)
         stage.rename(output)
-    if output == suite/"floor_neighbors_09882_v1":
+    if output == suite/REPORT_DIR:
         from scripts.refresh_orange4f_dashboard import refresh
         try:
             refresh(suite)
         except (OSError, ValueError) as exc:
             print(f"Could not add the dashboard link: {exc}. Use the report path below.")
     print(report["verdict"])
+    if "photo_check" in report:
+        print(report["photo_check"]["verdict"])
     print(f"Open {output/'index.html'}", flush=True)
 
 
