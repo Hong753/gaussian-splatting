@@ -23,9 +23,13 @@ def solve_bundle(images, features, tracks, args):
     camera, landmark, observed, heldout = observation_arrays(tracks, features)
     R0, C0 = np.array([im.R for im in images]), np.array([im.C for im in images])
     K = np.array([f["K"] for f in features])
-    anchors, normals, X0 = [], [], []
+    anchors, normals, X0, map_ids = [], [], [], []
     for k, track in enumerate(tracks):
         # Do not initialize landmarks or their priors using the withheld pixel.
+        if "triangulated_xyz" in track:
+            X0.append(track["triangulated_xyz"])
+            continue
+        map_ids.append(k)
         if "lidar_observation" in track:
             i, feature = track["lidar_observation"]
             anchor = features[i]["xyz"][feature]
@@ -42,7 +46,8 @@ def solve_bundle(images, features, tracks, args):
         anchors.append(anchor)
         normals.append(normal)
         X0.append(center)
-    anchors, normals, X0 = np.array(anchors), np.array(normals), np.array(X0)
+    map_ids = np.array(map_ids, dtype=int)
+    anchors, normals, X0 = np.array(anchors).reshape(-1, 3), np.array(normals).reshape(-1, 3), np.array(X0)
     counts = np.bincount(camera[~heldout], minlength=len(images))
     active = np.flatnonzero(counts >= args.min_observations)
     if not len(active):
@@ -73,9 +78,9 @@ def solve_bundle(images, features, tracks, args):
         def residual(x):
             R, C, X = unpack(x)
             reprojection = (predictions(R, C, X)[~heldout] - observed[~heldout]).ravel() / args.pixel_sigma
-            plane = np.sum((X - anchors) * normals, axis=1) / args.surface_sigma
+            plane = np.sum((X[map_ids] - anchors) * normals, axis=1) / args.surface_sigma
             # Weak finite support of local plane patches prevents sliding by a tile.
-            support = ((X - X0) / args.landmark_sigma).ravel()
+            support = ((X[map_ids] - X0[map_ids]) / args.landmark_sigma).ravel()
             prior = np.empty(0)
             if ncam:
                 delta = x[:offset].reshape(-1, 6)
@@ -94,17 +99,18 @@ def solve_bundle(images, features, tracks, args):
             if ncam and index >= 0:
                 block([2 * row, 2 * row + 1], 6 * index + np.arange(6))
         base = 2 * len(train_indices)
-        for k in range(len(tracks)):
-            block([base + k], offset + 3 * k + np.arange(3))
+        for row, k in enumerate(map_ids):
+            block([base + row], offset + 3 * k + np.arange(3))
             for axis in range(3):
-                block([base + len(tracks) + 3 * k + axis], [offset + 3 * k + axis])
-        base += len(tracks) * 4
+                block([base + len(map_ids) + 3 * row + axis], [offset + 3 * k + axis])
+        base += len(map_ids) * 4
         if ncam:
             rows.extend(base + np.arange(offset))
             cols.extend(np.arange(offset))
         sparsity = coo_matrix((np.ones(len(rows)), (rows, cols)), shape=(base + offset, nvar)).tocsr()
         x = np.concatenate((np.zeros(offset), (Xstart - X0).ravel()))
-        bounds = np.full(nvar, args.max_landmark_shift / np.sqrt(3))
+        bounds = np.full(nvar, np.inf)
+        bounds[offset:].reshape(-1, 3)[map_ids] = args.max_landmark_shift / np.sqrt(3)
         if ncam:
             bounds[:offset] = np.tile([np.deg2rad(args.max_rotation_deg) / np.sqrt(3)] * 3 +
                                       [args.max_translation / np.sqrt(3)] * 3, ncam)

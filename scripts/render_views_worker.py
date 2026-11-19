@@ -101,7 +101,8 @@ def save_rendered_views(spec, names, output, render, make_camera, pose_cache):
                                  psnr_db=psnr if math.isfinite(psnr) else "inf",
                                  metric='ROI PSNR' if mask is not None else 'full-image PSNR',
                                  mask_fraction=mask.float().mean().item() if mask is not None else 1.,
-                                 camera_pose='refined' if cached_pose else ('lidar_pose_ba' if pose_label == 'LiDAR-anchored BA training pose'
+                                 camera_pose='refined' if cached_pose else ('lidar_pose_ba' if pose_label in (
+                                                 'LiDAR-anchored BA training pose', 'multiview BA training pose (LiDAR-checked)')
                                                  else 'colmap_rerun' if name in dataset_labels else 'original'),
                                  target_sha256=hashlib.sha256(str(target_hash_array.shape).encode() + target_hash_array.tobytes()).hexdigest())
             del camera, pred, target

@@ -67,7 +67,8 @@ def main(argv=None):
         cloud = Path(suite['cloud']['cached']) if suite else source / 'input.ply'
     if not cloud.is_file():
         p.error('Missing LiDAR PLY in the sparse model, prepared suite, or source/input.ply')
-    output = root / ('pose_ba_full_v2' if args.full else 'pose_ba_pilot_v2')
+    name = 'pose_ba_full' if args.full else 'pose_ba_pilot'
+    output = root / (name + '_v3')
     if output.is_relative_to(source):
         p.error('Set --output-root outside the input scene')
     output.mkdir(parents=True, exist_ok=True)
@@ -92,6 +93,7 @@ def main(argv=None):
               f"Report: {output / 'ba/refinement_report.json'}", flush=True)
         refine(['--source', str(source), '--keyframes', str(run_manifest), '--output', str(output / 'ba'),
                 '--point-cloud', str(cloud), '--keep-lidar-indices', '--image-first', '--max-points', '1500000',
+                '--triangulate-rgb', '--reuse-preprocessing', str(root / (name + '_v2') / 'ba'),
                 '--max-tracks', str(max(8000, 24 * len(selected))),
                 '--max-translation', '.03', '--max-rotation-deg', '.5'])
         result = json.loads((output / 'ba/refinement_report.json').read_text())

@@ -4,6 +4,7 @@ import numpy as np
 
 from .common import project
 from .features import extract_features, match_pair
+from .epipolar import line_errors
 
 
 def validation_landmarks(ref, target, matches, im, camera, args):
@@ -32,13 +33,15 @@ def validation_landmarks(ref, target, matches, im, camera, args):
 
 def check_views(source, folder, cameras, checks, selected, features, points, normals, planar,
                 rotations, centers, per_image, args):
-    rows = []
+    rows, rgb_rows = [], []
+    measure_rgb = getattr(args, "triangulate_rgb", False)
     active = [i for i, row in enumerate(per_image) if row["optimized"]]
     for im in checks:
         ref = extract_features(source, folder, im, cameras[im.camera_id], points, normals, planar, args)
         nearby = sorted((i for i in active if im.R[2] @ selected[i].R[2] > .5),
                         key=lambda i: np.linalg.norm(im.C - selected[i].C))[:6]
         errors, ids = [], set()
+        rgb_errors, rgb_ids = [], set()
         paired_views = 0
         for i in nearby:
             target, camera = features[i], selected[i]
@@ -47,6 +50,13 @@ def check_views(source, folder, cameras, checks, selected, features, points, nor
             if len(matches) < args.min_pair_matches:
                 continue
             left, right = matches.T
+            if measure_rgb and np.linalg.norm(camera.C - im.C) > 2 * args.max_translation:
+                before = line_errors(ref, target, matches, im, camera.R, camera.C)
+                after = line_errors(ref, target, matches, im, rotations[i], centers[i])
+                valid = np.isfinite(before)
+                if valid.sum() >= args.min_pair_matches:
+                    rgb_errors.append(np.column_stack((before[valid], after[valid])))
+                    rgb_ids.update(left[valid].tolist())
             if args.image_first:
                 left, right, xyz = validation_landmarks(ref, target, matches, im, camera, args)
                 if len(left) < args.min_pair_matches:
@@ -62,41 +72,63 @@ def check_views(source, folder, cameras, checks, selected, features, points, nor
             errors.append(np.column_stack((old, new)))
             ids.update(left.tolist())
             paired_views += 1
-        row = dict(image=im.name, matched_train_views=paired_views, distinct_features=len(ids),
-                   count=sum(map(len, errors)), supported=False)
-        if errors:
-            uv = ref['uv'][sorted(ids)] / ref['scale']
-            cam = cameras[im.camera_id]
-            quadrants = (uv[:, 0] >= cam.width / 2).astype(int) + 2 * (uv[:, 1] >= cam.height / 2)
-            row['occupied_quadrants'] = len(np.unique(quadrants))
-            residuals = np.concatenate(errors)
-            row['invalid_after'] = int((~np.isfinite(residuals[:, 1])).sum())
-            if not row['invalid_after']:
-                row.update(median=np.median(residuals, axis=0).tolist(),
-                           p90=np.percentile(residuals, 90, axis=0).tolist(),
-                           supported=(paired_views >= 2 and len(ids) >= args.min_pair_matches
-                                      and row['occupied_quadrants'] >= 2))
+        row = photo_stats(im, ref, cameras[im.camera_id], errors, ids, paired_views, args)
         rows.append(row)
-        print(f"Independent photo {len(rows)}/{len(checks)}: {im.name}, {row['count']} matches, "
+        print(f"Independent photo {len(rows)}/{len(checks)}: {im.name}, {row['count']} LiDAR matches, "
               f"native-pixel medians {row.get('median')}", flush=True)
+        if measure_rgb:
+            rgb_rows.append(photo_stats(im, ref, cameras[im.camera_id], rgb_errors, rgb_ids, len(rgb_errors), args))
+    result = summarize(rows)
+    result["protocol"] = ("Matches gated at the original poses. LiDAR plane intersections from withheld photos "
+                          "are projected into the same training images with original and adjusted poses.")
+    if measure_rgb:
+        rgb = summarize(rgb_rows, epipolar=True)
+        rgb["protocol"] = ("Distance from independent RGB observations to the epipolar lines predicted by the poses, "
+                           "in native pixels. Both poses use the same image-verified correspondences.")
+        result["rgb_epipolar"] = rgb
+    return result
+
+
+def photo_stats(im, ref, cam, errors, ids, paired_views, args):
+    row = dict(image=im.name, matched_train_views=paired_views, distinct_features=len(ids),
+               count=sum(map(len, errors)), supported=False)
+    if errors:
+        uv = ref['uv'][sorted(ids)] / ref['scale']
+        quadrants = (uv[:, 0] >= cam.width / 2).astype(int) + 2 * (uv[:, 1] >= cam.height / 2)
+        row['occupied_quadrants'] = len(np.unique(quadrants))
+        residuals = np.concatenate(errors)
+        row['invalid_after'] = int((~np.isfinite(residuals[:, 1])).sum())
+        if not row['invalid_after']:
+            row.update(median=np.median(residuals, axis=0).tolist(),
+                       p90=np.percentile(residuals, 90, axis=0).tolist(),
+                       supported=(paired_views >= 2 and len(ids) >= args.min_pair_matches
+                                  and row['occupied_quadrants'] >= 2))
+    return row
+
+
+def summarize(rows, *, epipolar=False):
     supported = [r for r in rows if r["supported"]]
     reasons = []
-    if any(r.get('invalid_after', 0) for r in rows):
-        reasons.append("Pose changes put validation features behind the camera")
-    if len(supported) < max(min(3, len(checks)), (len(checks) + 1) // 2):
-        reasons.append("Insufficient independent photo coverage to judge refinement")
+    coverage = len(supported) >= max(min(3, len(rows)), (len(rows) + 1) // 2)
     delta = [r["median"][0] - r["median"][1] for r in supported]
     gain = float(np.median(delta)) if delta else None
-    if gain is not None and gain < .1:
-        reasons.append("Typical independent photo improved by less than 0.1 native pixel")
+    if epipolar:
+        # Only tests alignment perpendicular to the epipolar line. A substantial
+        # regression contradicts the candidate; insufficient support is reported.
+        if coverage and gain is not None and gain < -.1:
+            reasons.append("Independent RGB epipolar alignment worsened by over 0.1 pixel")
+    else:
+        if any(r.get('invalid_after', 0) for r in rows):
+            reasons.append("Pose changes put validation features behind the camera")
+        if not coverage:
+            reasons.append("Insufficient independent photo coverage to judge refinement")
+        if gain is not None and gain < .1:
+            reasons.append("Typical independent photo improved by less than 0.1 native pixel")
     medians = np.median([r["median"] for r in supported], axis=0).tolist() if supported else None
-    if supported:
+    if supported and not epipolar:
         tails = np.median([r["p90"] for r in supported], axis=0)
         if tails[1] > 1.05 * tails[0] + .1:
             reasons.append("Independent photo p90 errors worsened")
-    return dict(per_image=rows, supported=len(supported), requested=len(rows),
+    return dict(per_image=rows, supported=len(supported), requested=len(rows), sufficient_coverage=coverage,
                 median_before_after_native_px=medians, median_gain_native_px=gain, improved=sum(d > 0 for d in delta),
-                rejection_reasons=reasons,
-                protocol="Matches gated at the original poses. LiDAR plane intersections from withheld photos "
-                         "are projected into the same training images with original and adjusted poses. "
-                         "Each supported withheld photo gets one vote.")
+                rejection_reasons=reasons)

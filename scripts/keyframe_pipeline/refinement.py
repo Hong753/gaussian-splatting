@@ -105,7 +105,9 @@ def refine(args):
     checks = [im for im in all_images if im.name in check_set]
     if len(selected) < 3:
         raise ValueError("At least three selected images are required")
-    settings = {k: str(v.resolve()) if isinstance(v, Path) else v for k, v in vars(args).items() if k != "output"}
+    settings = {k: str(v.resolve()) if isinstance(v, Path) else v for k, v in vars(args).items() if k not in ("output", "reuse_preprocessing")}
+    if not args.triangulate_rgb:
+        settings.pop("triangulate_rgb")
     if not args.image_first:
         settings.pop("image_first")
     if not args.keep_lidar_indices:
@@ -123,10 +125,33 @@ def refine(args):
             print(f"Reusing validated dataset: {output / 'dataset'}", flush=True)
             return output / "dataset"
         raise ValueError("Dataset exists without a successful refinement report")
+    previous = args.reuse_preprocessing
+    if previous and (previous / "settings.json").is_file():
+        old = json.loads((previous / "settings.json").read_text())
+        # Match all inputs to surface association and pair matching. The sorted
+        # image stamps include identity and membership; BA parameters can differ.
+        keys = ("version", "source", "images", "model", "cloud", "image_files_sha256",
+                "image_first", "feature_max_side", "max_features", "anchor_pixels", "surface_radius",
+                "voxel_size", "max_points", "ratio", "match_distance", "match_pixels")
+        if all(old.get(key) == settings.get(key) for key in keys):
+            print(f"Reusing compatible preprocessing from {previous} (read only)", flush=True)
+        else:
+            print("Previous preprocessing differs; building a fresh cache", flush=True)
+            previous = None
+    else:
+        previous = None
+
+    def cached(path):
+        if previous and not path.exists():
+            existing = previous / path.relative_to(output)
+            if existing.is_file():
+                return existing
+        return path
+
     points, voxel = load_cloud(cloud, args.voxel_size, args.max_points)
     radius = max(args.surface_radius, voxel * 4)
     print(f"LiDAR: {len(points)} samples, voxel {voxel:.4g}; estimating local planes", flush=True)
-    plane_cache = output / "planes.npz"
+    plane_cache = cached(output / "planes.npz")
     if plane_cache.exists():
         with np.load(plane_cache, allow_pickle=False) as saved:
             normals, planar = saved["normals"], saved["planar"]
@@ -138,7 +163,7 @@ def refine(args):
     cache.mkdir(exist_ok=True)
     features = []
     for i, im in enumerate(selected):
-        path = cache / f"{im.id}.npz"
+        path = cached(cache / f"{im.id}.npz")
         if path.exists():
             with np.load(path, allow_pickle=False) as saved:
                 features.append(dict(saved))
@@ -158,7 +183,7 @@ def refine(args):
     mutual = verified = 0
     for k, (i, j) in enumerate(pairs):
         extension = '.npz' if args.image_first else '.npy'
-        path = pair_cache / f"{selected[i].id}_{selected[j].id}{extension}"
+        path = cached(pair_cache / f"{selected[i].id}_{selected[j].id}{extension}")
         stats = {}
         if path.exists() and args.image_first:
             with np.load(path, allow_pickle=False) as saved:
@@ -195,6 +220,18 @@ def refine(args):
         print(f"Mutual RGB matches {mutual}; geometrically verified {verified}. "
               f"Three-view tracks: {funnel['three_view_image_tracks']} RGB, {funnel['with_lidar_anchor']} with LiDAR, "
               f"{funnel['fit_geometry_consistent']} consistent; {len(tracks)} selected for BA.", flush=True)
+    if args.triangulate_rgb:
+        from .epipolar import original_pose_errors
+        geometry = original_pose_errors(features, selected, matched_pairs, args.max_translation)
+        diagnostics["original_pose_epipolar"] = geometry
+        diagnostics["selected_lidar_tracks"] = sum("lidar_observation" in track for track in tracks)
+        diagnostics["selected_rgb_tracks"] = len(tracks) - diagnostics["selected_lidar_tracks"]
+        print(f"Original RGB epipolar error: {geometry['median_of_pair_medians_native_px']} native px "
+              f"across {geometry['pairs']} usable training pairs", flush=True)
+        print(f"LiDAR rejections: {funnel['lidar_rejections']}. RGB triangulation rejections: "
+              f"{funnel['triangulation_rejections']}.", flush=True)
+        print(f"BA input: {diagnostics['selected_lidar_tracks']} LiDAR-supported and "
+              f"{diagnostics['selected_rgb_tracks']} triangulated RGB tracks", flush=True)
     atomic_json(output / "matching_report.json", diagnostics)
     if len(tracks) < args.min_tracks:
         atomic_json(report_file, dict(accepted=False, rejection_reasons=["Insufficient three-view feature tracks"], **diagnostics))
@@ -211,6 +248,11 @@ def refine(args):
                                   points, normals, planar, R, C, report["per_image"], args)
         report["independent_views"] = independent
         report["rejection_reasons"].extend(independent["rejection_reasons"])
+        if args.triangulate_rgb:
+            rgb = independent["rgb_epipolar"]
+            print(f"Independent RGB epipolar error: {rgb['median_before_after_native_px']} native px "
+                  f"before/after; {rgb['supported']}/{len(checks)} supported photos", flush=True)
+            report["rejection_reasons"].extend(rgb["rejection_reasons"])
         report["accepted"] = not report["rejection_reasons"]
         gain = independent["median_gain_native_px"]
         coverage = f'{independent["supported"]}/{len(checks)}'
@@ -241,6 +283,9 @@ def parser():
                    help="Mirror the source dataset and replace only supported extrinsics in its COLMAP poses")
     p.add_argument("--image-first", action="store_true",
                    help="Match image features before requiring LiDAR support in at least one fit observation per track")
+    p.add_argument("--triangulate-rgb", action="store_true",
+                   help="Supplement consistent LiDAR tracks with independently triangulated multiview landmarks")
+    p.add_argument("--reuse-preprocessing", type=Path, help="Optional read-only source for compatible cached features and matches")
     p.add_argument("--voxel-size", type=float, default=.05)
     p.add_argument("--max-points", type=int, default=500_000)
     p.add_argument("--surface-radius", type=float, default=.3)
@@ -273,6 +318,8 @@ def parser():
 def main(argv=None):
     p = parser()
     args = p.parse_args(argv)
+    if args.triangulate_rgb and not args.image_first:
+        p.error("--triangulate-rgb requires --image-first")
     numeric = [v for v in vars(args).values() if type(v) in (int, float)]
     if any(v <= 0 or not np.isfinite(v) for v in numeric) or not 0 < args.ratio < 1:
         p.error("Numeric parameters must be positive and ratio must be in (0,1)")

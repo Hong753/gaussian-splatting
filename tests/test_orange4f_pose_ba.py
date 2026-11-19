@@ -92,7 +92,7 @@ def test_orange_binary_poses_improve_independent_images(posed_scene, capsys):
     model = source/'sparse/0'
     argv = ['--output-root', str(root)]
     assert main(argv) == 0
-    ba = root/'pose_ba_pilot_v2/ba'
+    ba = root/'pose_ba_pilot_v3/ba'
     report = json.loads((ba/'refinement_report.json').read_text())
     views = report['independent_views']
     assert report['accepted'] and views['supported'] == 4
@@ -169,3 +169,83 @@ def test_only_anchor_is_retained_for_fit_and_missing_or_wrong_depth_rejected():
     assert (anchor, 0) in track['obs'] and track['obs'][track['reserve']] != (anchor, 0)
     features[anchor]['xyz'][0, 2] = .5
     assert anchored_track(*args) is None
+
+
+def test_hybrid_recovers_from_v2_rejection_using_read_only_cache(posed_scene, monkeypatch, capsys):
+    source, root, training, _, _ = posed_scene
+    selected, checks = pose_split([p.name for p in (source/'images').iterdir()], training, False)
+    manifest = root/'fit.json'
+    manifest.write_text(json.dumps(dict(selected_images=selected, pose_validation_images=checks)))
+    common = ['--source', str(source), '--keyframes', str(manifest), '--anchor-pixels', '.75',
+              '--keep-lidar-indices', '--image-first', '--max-translation', '.03', '--max-rotation-deg', '.5']
+    previous = root/'v2'
+    with pytest.raises(SystemExit):
+        refine([*common, '--output', str(previous)])
+    assert json.loads((previous/'matching_report.json').read_text())['tracks'] < 50
+    stamps = {p: p.stat().st_mtime_ns for p in previous.rglob('*') if p.is_file()}
+    from scripts.keyframe_pipeline import refinement
+
+    def unexpected(*_args):
+        pytest.fail("Recomputed a cached preprocessing stage")
+
+    # Validation matches new withheld photos through the validation module.
+    for name in ('surface_normals', 'extract_features', 'match_pair'):
+        monkeypatch.setattr(refinement, name, unexpected)
+    output = root/'v3'
+    refine([*common, '--output', str(output), '--triangulate-rgb', '--reuse-preprocessing', str(previous)])
+    report = json.loads((output/'refinement_report.json').read_text())
+    diag = report['matching']
+    assert 0 < diag['selected_lidar_tracks'] < 50 < diag['selected_rgb_tracks']
+    assert diag['selected_lidar_tracks'] + diag['selected_rgb_tracks'] == report['tracks']
+    assert report['independent_views']['rgb_epipolar']['sufficient_coverage']
+    assert report['independent_views']['median_gain_native_px'] > .1 and report['accepted']
+    assert 'Reusing compatible preprocessing' in capsys.readouterr().out
+    assert stamps == {p: p.stat().st_mtime_ns for p in previous.rglob('*') if p.is_file()}
+
+
+def test_triangulation_uses_only_fit_pixels_and_rejects_parallel_rays():
+    from collections import Counter
+    from types import SimpleNamespace
+    from scripts.keyframe_pipeline.features import triangulated_track
+    from scripts.keyframe_pipeline.epipolar import line_errors
+
+    centers = np.array([[0., 0., 0.], [.2, 0., 0.], [.4, 0., 0.]])
+    rotations = np.tile(np.eye(3), (3, 1, 1))
+    K = np.tile([350., 345., 198., 145.], (3, 1))
+    xyz = np.array([.2, .1, 2.])
+    uv = (xyz-centers)[:, :2]/2 * K[:, :2] + K[:, 2:]
+    features = [dict(uv=u[None].copy(), K=k, scale=np.array([.5, .5])) for u, k in zip(uv, K)]
+    obs = [(i, 0) for i in range(3)]
+    counters = Counter()
+    args = (obs, features, rotations, centers, K, SimpleNamespace(match_pixels=12.), counters)
+    track = triangulated_track(*args)
+    np.testing.assert_allclose(track['triangulated_xyz'], xyz)
+    reserve = track['reserve']
+    features[reserve]['uv'][0] += [500., 200.]
+    np.testing.assert_allclose(triangulated_track(*args)['triangulated_xyz'], xyz)
+    for f in features:
+        f['uv'][0] = uv[1]
+    assert triangulated_track(*args) is None and counters['low_parallax'] == 1
+    # Horizontal epipolar lines, using images downsampled by 2. Changing the
+    # x coordinate cannot change the discrepancy, but 2 working px in y is 4 native px.
+    features[0]['uv'][0] += [20., 2.]
+    err = line_errors(features[0], features[1], np.array([[0, 0]]),
+                      SimpleNamespace(R=rotations[0], C=centers[0]), rotations[1], centers[1])
+    np.testing.assert_allclose(err, [4.])
+
+
+def test_rgb_improvement_without_independent_map_support_is_diagnostic_only(posed_scene):
+    source, root, training, _, _ = posed_scene
+    selected, checks = pose_split([p.name for p in (source/'images').iterdir()], training, False)
+    manifest = root/'fit.json'
+    manifest.write_text(json.dumps(dict(selected_images=selected, pose_validation_images=checks)))
+    output = root/'unsupported'
+    with pytest.raises(SystemExit):
+        refine(['--source', str(source), '--keyframes', str(manifest), '--output', str(output),
+                '--max-translation', '.03', '--image-first', '--triangulate-rgb',
+                '--anchor-pixels', '.001', '--keep-lidar-indices'])
+    report = json.loads((output/'refinement_report.json').read_text())
+    views = report['independent_views']
+    assert report['matching']['selected_rgb_tracks'] >= 50 and views['rgb_epipolar']['sufficient_coverage']
+    assert views['rgb_epipolar']['median_gain_native_px'] > 0 and not views['sufficient_coverage']
+    assert not report['accepted'] and not (output/'dataset').exists()

@@ -121,7 +121,7 @@ def match_pair(a, b, image_a, image_b, args, stats=None):
     return matches[keep]
 
 
-def anchored_track(obs, features, rotations, centers, intrinsics, args):
+def anchored_track(obs, features, rotations, centers, intrinsics, args, rejections=None):
     """Hold out one pixel and require a LiDAR anchor consistent with the fit observations."""
     anchors = [j for j, (i, k) in enumerate(obs) if np.isfinite(features[i]["xyz"][k, 0])]
     if not anchors:
@@ -146,20 +146,57 @@ def anchored_track(obs, features, rotations, centers, intrinsics, args):
     support = [obs[j] for j in anchors if j != reserve]
     points = np.array([features[i]["xyz"][k] for i, k in support])
     normals = np.array([features[i]["normals"][k] for i, k in support])
+    compatible = in_front = False
     for (i, k), xyz, normal in zip(support, points, normals):
         if len(support) > 1 and ((np.linalg.norm(points - xyz, axis=1) > args.match_distance).any() or
                                  (np.abs(normals @ normal) < .85).any()):
             continue
+        compatible = True
         local = np.einsum("nij,nj->ni", rotations[fit_cameras], xyz - centers[fit_cameras])
         if (local[:, 2] <= .2).any():
             continue
+        in_front = True
         K = intrinsics[fit_cameras]
         err = np.linalg.norm(local[:, :2] / local[:, 2:] * K[:, :2] + K[:, 2:] - uv, axis=1)
         if err.max() <= args.match_pixels and err.mean() < best_error:
             best, best_error = (i, k), err.mean()
     if best is None:
+        if rejections is not None:
+            reason = "inconsistent_planes"
+            if compatible:
+                reason = "pixel_error" if in_front else "behind_camera"
+            rejections[reason] += 1
         return None
     return dict(obs=obs, reserve=reserve, lidar_observation=best)
+
+
+def triangulated_track(obs, features, rotations, centers, intrinsics, args, rejections):
+    """Intersect fitting rays in the original metric frame. Never use the reserved pixel."""
+    if len(obs) > 10:
+        obs = [obs[j] for j in np.linspace(0, len(obs)-1, 10).round().astype(int)]
+    reserve = (obs[0][1] + 31 * obs[0][0]) % len(obs)
+    fit = [pair for j, pair in enumerate(obs) if j != reserve]
+    indices = [i for i, _ in fit]
+    C, R, K = centers[indices], rotations[indices], intrinsics[indices]
+    uv = np.array([features[i]["uv"][k] for i, k in fit])
+    local = np.column_stack(((uv-K[:, 2:])/K[:, :2], np.ones(len(fit))))
+    rays = np.einsum("nji,nj->ni", R, local)
+    rays /= np.linalg.norm(rays, axis=1, keepdims=True)
+    # A real baseline and crossing angle are required to recover finite depth.
+    # abs(dot) also rejects collinear, oppositely directed rays.
+    if np.min(np.abs(rays @ rays.T)) >= np.cos(np.deg2rad(2.)):
+        rejections["low_parallax"] += 1
+        return None
+    perpendicular = np.eye(3) - rays[:, :, None] * rays[:, None, :]
+    xyz = np.linalg.solve(perpendicular.sum(axis=0), np.einsum("nij,nj->i", perpendicular, C))
+    q = np.einsum("nij,nj->ni", R, xyz - C)
+    if not np.isfinite(q).all() or np.any(q[:, 2] <= .2):
+        rejections["invalid_depth"] += 1
+        return None
+    if np.max(np.linalg.norm(q[:, :2]/q[:, 2:] * K[:, :2] + K[:, 2:] - uv, axis=1)) > args.match_pixels:
+        rejections["pixel_error"] += 1
+        return None
+    return dict(obs=obs, reserve=reserve, triangulated_xyz=xyz)
 
 
 def build_tracks(features, pair_matches, max_tracks=8000, *, images=None, args=None, stats=None):
@@ -186,7 +223,9 @@ def build_tracks(features, pair_matches, max_tracks=8000, *, images=None, args=N
             members[x] = {**mx, **my}
             members.pop(y, None)
     tracks = []
-    n_multiview = n_anchored = 0
+    n_multiview = n_anchored = n_consistent = 0
+    lidar_rejections, rgb_rejections = defaultdict(int), defaultdict(int)
+    hybrid = getattr(args, "triangulate_rgb", False)
     if images is not None:
         rotations = np.stack([im.R for im in images])
         centers = np.stack([im.C for im in images])
@@ -197,10 +236,13 @@ def build_tracks(features, pair_matches, max_tracks=8000, *, images=None, args=N
         obs = sorted(observations.items())
         n_multiview += 1
         if images is not None:
-            if not any(np.isfinite(features[i]["xyz"][k, 0]) for i, k in obs):
-                continue
-            n_anchored += 1
-            track = anchored_track(obs, features, rotations, centers, intrinsics, args)
+            track = None
+            if any(np.isfinite(features[i]["xyz"][k, 0]) for i, k in obs):
+                n_anchored += 1
+                track = anchored_track(obs, features, rotations, centers, intrinsics, args, lidar_rejections)
+                n_consistent += int(track is not None)
+            if track is None and hybrid:
+                track = triangulated_track(obs, features, rotations, centers, intrinsics, args, rgb_rejections)
             if track is not None:
                 tracks.append(track)
             continue
@@ -218,7 +260,8 @@ def build_tracks(features, pair_matches, max_tracks=8000, *, images=None, args=N
         tracks.append(dict(obs=obs, xyz=center, anchor=anchor, normal=normal))
     if stats is not None:
         stats.update(three_view_image_tracks=n_multiview, with_lidar_anchor=n_anchored,
-                     fit_geometry_consistent=len(tracks))
+                     fit_geometry_consistent=n_consistent, lidar_rejections=dict(lidar_rejections),
+                     triangulated_rgb=len(tracks)-n_consistent, triangulation_rejections=dict(rgb_rejections))
     # Round-robin by least represented camera avoids filling the budget in one room.
     tracks.sort(key=lambda t: (-len(t["obs"]), t["obs"]))
     by_camera = defaultdict(list)

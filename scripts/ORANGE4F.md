@@ -5,18 +5,25 @@
 In the `3dgs` environment, run `python -u scripts/orange4f_pose_ba.py` on CPU.
 The pilot takes 48 training cameras from three trajectory sections and reserves
 12 neighboring photos for the final check. It first matches RGB features across
-views. A usable track needs observations in at least three training photos and a
-local LiDAR plane consistent with the observations used for fitting. The
-optimizer holds out one pixel observation per track.
+views. Each track needs at least three training photos. The solver reserves
+one observation per track and uses a consistent LiDAR plane when available.
+For other tracks it triangulates a free 3D landmark from fitting observations
+with at least two degrees of parallax, positive depth and consistent
+reprojections. Camera priors tie the solution to the original metric trajectory.
 
-Look at the `Three-view tracks` line to see how many RGB tracks have map support
-and how many pass the geometric checks. `Independent photos` measures the change
-in pixel error on correspondences with photos excluded from fitting. Positive
-gain means better alignment. The pilot writes the counts and verdict to
-`pose_ba_pilot_v2/ba/{matching_report,refinement_report}.json` under the
+`BA input` gives distinct LiDAR and RGB landmark counts. `Original RGB epipolar
+error` measures the perpendicular distance of observed features to lines
+predicted by the input poses and intrinsics. `Independent RGB epipolar error`
+compares that distance before and after on the reserved photos. The separate
+`Independent photos` check compares full 2D reprojection against LiDAR
+surfaces. Acceptance requires sufficient map-supported coverage and improved
+reprojection on held-out observations and independent photos.
+
+The pilot reads compatible features and matches from v2 when available and
+writes `pose_ba_pilot_v3/ba/{matching_report,refinement_report}.json` under the
 Orange4F fine-tuning output root. An accepted fit exports the camera poses to
 `ba/dataset/` with the original indexed LiDAR associations. Use `--full` for
-the full training split in `pose_ba_full_v2/`.
+the full training split in `pose_ba_full_v3/`.
 
 ## Fixed-LiDAR scale
 
