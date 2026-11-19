@@ -10,7 +10,7 @@ def observation_arrays(tracks, features):
     camera, landmark, uv, heldout = [], [], [], []
     for k, track in enumerate(tracks):
         # Reserve one observation per track. It is never used by the optimizer.
-        reserve = k % len(track["obs"])
+        reserve = track.get("reserve", k % len(track["obs"]))
         for j, (i, feature) in enumerate(track["obs"]):
             camera.append(i)
             landmark.append(k)
@@ -26,6 +26,13 @@ def solve_bundle(images, features, tracks, args):
     anchors, normals, X0 = [], [], []
     for k, track in enumerate(tracks):
         # Do not initialize landmarks or their priors using the withheld pixel.
+        if "lidar_observation" in track:
+            i, feature = track["lidar_observation"]
+            anchor = features[i]["xyz"][feature]
+            anchors.append(anchor)
+            normals.append(features[i]["normals"][feature])
+            X0.append(anchor)
+            continue
         training = [obs for j, obs in enumerate(track["obs"]) if j != k % len(track["obs"])]
         samples = np.array([features[i]["xyz"][feature] for i, feature in training])
         center = np.median(samples, axis=0)

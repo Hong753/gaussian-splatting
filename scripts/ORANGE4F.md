@@ -1,5 +1,23 @@
 # orange4f: shared-input runs, AA off
 
+## Check image alignment with bounded pose refinement
+
+In the `3dgs` environment, run `python -u scripts/orange4f_pose_ba.py` on CPU.
+The pilot takes 48 training cameras from three trajectory sections and reserves
+12 neighboring photos for the final check. It first matches RGB features across
+views. A usable track needs observations in at least three training photos and a
+local LiDAR plane consistent with the observations used for fitting. The
+optimizer holds out one pixel observation per track.
+
+Look at the `Three-view tracks` line to see how many RGB tracks have map support
+and how many pass the geometric checks. `Independent photos` measures the change
+in pixel error on correspondences with photos excluded from fitting. Positive
+gain means better alignment. The pilot writes the counts and verdict to
+`pose_ba_pilot_v2/ba/{matching_report,refinement_report}.json` under the
+Orange4F fine-tuning output root. An accepted fit exports the camera poses to
+`ba/dataset/` with the original indexed LiDAR associations. Use `--full` for
+the full training split in `pose_ba_full_v2/`.
+
 ## Fixed-LiDAR scale
 
 Run `python -u scripts/orange4f_detail.py --estimate-fixed-scale` to print the

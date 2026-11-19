@@ -13,6 +13,8 @@ from scipy.spatial.transform import Rotation
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.orange4f_pose_ba import main, pose_split
 from scripts.keyframe_pipeline.common import read_model
+from scripts.keyframe_pipeline.refinement import main as refine
+from scripts.keyframe_pipeline.features import anchored_track
 from scripts.keyframe_pipeline.pose_export import replace_text
 from scripts.pose_options import dataset_pose_labels
 
@@ -40,7 +42,8 @@ def test_text_overlay_keeps_observation_and_heldout_records(tmp_path):
     assert source.read_text() == data
 
 
-def test_orange_binary_poses_improve_independent_images(tmp_path, capsys):
+@pytest.fixture
+def posed_scene(tmp_path):
     source, root = tmp_path/'scene', tmp_path/'out'
     model = source/'sparse/0'
     model.mkdir(parents=True)
@@ -81,9 +84,15 @@ def test_orange_binary_poses_improve_independent_images(tmp_path, capsys):
     split = suite/'selection.json'
     split.write_text(json.dumps(dict(selected_images=training)))
     (suite/'suite.json').write_text(json.dumps(dict(source=str(source), selection=str(split))))
+    return source, root, training, payload, pose_offsets
+
+
+def test_orange_binary_poses_improve_independent_images(posed_scene, capsys):
+    source, root, training, payload, pose_offsets = posed_scene
+    model = source/'sparse/0'
     argv = ['--output-root', str(root)]
     assert main(argv) == 0
-    ba = root/'pose_ba_pilot_v1/ba'
+    ba = root/'pose_ba_pilot_v2/ba'
     report = json.loads((ba/'refinement_report.json').read_text())
     views = report['independent_views']
     assert report['accepted'] and views['supported'] == 4
@@ -98,7 +107,7 @@ def test_orange_binary_poses_improve_independent_images(tmp_path, capsys):
     for start in pose_offsets:
         adjusted[start:start+56] = payload[start:start+56]
     assert adjusted == payload == (model/'images.bin').read_bytes()
-    assert read_model(exported)[1][1].params.tolist() == [fx, fy, cx, cy]
+    assert read_model(exported)[1][1].params.tolist() == [350., 348., 198., 145.]
     assert main(argv) == 0
     assert 'Reusing validated dataset' in capsys.readouterr().out
 
@@ -113,3 +122,50 @@ def test_no_supported_validation_views_are_inconclusive(monkeypatch):
                                     [], [], [], SimpleNamespace())
     assert result["supported"] == 0 and result["median_gain_native_px"] is None
     assert "Insufficient independent photo coverage" in result["rejection_reasons"][0]
+
+def test_sparse_associations_pass_only_after_image_first_matching(posed_scene):
+    source, root, training, _, _ = posed_scene
+    selected, checks = pose_split([p.name for p in (source/'images').iterdir()], training, False)
+    manifest = root/'fit.json'
+    manifest.write_text(json.dumps(dict(selected_images=selected, pose_validation_images=checks)))
+    common = ['--source', str(source), '--keyframes', str(manifest), '--anchor-pixels', '1',
+              '--keep-lidar-indices', '--max-translation', '.03', '--max-rotation-deg', '.5']
+    with pytest.raises(SystemExit) as exc:
+        refine([*common, '--output', str(root/'legacy')])
+    assert exc.value.code == 2
+    assert json.loads((root/'legacy/matching_report.json').read_text())['tracks'] < 50
+    assert not (root/'legacy/dataset').exists()
+    argv = [*common, '--image-first', '--output', str(root/'retry')]
+    refine(argv)
+    report = json.loads((root/'retry/refinement_report.json').read_text())
+    diag = report['matching']
+    assert diag['three_view_image_tracks'] > diag['tracks'] >= 50
+    assert diag['verified_rgb_matches'] <= diag['mutual_rgb_matches']
+    assert report['independent_views']['median_gain_native_px'] >= .1
+    assert report['independent_views']['supported'] == len(checks)
+
+
+def test_only_anchor_is_retained_for_fit_and_missing_or_wrong_depth_rejected():
+    from types import SimpleNamespace
+    n = 15
+    centers = np.column_stack([np.arange(n) * .1, np.zeros((n, 2))])
+    rotations = np.tile(np.eye(3), (n, 1, 1))
+    intrinsics = np.tile([300., 300., 50., 50.], (n, 1))
+    xyz = np.array([.1, .3, 3.])
+    features = []
+    for C in centers:
+        uv = (xyz[:2] - C[:2]) / xyz[2] * 300. + 50.
+        features.append(dict(uv=uv[None], xyz=np.full((1, 3), np.nan), normals=np.full((1, 3), np.nan)))
+    obs = [(i, 0) for i in range(n)]
+    cfg = SimpleNamespace(match_distance=.15, match_pixels=12.)
+    args = (obs, features, rotations, centers, intrinsics, cfg)
+    assert anchored_track(*args) is None
+    # Give the sole anchor to a view otherwise dropped by the ten-view cap.
+    anchor = next(i for i in range(n) if i not in np.linspace(0, n-1, 10).round())
+    features[anchor]['xyz'][0] = xyz
+    features[anchor]['normals'][0] = [0., 0., 1.]
+    track = anchored_track(*args)
+    assert track['lidar_observation'] == (anchor, 0)
+    assert (anchor, 0) in track['obs'] and track['obs'][track['reserve']] != (anchor, 0)
+    features[anchor]['xyz'][0, 2] = .5
+    assert anchored_track(*args) is None

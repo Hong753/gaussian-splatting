@@ -106,6 +106,8 @@ def refine(args):
     if len(selected) < 3:
         raise ValueError("At least three selected images are required")
     settings = {k: str(v.resolve()) if isinstance(v, Path) else v for k, v in vars(args).items() if k != "output"}
+    if not args.image_first:
+        settings.pop("image_first")
     if not args.keep_lidar_indices:
         settings.pop("keep_lidar_indices")
     if checks:
@@ -146,30 +148,53 @@ def refine(args):
             np.savez_compressed(path.with_suffix(".tmp.npz"), **data)
             path.with_suffix(".tmp.npz").replace(path)
         if i % 25 == 0 or i == len(selected) - 1:
-            print(f"Features {i + 1}/{len(selected)}; last frame {len(features[-1]['uv'])} surface-associated", flush=True)
+            data = features[-1]
+            n = int(np.isfinite(data['xyz'][:, 0]).sum())
+            print(f"Features {i + 1}/{len(selected)}; last frame {len(data['uv'])} retained, {n} surface-associated", flush=True)
     pairs = candidate_pairs(selected, args.spatial_neighbors, args.temporal_neighbors)
     pair_cache = output / "matches"
     pair_cache.mkdir(exist_ok=True)
     matched_pairs, match_count = [], 0
+    mutual = verified = 0
     for k, (i, j) in enumerate(pairs):
-        path = pair_cache / f"{selected[i].id}_{selected[j].id}.npy"
-        if path.exists():
+        extension = '.npz' if args.image_first else '.npy'
+        path = pair_cache / f"{selected[i].id}_{selected[j].id}{extension}"
+        stats = {}
+        if path.exists() and args.image_first:
+            with np.load(path, allow_pickle=False) as saved:
+                matches, stats["mutual"] = saved["matches"], int(saved["mutual"])
+        elif path.exists():
             matches = np.load(path, allow_pickle=False)
         else:
             # Seed per pair so cache hits do not change later FLANN searches.
             cv2.setRNGSeed((selected[i].id * 100003 + selected[j].id) % (2**31 - 1))
-            matches = match_pair(features[i], features[j], selected[i], selected[j], args)
-            np.save(path.with_suffix(".tmp.npy"), matches)
-            path.with_suffix(".tmp.npy").replace(path)
+            matches = match_pair(features[i], features[j], selected[i], selected[j], args, stats)
+            tmp = path.with_suffix('.tmp' + extension)
+            if args.image_first:
+                np.savez(tmp, matches=matches, mutual=stats["mutual"])
+            else:
+                np.save(tmp, matches)
+            tmp.replace(path)
+        mutual += stats.get("mutual", 0)
+        verified += len(matches)
         if len(matches) >= args.min_pair_matches:
             matched_pairs.append((i, j, matches))
             match_count += len(matches)
         if k % 100 == 0 or k == len(pairs) - 1:
-            print(f"Matched {k + 1}/{len(pairs)} pairs; {match_count} gated correspondences", flush=True)
-    tracks = build_tracks(features, matched_pairs, args.max_tracks)
+            print(f"Matched {k + 1}/{len(pairs)} pairs; {match_count} correspondences in usable pairs", flush=True)
+    funnel = {}
+    tracks = build_tracks(features, matched_pairs, args.max_tracks, images=selected if args.image_first else None,
+                          args=args, stats=funnel if args.image_first else None)
     diagnostics = dict(candidate_pairs=len(pairs), usable_pairs=len(matched_pairs), matches=match_count,
                        tracks=len(tracks), planar_lidar_samples=int(planar.sum()), actual_voxel_size=voxel,
                        features_per_image={im.name: len(f["uv"]) for im, f in zip(selected, features)})
+    if args.image_first:
+        diagnostics.update(mutual_rgb_matches=mutual, verified_rgb_matches=verified, **funnel,
+                           anchored_features_per_image={im.name: int(np.isfinite(f['xyz'][:, 0]).sum())
+                                                        for im, f in zip(selected, features)})
+        print(f"Mutual RGB matches {mutual}; geometrically verified {verified}. "
+              f"Three-view tracks: {funnel['three_view_image_tracks']} RGB, {funnel['with_lidar_anchor']} with LiDAR, "
+              f"{funnel['fit_geometry_consistent']} consistent; {len(tracks)} selected for BA.", flush=True)
     atomic_json(output / "matching_report.json", diagnostics)
     if len(tracks) < args.min_tracks:
         atomic_json(report_file, dict(accepted=False, rejection_reasons=["Insufficient three-view feature tracks"], **diagnostics))
@@ -214,6 +239,8 @@ def parser():
     p.add_argument("--point-cloud", type=Path)
     p.add_argument("--keep-lidar-indices", action="store_true",
                    help="Mirror the source dataset and replace only supported extrinsics in its COLMAP poses")
+    p.add_argument("--image-first", action="store_true",
+                   help="Match image features before requiring LiDAR support in at least one fit observation per track")
     p.add_argument("--voxel-size", type=float, default=.05)
     p.add_argument("--max-points", type=int, default=500_000)
     p.add_argument("--surface-radius", type=float, default=.3)

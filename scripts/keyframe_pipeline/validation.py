@@ -6,6 +6,30 @@ from .common import project
 from .features import extract_features, match_pair
 
 
+def validation_landmarks(ref, target, matches, im, camera, args):
+    """Intersect withheld RGB rays with fixed local planes once, before comparing poses."""
+    left, right = matches.T
+    ref_xyz, train_xyz = ref["xyz"][left], target["xyz"][right]
+    in_ref, in_train = np.isfinite(ref_xyz[:, 0]), np.isfinite(train_xyz[:, 0])
+    compatible = ((np.linalg.norm(ref_xyz - train_xyz, axis=1) < args.match_distance) &
+                  (np.abs((ref["normals"][left] * target["normals"][right]).sum(axis=1)) > .85))
+    keep = (in_ref | in_train) & (~(in_ref & in_train) | compatible)
+    left, right = left[keep], right[keep]
+    prefer_ref = in_ref[keep, None]
+    xyz = np.where(prefer_ref, ref["xyz"][left], target["xyz"][right])
+    normal = np.where(prefer_ref, ref["normals"][left], target["normals"][right])
+    K = ref["K"]
+    rays = np.column_stack(((ref["uv"][left] - K[2:]) / K[:2], np.ones(len(left)))) @ im.R
+    denom = (rays * normal).sum(axis=1)
+    depth = ((xyz - im.C) * normal).sum(axis=1) / np.where(abs(denom) > 1e-8, denom, 1.)
+    hit = im.C + depth[:, None] * rays
+    uv, z = project(hit, camera.R, camera.C, target["K"])
+    use = ((abs(denom) / np.linalg.norm(rays, axis=1) > .15) & (depth > .2) & (z > .2) &
+           (np.linalg.norm(hit - xyz, axis=1) <= args.surface_radius) &
+           (np.linalg.norm(uv - target["uv"][right], axis=1) < args.match_pixels))
+    return left[use], right[use], hit[use]
+
+
 def check_views(source, folder, cameras, checks, selected, features, points, normals, planar,
                 rotations, centers, per_image, args):
     rows = []
@@ -23,9 +47,13 @@ def check_views(source, folder, cameras, checks, selected, features, points, nor
             if len(matches) < args.min_pair_matches:
                 continue
             left, right = matches.T
-            # Both predictions use the same fixed world point from the withheld
-            # photo and the same measured SIFT pixel in the training photo.
-            xyz, observed = ref["xyz"][left], target["uv"][right]
+            if args.image_first:
+                left, right, xyz = validation_landmarks(ref, target, matches, im, camera, args)
+                if len(left) < args.min_pair_matches:
+                    continue
+            else:
+                xyz = ref["xyz"][left]
+            observed = target["uv"][right]
             before, _ = project(xyz, camera.R, camera.C, target["K"])
             after, depth = project(xyz, rotations[i], centers[i], target["K"])
             old = np.linalg.norm((before - observed) / target["scale"], axis=1)
