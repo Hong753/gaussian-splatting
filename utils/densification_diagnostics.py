@@ -105,8 +105,8 @@ def ellipsoid_segments(xyz, scales, quaternion, samples=32):
     return np.stack((world[:,:,:-1],world[:,:,1:]),axis=-2).reshape(-1,2,3).astype(np.float32)
 
 
-def projected_ellipses(xyz, scales, quaternion, view, width, height, fovx, fovy, samples=48):
-    """3-sigma projected covariance contours with the native 0.3px low-pass term."""
+def projected_covariance(xyz, scales, quaternion, view, width, height, fovx, fovy):
+    """Native screen covariance in pixel² including the 0.3 low-pass variance."""
     rotation=rotations(quaternion)
     cov=np.einsum('nij,nj,nkj->nik',rotation,np.asarray(scales)**2,rotation)
     camera=np.asarray(xyz)@view[:3,:3]+view[3,:3]
@@ -118,7 +118,12 @@ def projected_ellipses(xyz, scales, quaternion, view, width, height, fovx, fovy,
     ty=np.clip(camera[:,1]/z,-1.3*np.tan(fovy/2),1.3*np.tan(fovy/2))*z
     j=np.zeros((len(xyz),2,3));j[:,0,0]=fx/z;j[:,0,2]=-fx*tx/z**2
     j[:,1,1]=fy/z;j[:,1,2]=-fy*ty/z**2
-    cov2=np.einsum('nij,njk,nlk->nil',j,cov,j)+.3*np.eye(2)
+    return np.einsum('nij,njk,nlk->nil',j,cov,j)+.3*np.eye(2)
+
+
+def projected_ellipses(xyz, scales, quaternion, view, width, height, fovx, fovy, samples=48):
+    """3-sigma projected covariance contours with the native 0.3px low-pass term."""
+    cov2=projected_covariance(xyz, scales, quaternion, view, width, height, fovx, fovy)
     values,axes=np.linalg.eigh(cov2)
     angle=np.linspace(0,2*np.pi,samples+1)
     unit=np.stack((np.cos(angle),np.sin(angle)),1)

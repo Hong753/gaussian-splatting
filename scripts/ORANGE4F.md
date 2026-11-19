@@ -25,6 +25,22 @@ Orange4F fine-tuning output root. An accepted fit exports the camera poses to
 `ba/dataset/` with the original indexed LiDAR associations. Use `--full` for
 the full training split in `pose_ba_full_v3/`.
 
+## Measure which splats render the foreground floor
+
+Run `python -u scripts/orange4f_splat_footprints.py` in the `3dgs` environment.
+It renders the same floor patch in `09882.jpg` and `09884.jpg` using adaptive
+3DGS and fixed-LiDAR 3DGS at their latest shared saved iteration. Use
+`--gpu N` to choose a device or `--plain-only` for adaptive 3DGS alone.
+When available, the separate 2,000-step one-view fit shows how much detail
+transfers from its training frame to its neighbor.
+
+Open `floor_splat_audit_v1/index.html` on the stride-3 dashboard. Start with the
+rendered contrast at the marked bright pixels. If contrast is low, check the
+contribution map for broad floor splats (blue) or centers outside the 2.5 cm
+floor band (red). The measurements use front-to-back compositing weights and
+the mutually LiDAR-supported pixels in the two photos. The results apply to
+this floor patch and these checkpoints.
+
 ## Fixed-LiDAR scale
 
 Run `python -u scripts/orange4f_detail.py --estimate-fixed-scale` to print the
