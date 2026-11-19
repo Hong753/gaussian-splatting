@@ -5,6 +5,12 @@ from pathlib import Path
 
 def dataset_pose_labels(source):
     """Distinguish an offline COLMAP rerun from the source's original poses."""
+    ba = Path(source) / 'lidar_pose_ba.json'
+    if ba.is_file():
+        audit = json.loads(ba.read_text())
+        if not audit.get('accepted'):
+            raise ValueError('LiDAR pose refinement was not accepted')
+        return {row['name']: 'LiDAR-anchored BA training pose' for row in audit['per_image'] if row['optimized']}
     path=Path(source)/'colmap_rerun.json'
     if not path.is_file(): return {}
     audit=json.loads(path.read_text())
@@ -82,6 +88,8 @@ def apply_camera(camera,cache):
 def protocol(spec):
     if spec.get('camera_poses','original')=='refined':
         return 'cached training-view corrections; unselected frames retain dataset COLMAP poses'
+    if (Path(spec['cfg']['source_path']) / 'lidar_pose_ba.json').is_file():
+        return 'LiDAR-anchored BA for supported training cameras; original held-out poses'
     if dataset_pose_labels(spec['cfg']['source_path']):
         return 'rerun COLMAP training poses aligned to LiDAR; unchanged original held-out poses'
     return 'original COLMAP poses for all frames'

@@ -95,10 +95,23 @@ def refine(args):
         raise ValueError(f"Keyframes absent from the model: {sorted(unknown)[:5]}")
     if set(names) & set(manifest.get("excluded_images", [])):
         raise ValueError("Keyframes overlap the manifest's held-out images")
-    selected = [im for im in all_images if im.name in set(names)]
+    name_set = set(names)
+    selected = [im for im in all_images if im.name in name_set]
+    check_names = manifest.get("pose_validation_images", [])
+    if (len(set(check_names)) != len(check_names) or set(check_names) & name_set or
+            set(check_names) - {im.name for im in all_images}):
+        raise ValueError("Validation photos must be unique registered images outside the fit")
+    check_set = set(check_names)
+    checks = [im for im in all_images if im.name in check_set]
     if len(selected) < 3:
         raise ValueError("At least three selected images are required")
     settings = {k: str(v.resolve()) if isinstance(v, Path) else v for k, v in vars(args).items() if k != "output"}
+    if not args.keep_lidar_indices:
+        settings.pop("keep_lidar_indices")
+    if checks:
+        settings["validation_files_sha256"] = digest([file_stamp(image_path(source, args.images, im.name)) for im in checks])
+    if args.keep_lidar_indices and args.output.expanduser().resolve().is_relative_to(source):
+        raise ValueError("Set the pose export directory outside the source scene")
     settings.update(version=1, model=stamps, cloud=file_stamp(cloud), manifest_sha256=digest(manifest),
                     image_files_sha256=digest([file_stamp(image_path(source, args.images, im.name)) for im in selected]))
     output = prepare_output(args.output.expanduser().resolve(), settings)
@@ -167,12 +180,27 @@ def refine(args):
         atomic_json(report_file, dict(accepted=False, rejection_reasons=[str(exc)], matching=diagnostics))
         raise
     report.update(source=str(source), keyframes=str(args.keyframes.resolve()), matching=diagnostics)
+    if checks:
+        from .validation import check_views
+        independent = check_views(source, args.images, cameras, checks, selected, features,
+                                  points, normals, planar, R, C, report["per_image"], args)
+        report["independent_views"] = independent
+        report["rejection_reasons"].extend(independent["rejection_reasons"])
+        report["accepted"] = not report["rejection_reasons"]
+        gain = independent["median_gain_native_px"]
+        coverage = f'{independent["supported"]}/{len(checks)}'
+        print(f"Independent photos: {coverage} supported; native pixel error before/after "
+              f"{independent['median_before_after_native_px']}; paired median gain {gain} (positive is better)", flush=True)
     atomic_json(report_file, report)
     print(f"Held-out median: {report['validation_before']['median']:.3f} -> {report['validation_after']['median']:.3f} working-image px", flush=True)
     if not report["accepted"]:
         raise ValueError("Refinement rejected: " + "; ".join(report["rejection_reasons"]) + ". Original poses untouched; see refinement_report.json.")
-    dataset = export_dataset(output, source, args.images, cloud, cameras, all_images,
-                             selected, features, tracks, R, C, X, manifest)
+    if args.keep_lidar_indices:
+        from .pose_export import export_poses
+        dataset = export_poses(output, source, model, cloud, selected, R, C, report, manifest)
+    else:
+        dataset = export_dataset(output, source, args.images, cloud, cameras, all_images,
+                                 selected, features, tracks, R, C, X, manifest)
     print(f"Validated COLMAP dataset: {dataset}\nTrain using {dataset / 'keyframes.json'}", flush=True)
     return dataset
 
@@ -184,6 +212,8 @@ def parser():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--images", default="images")
     p.add_argument("--point-cloud", type=Path)
+    p.add_argument("--keep-lidar-indices", action="store_true",
+                   help="Mirror the source dataset and replace only supported extrinsics in its COLMAP poses")
     p.add_argument("--voxel-size", type=float, default=.05)
     p.add_argument("--max-points", type=int, default=500_000)
     p.add_argument("--surface-radius", type=float, default=.3)
@@ -216,7 +246,7 @@ def parser():
 def main(argv=None):
     p = parser()
     args = p.parse_args(argv)
-    numeric = [v for v in vars(args).values() if isinstance(v, (int, float))]
+    numeric = [v for v in vars(args).values() if type(v) in (int, float)]
     if any(v <= 0 or not np.isfinite(v) for v in numeric) or not 0 < args.ratio < 1:
         p.error("Numeric parameters must be positive and ratio must be in (0,1)")
     if args.max_tracks < args.min_tracks or args.max_points < 20:
