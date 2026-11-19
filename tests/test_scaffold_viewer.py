@@ -74,6 +74,20 @@ class ScaffoldViewerTests(unittest.TestCase):
         (self.run / "point_cloud/iteration_4/ready.json").write_text("{}")
         self.assertEqual(tuple(viewer_mod.discover_checkpoints(self.root)["run"]), (4,))
 
+    def test_native_catalog_waits_for_snapshot_publication(self):
+        (self.run / "cfg_args").write_text("Namespace(sh_degree=1, antialiasing=False)")
+        (self.run / "periodic_evaluation").mkdir()
+        (self.run / "periodic_evaluation/plan.json").touch()
+        self.ply.write_bytes(b"ply")
+        newer = self.folder.parent / "iteration_10000"
+        newer.mkdir()
+        (newer / "point_cloud.ply").write_bytes(b"ply")
+        self.assertEqual(viewer_mod.native_checkpoints(self.run), {})
+        (self.folder / "ready.json").touch()
+        self.assertEqual(viewer_mod.native_checkpoints(self.run), {7000: self.ply})
+        (newer / "ready.json").touch()
+        self.assertEqual(tuple(viewer_mod.native_checkpoints(self.run)), (10000, 7000))
+
     def test_projected_child_radii_and_orientation(self):
         from scripts.scaffold_viewer_render import projected_axes, projected_centers
         ids, uv, local = projected_centers(np.array([[0,0,2], [2,0,2], [0,0,-1]]), np.eye(4), 100, 80, 60)
@@ -155,6 +169,40 @@ class ScaffoldViewerTests(unittest.TestCase):
         (self.run / 'cfg_args').write_text("Namespace(model_type='scaffold', scaffold_n_offsets=10, antialiasing=False)")
         app.load(self.ply)
         self.assertFalse(app.antialiasing.value)
+
+    @unittest.skipUnless(importlib.util.find_spec("viser"), "optional viser dependency not installed")
+    def test_native_viewer_follows_new_checkpoints_and_can_open_older_ones(self):
+        import viser
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        server = viser.ViserServer(host="127.0.0.1", port=port, verbose=False)
+        self.addCleanup(server.stop)
+        (self.run / "cfg_args").write_text("Namespace(sh_degree=1, antialiasing=False)")
+        loaded = []
+
+        class Backend:
+            def __init__(self, ply, cfg): loaded.append(ply)
+            def close(self): pass
+
+        app = viewer_mod.Viewer(server, self.root, backend_factory=Backend, native_model=self.run)
+        self.addCleanup(app.close)
+        self.assertFalse(loaded)
+        self.ply.write_bytes(b"ply")
+        app.refresh_catalog()
+        self.assertEqual(loaded, [self.ply])
+        self.assertFalse(app.antialiasing.value)
+        newer = self.folder.parent / "iteration_10000"
+        newer.mkdir()
+        newest_ply = newer / "point_cloud.ply"
+        newest_ply.write_bytes(b"ply")
+        app.refresh_catalog()
+        self.assertEqual(loaded, [self.ply, newest_ply])
+        app.step.value = "7000"
+        app.open_selected_step()
+        app.refresh_catalog()
+        self.assertFalse(app.follow_latest.value)
+        self.assertEqual(loaded, [self.ply, newest_ply, self.ply])
 
 
 if __name__ == "__main__":

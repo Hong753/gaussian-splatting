@@ -1,4 +1,4 @@
-"""Free-camera RGB and geometry inspection for native and upstream Scaffold checkpoints."""
+"""Free-camera rendering for 3DGS and Scaffold checkpoints."""
 import json
 import math
 import multiprocessing
@@ -61,6 +61,38 @@ def overlay_geometry(rgb, mode, xyz, w2c, focal, scales=None, rotations=None):
                     cv2.ellipse(image, tuple(center), tuple(np.maximum(1, np.rint(radius).astype(int))),
                                 angle, 0, 360, (255, 184, 77), 1, cv2.LINE_AA)
     return image
+
+
+class NativeBackend:
+    def __init__(self, ply, cfg):
+        import torch
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is required to render 3DGS on this machine")
+        from gaussian_renderer import render
+        from scene.cameras import MiniCam
+        from scene.gaussian_model import GaussianModel
+        from utils.graphics_utils import getProjectionMatrix
+
+        self.torch, self.MiniCam, self.projection = torch, MiniCam, getProjectionMatrix
+        self.render = render
+        self.model = GaussianModel(cfg.get("sh_degree", 3))
+        self.model.load_ply(str(ply))
+        self.background = torch.full((3,), float(cfg.get("white_background", False)), device="cuda")
+
+    def render_image(self, wxyz, pos, fovy, width, height, antialiasing, mode="RGB"):
+        w2c, fovx = camera_matrices(wxyz, pos, fovy, width, height)
+        with self.torch.no_grad():
+            view = self.torch.as_tensor(w2c, device="cuda").T.contiguous()
+            proj = self.projection(.01, 100., fovx, fovy).T.cuda()
+            cam = self.MiniCam(width, height, fovy, fovx, .01, 100., view, view @ proj)
+            pipe = SimpleNamespace(debug=False, antialiasing=antialiasing,
+                                   compute_cov3D_python=False, convert_SHs_python=False)
+            rgb = self.render(cam, self.model, pipe, self.background)["render"]
+            return rgb.permute(1, 2, 0).mul(255).round().byte().cpu().numpy()
+
+    def close(self):
+        del self.model
+        self.torch.cuda.empty_cache()
 
 
 class ScaffoldBackend:

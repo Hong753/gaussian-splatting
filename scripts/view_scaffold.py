@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Explore saved Scaffold-GS checkpoints in a browser.
+"""Explore saved Scaffold-GS or native 3DGS checkpoints in a browser.
 
-The file picker browses the viewer machine's filesystem; it does not upload PLYs.
-The selected point_cloud.ply must have the Scaffold MLP files beside it.
+Open a native run with --native-model or browse Scaffold runs with --suite.
 """
 import argparse
 import json
@@ -19,7 +18,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts.eval_all_frames import read_config
-from scripts.scaffold_viewer_render import MODES, ScaffoldBackend, UpstreamBackend, camera_matrices
+from scripts.scaffold_viewer_render import MODES, NativeBackend, ScaffoldBackend, UpstreamBackend, camera_matrices
 
 MLP_FILES = ("opacity_mlp.pt", "cov_mlp.pt", "color_mlp.pt")
 
@@ -99,13 +98,31 @@ def discover_checkpoints(suite):
     return runs
 
 
+def native_checkpoints(root):
+    steps = {}
+    if not (root / 'cfg_args').is_file() or not (root / 'cameras.json').is_file():
+        return steps
+    publishes_snapshots = (root / 'periodic_evaluation/plan.json').is_file()
+    for folder in (root / 'point_cloud').glob('iteration_*'):
+        number = folder.name.removeprefix('iteration_')
+        ply = folder / 'point_cloud.ply'
+        if not number.isdecimal() or not ply.resolve().is_relative_to(root):
+            continue
+        if publishes_snapshots and not (folder / 'ready.json').is_file():
+            continue
+        if ply.is_file() and ply.stat().st_size:
+            steps[int(number)] = ply
+    return dict(sorted(steps.items(), reverse=True))
+
+
 def backend_for(ply, cfg):
     return (UpstreamBackend if cfg.get("scaffold_upstream") else ScaffoldBackend)(ply, cfg)
 
 
 class Viewer:
-    def __init__(self, server, start_dir, backend_factory=backend_for, *, suite=None):
-        self.server, self.backend_factory = server, backend_factory
+    def __init__(self, server, start_dir, backend_factory=None, *, suite=None, native_model=None):
+        self.server = server
+        self.backend_factory = backend_factory or (NativeBackend if native_model is not None else backend_for)
         self.backend = None
         self.generation = 0
         self.model_lock = threading.RLock()
@@ -117,6 +134,7 @@ class Viewer:
         self.camera_poses = {}
         self.scene_source = None
         self.suite = Path(suite).resolve() if suite is not None else None
+        self.native_model = Path(native_model).resolve() if native_model is not None else None
         self.catalog_lock = threading.RLock()
         self.runs = {}
         self.attempted = None
@@ -125,7 +143,7 @@ class Viewer:
         gui = server.gui
         gui.configure_theme(dark_mode=True, control_layout="collapsible", show_share_button=False)
         with gui.add_folder("Scene"):
-            if self.suite is None:
+            if self.suite is None and self.native_model is None:
                 self.add_file_picker(start_dir)
             else:
                 self.run = gui.add_dropdown("Run", ("Waiting for runs",))
@@ -135,9 +153,18 @@ class Viewer:
                 self.run.on_update(lambda _: self.refresh_steps())
                 self.load_step.on_click(lambda _: self.open_selected_step())
                 self.refresh_runs.on_click(lambda _: self.refresh_catalog())
-            self.status = gui.add_markdown("Choose a saved Scaffold checkpoint.")
+                if self.native_model is not None:
+                    self.run.disabled = True
+                    self.follow_latest = gui.add_checkbox("Follow latest checkpoint", initial_value=True)
+                    self.follow_latest.on_update(lambda _: self.refresh_catalog())
+            model_type = "3DGS" if self.native_model is not None else "Scaffold"
+            self.status = gui.add_markdown(f"Choose a saved {model_type} checkpoint.")
         with gui.add_folder("Viewport"):
-            self.mode = gui.add_dropdown("Display", MODES, hint="Rings show sampled one-sigma child footprints. Centers show sampled voxel anchors.")
+            if self.native_model is not None:
+                self.mode = gui.add_dropdown("Display", ("RGB",))
+                self.mode.disabled = True
+            else:
+                self.mode = gui.add_dropdown("Display", MODES, hint="Rings show sampled one-sigma child footprints. Centers show sampled voxel anchors.")
             self.resolution = gui.add_slider("Render width", min=320, max=1920, step=32, initial_value=960)
             self.antialiasing = gui.add_checkbox("Anti-aliasing", initial_value=True)
             self.lossless = gui.add_checkbox("Lossless PNG", initial_value=False,
@@ -181,7 +208,7 @@ class Viewer:
                 self.pending.pop(client.client_id, None)
                 self.active_clients.discard(client.client_id)
 
-        if self.suite is None:
+        if self.suite is None and self.native_model is None:
             self.refresh()
         else:
             self.refresh_catalog()
@@ -225,7 +252,10 @@ class Viewer:
 
     def refresh_catalog(self):
         with self.catalog_lock:
-            self.runs = discover_checkpoints(self.suite)
+            if self.native_model is not None:
+                self.runs = {self.native_model.name: native_checkpoints(self.native_model)}
+            else:
+                self.runs = discover_checkpoints(self.suite)
             names = tuple(self.runs) or ("Waiting for runs",)
             if tuple(self.run.options) != names:
                 previous = self.run.value
@@ -235,9 +265,11 @@ class Viewer:
                 self.run.value = previous if previous in names else preferred
             self.refresh_steps()
             steps = self.runs.get(self.run.value, {})
-            if self.backend is None and steps:
-                latest = next(iter(steps.values()))
+            auto_load = self.backend is None if self.native_model is None else self.follow_latest.value
+            if auto_load and steps:
+                number, latest = next(iter(steps.items()))
                 if latest != self.attempted:
+                    self.step.value = str(number)
                     self.load(latest)
             elif self.backend is None and not steps:
                 self.status.content = "Waiting for a saved 3D checkpoint. Orange4F saves at 10k, 20k and 30k."
@@ -256,6 +288,8 @@ class Viewer:
             if self.step.value.isdecimal():
                 ply = self.runs.get(self.run.value, {}).get(int(self.step.value))
                 if ply is not None:
+                    if self.native_model is not None:
+                        self.follow_latest.value = False
                     self.load(ply)
 
     def refresh(self):
@@ -274,11 +308,19 @@ class Viewer:
             self.status.content = f"**Folder error:** {exc}"
 
     def load(self, selected):
+        self.attempted = selected
         try:
-            ply, root, cfg = model_paths(selected)
+            if self.native_model is not None:
+                root = self.native_model
+                if selected not in self.runs.get(root.name, {}).values():
+                    raise ValueError("Choose a checkpoint from the specified native 3DGS run")
+                ply, cfg = selected, read_config(root / "cfg_args")
+                if cfg.get("model_type", "3dgs") != "3dgs":
+                    raise ValueError("The specified run is not native 3DGS")
+            else:
+                ply, root, cfg = model_paths(selected)
             if self.suite is not None and (root.parent != self.suite or ply not in self.runs.get(root.name, {}).values()):
                 raise ValueError("Choose a checkpoint from the suite")
-            self.attempted = selected
             poses = saved_cameras(root / "cameras.json")
             source = cfg.get("source_path")
             self.status.content = f"Loading `{ply}` on the GPU…"
@@ -302,6 +344,8 @@ class Viewer:
                 for client in self.server.get_clients().values():
                     self.set_initial_camera(client)
             self.status.content = f"**Loaded** · {root.name} · {ply.parent.name}"
+            if self.native_model is not None:
+                print(f"Loaded {root.name} · {ply.parent.name}", flush=True)
             self.schedule_all()
         except Exception as exc:
             self.status.content = f"**Load failed:** {type(exc).__name__}: {exc}"
@@ -373,19 +417,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpu", default="0", help="CUDA GPU index")
     parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--host", default="127.0.0.1", help="Listen address. Use 0.0.0.0 with --suite for LAN access.")
+    parser.add_argument("--host", default="127.0.0.1", help="Use 0.0.0.0 with --suite or --native-model for remote access.")
     group = parser.add_mutually_exclusive_group()
     default_suite = Path(os.environ.get("ORANGE4F_OUTPUT_ROOT", "/data/3dgs_outputs/orange4f/3dgs_finetuning"))/"stride3_noaa_v1"
     group.add_argument("--suite", nargs="?", type=Path, const=default_suite, help="Pick saved runs and iterations (default Orange4F suite)")
+    group.add_argument("--native-model", type=Path, help="Open and follow saved checkpoints from a single native 3DGS run")
     group.add_argument("--browse-root", type=Path, default=None,
                         help="Optional initial folder (default: home directory)")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
-    if args.host not in ("127.0.0.1", "::1", "localhost") and args.suite is None:
-        parser.error("Use --suite for a remote viewer and select from its saved models.")
+    if args.host not in ("127.0.0.1", "::1", "localhost") and args.suite is None and args.native_model is None:
+        parser.error("Use --suite or --native-model for a remote viewer.")
     if args.suite is not None and not args.suite.expanduser().is_dir():
         parser.error(f"Suite directory does not exist: {args.suite}")
+    if args.native_model is not None and not args.native_model.expanduser().is_dir():
+        parser.error(f"Run directory does not exist: {args.native_model}")
     start_dir = args.browse_root.expanduser() if args.browse_root is not None else Path.home()
     if not start_dir.is_dir():
         fallback = Path.cwd()
@@ -396,8 +443,10 @@ def main():
         import viser
     except ImportError:
         parser.exit(1, "Install the viewer dependency: python -m pip install 'viser==1.0.30'\n")
-    server = viser.ViserServer(host=args.host, port=args.port, label="Scaffold-GS Viewer")
-    viewer = Viewer(server, start_dir, suite=args.suite.expanduser() if args.suite else None)
+    label = "3DGS Viewer" if args.native_model is not None else "Scaffold-GS Viewer"
+    server = viser.ViserServer(host=args.host, port=args.port, label=label)
+    viewer = Viewer(server, start_dir, suite=args.suite.expanduser() if args.suite else None,
+                    native_model=args.native_model.expanduser() if args.native_model else None)
     host = "<server-ip>" if args.host == "0.0.0.0" else args.host
     port = server.get_port()
     print(f"Open http://{host}:{port}/", flush=True)
@@ -410,7 +459,7 @@ def main():
     try:
         while True:
             time.sleep(10)
-            if args.suite:
+            if args.suite or args.native_model:
                 try:
                     viewer.refresh_catalog()
                 except OSError as exc:
