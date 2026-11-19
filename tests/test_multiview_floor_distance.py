@@ -10,6 +10,7 @@ import pytest
 
 from scripts import orange4f_multiview_floor_distance as probe
 from scripts import render as gallery
+from scripts.orange4f_splat_footprints import NEIGHBOR
 from utils.region_loss import load_view_weights, mask_path
 from utils.training_previews import create_previewer
 
@@ -26,7 +27,7 @@ def make_suite(tmp_path):
     poses = {
         "09879.jpg": (0.26, 0.45, 0.45),
         probe.REFERENCE: (0, 0, 0),
-        probe.NEIGHBOR: (0.08, 0.05, 0.0),
+        NEIGHBOR: (0.08, 0.05, 0.0),
         "09885.jpg": (0.2, 0.15, -0.25),
         "09888.jpg": (-0.15, -0.3, -2.0),
         "09891.jpg": (10.0, 0.0, -2.0),
@@ -47,8 +48,11 @@ def make_suite(tmp_path):
     for name in poses:
         Image.fromarray(rgb).save(source / "images" / name, quality=100)
     x, y = np.meshgrid(np.linspace(-3.2, 3.2, 220), np.linspace(-3.2, 3.2, 220))
-    xyz = np.zeros(x.size, dtype=[("x", "f4"), ("y", "f4"), ("z", "f4")])
-    xyz["x"], xyz["y"], xyz["z"] = x.ravel(), y.ravel(), 3.0
+    # An intervening surface hides the original crop from distant cameras.
+    ox, oy = np.meshgrid(np.linspace(0.15, 2.8, 140), np.linspace(0.85, 2.9, 110))
+    xyz = np.zeros(x.size + ox.size, dtype=[("x", "f4"), ("y", "f4"), ("z", "f4")])
+    xyz["x"], xyz["y"] = np.r_[x.ravel(), ox.ravel()], np.r_[y.ravel(), oy.ravel()]
+    xyz["z"] = np.r_[np.full(x.size, 3.0), np.full(ox.size, -1.0)]
     cloud = model / "input.ply"
     PlyData([PlyElement.describe(xyz, "vertex")]).write(cloud)
     manifest = model / "keyframes.json"
@@ -77,19 +81,61 @@ def make_suite(tmp_path):
 def test_multiview_probe_prepares_real_colmap_and_lidar_then_uses_shared_split(tmp_path, monkeypatch):
     suite, cfg, _ = make_suite(tmp_path)
     data_path = suite / probe.REPORT
+    source = Path(cfg.source_path)
+    _, cameras, images, stamps = probe.read_model(source)
+    by_name = {view.name: view for view in images}
+    ref = by_name[probe.REFERENCE]
+    cam = cameras[ref.camera_id]
+    left, top, right, bottom = [
+        round(frac * size)
+        for frac, size in zip(
+            probe.ROI_FRACTIONS,
+            (cam.width, cam.height) * 2,
+        )
+    ]
+    rect = left, top, right - left, bottom - top
+    center, normal = np.array([0.0, 0.0, 3.0]), np.array([0.0, 0.0, 1.0])
+    world = probe.plane_grid(ref, cam, rect, center, normal)
+    original_range = float(np.linalg.norm(ref.C - world.mean(axis=(0, 1))))
+    allowed = set(json.loads((suite / "3dgs/keyframes.json").read_text())["selected_images"])
+    with pytest.raises(ValueError, match="No distant train/eval pair"):
+        probe.match_floor_views(
+            source,
+            suite / "3dgs/input.ply",
+            "images",
+            images,
+            cameras,
+            stamps,
+            allowed,
+            4,
+            None,
+            2.0,
+            original_range,
+            ref,
+            rect,
+            [by_name[NEIGHBOR]],
+            (center, normal, world),
+            {},
+        )
     args = ["--suite", str(suite), "--steps-per-view", "5", "--search-window", "2"]
     probe.main([*args, "--prepare-only"])
     protocol = json.loads((data_path / "protocol.json").read_text())
     train = protocol["train"]
     holdout = protocol["held_out"]
-    assert train[0] == probe.REFERENCE and len(train) == 4
-    assert holdout == [probe.NEIGHBOR, "10903.jpg"]
-    assert set(train) == {probe.REFERENCE, "09879.jpg", "10900.jpg", "10901.jpg"}
-    far_min = protocol["geometry"]["far_min_distance_m"]
-    assert far_min == pytest.approx(2 * protocol["views"][probe.REFERENCE]["distance_m"])
+    assert len(train) == 4 and len(holdout) == 2
+    assert not set(train).intersection(holdout)
     assert {protocol["views"][name]["distance_group"] for name in holdout} == {"near", "far"}
-    for name in ["10900.jpg", "10901.jpg", "10903.jpg"]:
-        assert protocol["views"][name]["distance_m"] >= far_min
+    assert [protocol["views"][name]["distance_group"] for name in train].count("far") == 2
+    geometry = protocol["geometry"]
+    assert geometry["reference"] == train[0]
+    assert np.linalg.norm(np.array(geometry["patch_center_m"]) - geometry["original_patch_center_m"]) >= 1
+    far_min = geometry["far_min_distance_m"]
+    assert far_min == pytest.approx(
+        2 * max(geometry["original_reference_range_m"], protocol["views"][train[0]]["distance_m"])
+    )
+    for name in protocol["views"]:
+        if protocol["views"][name]["distance_group"] == "far":
+            assert name.startswith("109") and protocol["views"][name]["distance_m"] >= far_min
     assert protocol["iteration"] == 20
     distance_weights = protocol["training_weights"]["distance_weighted"]
     d = {name: protocol["views"][name]["distance_m"] for name in train}
@@ -187,7 +233,7 @@ def test_view_weight_loader_rejects_eval_frames_and_nonpositive_weights(tmp_path
 
 def test_distant_run_refuses_to_prepare_close_only(tmp_path):
     suite, _, _ = make_suite(tmp_path)
-    with pytest.raises(ValueError, match="distinct distant training and held-out"):
+    with pytest.raises(ValueError, match="No alternative floor crop"):
         probe.main(["--suite", str(suite), "--far-min-ratio", "4", "--prepare-only"])
     assert not (suite / probe.REPORT / "protocol.json").is_file()
 

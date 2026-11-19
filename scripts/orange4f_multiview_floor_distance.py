@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 
 import cv2
 import numpy as np
@@ -26,13 +27,14 @@ from scripts.orange4f_floor_neighbors import (
     local_cloud,
     visible_floor,
 )
+from scripts.orange4f_floor_patch_search import alternate_patches
 from scripts.orange4f_one_view_weight import crop_result
-from scripts.orange4f_splat_footprints import NEIGHBOR, bright_cores, validate_audit_camera
+from scripts.orange4f_splat_footprints import bright_cores, validate_audit_camera
 from scripts.view_comparisons import image_id, model_info
 from utils.checkpoint_snapshots import atomic_json, atomic_write, digest, read_snapshot
 from utils.region_loss import mask_path
 
-REPORT = "multiview_floor_distance_v2"
+REPORT = "multiview_floor_distance_v3"
 ARMS = ("uniform", "distance_weighted")
 
 
@@ -87,16 +89,101 @@ def find_floor_views(suite, output, allowed, count, search_window, far_min_ratio
     folder = json.loads(Path(meta["selection"]).read_text()).get("image_directory", "images")
     _, cameras, images, stamps = read_model(source)
     records = {v.name: v for v in images}
-    ref, near_eval = (records[n] for n in (REFERENCE, NEIGHBOR))
-    ref_cam = cameras[ref.camera_id]
-    x, y, right, bottom = [round(v * n) for v, n in zip(ROI_FRACTIONS, (ref_cam.width, ref_cam.height) * 2)]
-    rect = (x, y, right - x, bottom - y)
-    photo = load_rgb(image_path(source, folder, REFERENCE), ref_cam)
-    raw_floor = floor_points(cloud, ref, ref_cam, rect, (0.05, np.inf))
-    fit, plane, reason = fit_visible_patch(raw_floor, ref, ref_cam, rect, photo[y:bottom, x:right], output)
-    if fit is None:
-        raise ValueError(f"Cannot fit the audited floor patch. {reason}")
+    original = records[REFERENCE]
+    camera = cameras[original.camera_id]
+    x, y, right, bottom = [round(v * n) for v, n in zip(ROI_FRACTIONS, (camera.width, camera.height) * 2)]
+    original_rect = (x, y, right - x, bottom - y)
+
+    def fit_patch(view, rect):
+        cam = cameras[view.camera_id]
+        left, top, width, height = rect
+        photo = load_rgb(image_path(source, folder, view.name), cam)
+        points = floor_points(cloud, view, cam, rect, (0.05, np.inf))
+        return fit_visible_patch(points, view, cam, rect, photo[top : top + height, left : left + width], output)
+
+    original_fit, _, reason = fit_patch(original, original_rect)
+    if original_fit is None:
+        raise ValueError(f"Cannot establish the audited floor level. {reason}")
+    origin, original_normal, original_world = original_fit
+    patches, original_range, axes = alternate_patches(
+        cloud,
+        origin,
+        original_normal,
+        original,
+        original_world,
+        images,
+        cameras,
+        allowed,
+        far_min_ratio,
+    )
+    old_corners = (original_world[[0, 0, -1, -1], [0, -1, -1, 0]] - origin) @ axes.T
+    print(f"Found {len(patches)} alternative floor crops with near and distant framing", flush=True)
+    for attempt, (_, ref, rect, near_options) in enumerate(patches, 1):
+        print(f"Checking alternative floor crop {attempt}/{len(patches)} in {ref.name}, ROI {rect}", flush=True)
+        fit, plane, reason = fit_patch(ref, rect)
+        if fit is None:
+            print(f"  {reason}", flush=True)
+            continue
+        center, normal, world = fit
+        bounds = (world[[0, 0, -1, -1], [0, -1, -1, 0]] - origin) @ axes.T
+        separate = (
+            (bounds.max(axis=0) < old_corners.min(axis=0)) | (bounds.min(axis=0) > old_corners.max(axis=0))
+        ).any()
+        same_floor = abs(normal @ original_normal) >= 0.95 and abs((center - origin) @ original_normal) <= 0.15
+        if not separate or not same_floor:
+            print("  Projected crop overlaps the original patch or fits a different surface", flush=True)
+            continue
+        try:
+            train, held_out, data, geometry = match_floor_views(
+                source,
+                cloud,
+                folder,
+                images,
+                cameras,
+                stamps,
+                allowed,
+                count,
+                search_window,
+                far_min_ratio,
+                original_range,
+                ref,
+                rect,
+                near_options,
+                fit,
+                plane,
+            )
+        except ValueError as exc:
+            print(f"  {exc}", flush=True)
+            continue
+        geometry["original_patch_center_m"] = original_world.mean(axis=(0, 1)).tolist()
+        print(f"Selected a different floor patch in {ref.name}, ROI {rect}", flush=True)
+        return train, held_out, data, geometry
+    raise ValueError(
+        f"No alternative floor crop passed the near/far visibility checks after testing {len(patches)} candidates."
+    )
+
+
+def match_floor_views(
+    source,
+    cloud,
+    folder,
+    images,
+    cameras,
+    stamps,
+    allowed,
+    count,
+    search_window,
+    far_min_ratio,
+    original_range,
+    ref,
+    rect,
+    near_options,
+    fit,
+    plane,
+):
     center, normal, world = fit
+    ref_cam = cameras[ref.camera_id]
+    records = {v.name: v for v in images}
     corners = world[[0, 0, -1, -1], [0, -1, -1, 0]]
     floor_min, floor_max = corners.min(axis=0), corners.max(axis=0)
     # Keep the distance anchor identical even when a candidate changes the common pixel mask.
@@ -106,12 +193,13 @@ def find_floor_views(suite, output, allowed, count, search_window, far_min_ratio
         return float(np.linalg.norm(view.C - patch_center))
 
     ref_distance = distance(ref)
-    far_distance = far_min_ratio * ref_distance
-    ref_index = next(i for i, v in enumerate(images) if v.name == REFERENCE)
+    far_distance = far_min_ratio * max(original_range, ref_distance)
+    ref_index = next(i for i, v in enumerate(images) if v.name == ref.name)
     prescreen = world[::8, ::8]
     near_candidates, far_candidates = [], []
+    camera_side = np.sign((ref.C - center) @ normal)
     for index, view in enumerate(images):
-        if view.name in (REFERENCE, NEIGHBOR):
+        if view.name == ref.name or ((view.C - center) @ normal) * camera_side <= 0:
             continue
         is_far = distance(view) >= far_distance
         if not is_far and (
@@ -128,15 +216,12 @@ def find_floor_views(suite, output, allowed, count, search_window, far_min_ratio
     print(
         f"Full-scene search: {len(far_candidates)} distant candidates, including {stride_candidates} "
         f"stride-3 training candidates. Distant means at least {far_distance:.2f} m "
-        f"({far_min_ratio:g}× {REFERENCE}).",
+        f"(at least {far_min_ratio:g}× the new reference range).",
         flush=True,
     )
     if len(far_candidates) < 2:
-        raise ValueError(
-            "Need distinct distant training and held-out cameras with this floor patch in frame. "
-            "The full capture was searched. Adjust --far-min-ratio if the capture has a shorter range."
-        )
-    points = local_cloud(cloud, world, [v.C for v in [ref, near_eval, *near_candidates, *far_candidates]])
+        raise ValueError("Fewer than two distant cameras frame this crop.")
+    points = local_cloud(cloud, world, [v.C for v in [ref, *near_options, *near_candidates, *far_candidates]])
 
     def support(view):
         # Exclude points outside the camera-to-patch box before projecting the LiDAR.
@@ -147,22 +232,38 @@ def find_floor_views(suite, output, allowed, count, search_window, far_min_ratio
         xy, valid = target_grid(world, view, camera)
         return visible_floor(local, center, normal, view, camera, xy, valid)
 
-    base_mask = support(ref) & support(near_eval)
-    reference_support = int(base_mask.sum())
-    minimum = 0.5 * reference_support
-
     def projection(view):
         return native_projection(world, ref, ref_cam, rect, view, cameras[view.camera_id], center, normal)
+
+    ref_mask = support(ref)
+    ref_projection = projection(ref)
+    if not mask_interior(ref_mask, 5).any():
+        raise ValueError("The reference crop has no supported 11×11 floor window.")
+    for near_eval in near_options:
+        if distance(near_eval) >= far_distance:
+            continue
+        try:
+            near_projection = projection(near_eval)
+        except ValueError:
+            continue
+        base_mask = ref_mask & support(near_eval)
+        if (
+            base_mask.sum() >= 0.5 * ref_mask.sum()
+            and mask_interior(base_mask, 5).any()
+            and mask_interior(native_mask(base_mask, near_projection[1]), 5).any()
+        ):
+            break
+    else:
+        raise ValueError("No distinct near held-out camera shares enough visible floor with the reference.")
+    reference_support = int(base_mask.sum())
+    minimum = 0.5 * reference_support
+    mappings = {ref.name: ref_projection, near_eval.name: near_projection}
+    reference_projections = list(mappings.values())
 
     def usable(mask, projections):
         return mask.sum() >= minimum and all(
             mask_interior(native_mask(mask, mapping), 5).any() for _, mapping in projections
         )
-
-    mappings = {v.name: projection(v) for v in (ref, near_eval)}
-    reference_projections = list(mappings.values())
-    if not usable(base_mask, reference_projections):
-        raise ValueError("Reference and near held-out photos share no floor region large enough for SSIM")
 
     rejected = set()
 
@@ -203,9 +304,7 @@ def find_floor_views(suite, output, allowed, count, search_window, far_min_ratio
             break
     if train_far is None:
         raise ValueError(
-            f"No distant train/eval pair at {far_distance:.2f} m or farther shares enough visible floor "
-            "and native pixels with the reference. The full capture was searched. "
-            "Adjust --far-min-ratio if the capture has a shorter usable range."
+            f"No distant train/eval pair at {far_distance:.2f} m or farther shares enough visible floor."
         )
 
     train = [ref, train_far]
@@ -261,6 +360,10 @@ def find_floor_views(suite, output, allowed, count, search_window, far_min_ratio
         plane=plane,
         camera_files=stamps,
         patch_center_m=patch_center.tolist(),
+        reference=ref.name,
+        reference_roi_xywh=list(rect),
+        original_floor_reference=REFERENCE,
+        original_reference_range_m=original_range,
         far_min_ratio=far_min_ratio,
         far_min_distance_m=far_distance,
         common_reference_pixels=int(common.sum()),
@@ -316,6 +419,7 @@ def write_gallery(root, status, iteration, train_names, data, weights, final, fa
         "figure{margin:0}img{width:100%;height:auto}a{color:#9de0ff}th,td{padding:5px 14px;text-align:left}"
         "@media(max-width:720px){.panels{grid-template-columns:1fr}}</style>"
         f"<h1>Multiview floor loss</h1><p>{escape(status)} · {iteration:,} steps per run</p>"
+        f"<p>Reference crop in {escape(train_names[0])}. <a href='plane_support.png'>LiDAR support</a></p>"
         "<p>Both runs use the same floor region and original cameras. Each training view has weight 1× "
         "in the uniform run. The distance-weighted run gives closer cameras greater weight. "
         f"Distant cameras are at least {far_min_distance:.2f} m from the patch. "
@@ -343,14 +447,17 @@ def launch(
     native_base = dict(base, cfg=dict(base["cfg"], eval=False))
     with experiment_lock(root) as lock:
         root.mkdir(exist_ok=True)
-        train_names, heldout_names, data, geometry = find_floor_views(
-            suite,
-            root,
-            base["splits"]["train"],
-            count,
-            search_window,
-            far_min_ratio,
-        )
+        with TemporaryDirectory(dir=root) as preparation:
+            staging = Path(preparation)
+            train_names, heldout_names, data, geometry = find_floor_views(
+                suite,
+                staging,
+                base["splits"]["train"],
+                count,
+                search_window,
+                far_min_ratio,
+            )
+            overlay = (staging / "plane_support.png").read_bytes()
         iteration = len(train_names) * steps_per_view
         far_min_distance = geometry["far_min_distance_m"]
         weights = inverse_square_weights({name: data[name]["distance"] for name in train_names})
@@ -401,6 +508,7 @@ def launch(
         if models_exist and not protocol.exists():
             raise FileExistsError(f"Unrecognized run directories in {root}")
         atomic_json(protocol, plan)
+        atomic_write(root / "plane_support.png", lambda path: path.write_bytes(overlay))
         atomic_json(weights_file, weights)
         for name, patch in data.items():
             atomic_write(
@@ -500,7 +608,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", type=Path, default=SUITE)
     parser.add_argument("--gpu", help="Physical CUDA device. Defaults to an idle GPU.")
-    parser.add_argument("--train-views", type=int, default=4, help="Target number including 09882.jpg")
+    parser.add_argument("--train-views", type=int, default=4, help="Target number of training cameras")
     parser.add_argument(
         "--steps-per-view", type=int, default=2000, help="Total steps divided by the training view count"
     )
