@@ -30,6 +30,9 @@ def make_suite(tmp_path):
         "09885.jpg": (0.2, 0.15, -0.25),
         "09888.jpg": (-0.15, -0.3, -2.0),
         "09891.jpg": (10.0, 0.0, -2.0),
+        "10900.jpg": (0.1, -0.1, -6.2),
+        "10901.jpg": (-0.3, 0.0, -6.7),
+        "10903.jpg": (0.4, 0.3, -7.0),
     }
     (sparse / "cameras.txt").write_text(f"1 PINHOLE {size} {size} 200 200 210 210\n")
     (sparse / "images.txt").write_text(
@@ -49,7 +52,8 @@ def make_suite(tmp_path):
     cloud = model / "input.ply"
     PlyData([PlyElement.describe(xyz, "vertex")]).write(cloud)
     manifest = model / "keyframes.json"
-    manifest.write_text(json.dumps(dict(selected_images=list(poses), image_directory="images")))
+    selected = [name for name in poses if name != "10903.jpg"]
+    manifest.write_text(json.dumps(dict(selected_images=selected, image_directory="images")))
     cfg = argparse.Namespace(
         source_path=str(source),
         resolution=1,
@@ -71,15 +75,21 @@ def make_suite(tmp_path):
 
 
 def test_multiview_probe_prepares_real_colmap_and_lidar_then_uses_shared_split(tmp_path, monkeypatch):
-    suite, cfg, poses = make_suite(tmp_path)
+    suite, cfg, _ = make_suite(tmp_path)
     data_path = suite / probe.REPORT
-    probe.main(["--suite", str(suite), "--steps-per-view", "5", "--prepare-only"])
+    args = ["--suite", str(suite), "--steps-per-view", "5", "--search-window", "2"]
+    probe.main([*args, "--prepare-only"])
     protocol = json.loads((data_path / "protocol.json").read_text())
     train = protocol["train"]
     holdout = protocol["held_out"]
     assert train[0] == probe.REFERENCE and len(train) == 4
-    assert holdout == [probe.NEIGHBOR]
-    assert set(train) == set(poses) - {probe.NEIGHBOR, "09891.jpg"}
+    assert holdout == [probe.NEIGHBOR, "10903.jpg"]
+    assert set(train) == {probe.REFERENCE, "09879.jpg", "10900.jpg", "10901.jpg"}
+    far_min = protocol["geometry"]["far_min_distance_m"]
+    assert far_min == pytest.approx(2 * protocol["views"][probe.REFERENCE]["distance_m"])
+    assert {protocol["views"][name]["distance_group"] for name in holdout} == {"near", "far"}
+    for name in ["10900.jpg", "10901.jpg", "10903.jpg"]:
+        assert protocol["views"][name]["distance_m"] >= far_min
     assert protocol["iteration"] == 20
     distance_weights = protocol["training_weights"]["distance_weighted"]
     d = {name: protocol["views"][name]["distance_m"] for name in train}
@@ -100,10 +110,8 @@ def test_multiview_probe_prepares_real_colmap_and_lidar_then_uses_shared_split(t
     monkeypatch.setattr(
         "utils.training_previews.load_heldout_camera", lambda r, dataset: SimpleNamespace(image_name=r["name"])
     )
-    preview = create_previewer(native_scene, dataset, dict(every=500, train=2, test=1, seed=0))
-    assert [(label, c.image_name) for label, c in preview.frames if label == "held-out"] == [
-        ("held-out", probe.NEIGHBOR)
-    ]
+    preview = create_previewer(native_scene, dataset, dict(every=500, train=2, test=2, seed=0))
+    assert [c.image_name for label, c in preview.frames if label == "held-out"] == sorted(holdout)
     # Substitute only GPU subprocesses, checking the commands against the real native CLI schema and gallery.
     monkeypatch.setattr(probe, "read_snapshot", lambda out, step, **kw: (out / f"chkpnt{step}.pth").exists())
     commands = []
@@ -154,14 +162,16 @@ def test_multiview_probe_prepares_real_colmap_and_lidar_then_uses_shared_split(t
                         image.save(directory / f"{probe.image_id(name)}.png")
 
     monkeypatch.setattr(probe.subprocess, "run", execute)
-    probe.main(["--suite", str(suite), "--steps-per-view", "5", "--gpu", "6"])
+    probe.main([*args, "--gpu", "6"])
     assert len(commands) == 3
     result = json.loads((data_path / "results.json").read_text())
-    assert result["metrics"]["uniform"][probe.NEIGHBOR]["psnr_db"] == "inf"
+    assert result["held_out"] == holdout
+    for name in holdout:
+        assert result["metrics"]["uniform"][name]["psnr_db"] == "inf"
     assert "Complete" in (data_path / "index.html").read_text()
     assert probe.REPORT in (suite / "index.html").read_text()
     commands.clear()
-    probe.main(["--suite", str(suite), "--steps-per-view", "5", "--gpu", "6"])
+    probe.main([*args, "--gpu", "6"])
     assert len(commands) == 1 and "scripts/render.py" in commands[0]
 
 
@@ -173,3 +183,24 @@ def test_view_weight_loader_rejects_eval_frames_and_nonpositive_weights(tmp_path
     path.write_text('{"train.jpg": 0}')
     with pytest.raises(ValueError, match="positive"):
         load_view_weights(path, ["train.jpg"])
+
+
+def test_distant_run_refuses_to_prepare_close_only(tmp_path):
+    suite, _, _ = make_suite(tmp_path)
+    with pytest.raises(ValueError, match="distinct distant training and held-out"):
+        probe.main(["--suite", str(suite), "--far-min-ratio", "4", "--prepare-only"])
+    assert not (suite / probe.REPORT / "protocol.json").is_file()
+
+
+def test_distant_frames_can_come_from_outside_stride_split(tmp_path):
+    suite, _, _ = make_suite(tmp_path)
+    manifest = suite / "3dgs/keyframes.json"
+    selection = json.loads(manifest.read_text())
+    selection["selected_images"] = [name for name in selection["selected_images"] if not name.startswith("109")]
+    manifest.write_text(json.dumps(selection))
+    probe.main(["--suite", str(suite), "--prepare-only", "--train-views", "2"])
+    plan = json.loads((suite / probe.REPORT / "protocol.json").read_text())
+    assert plan["train"][1] not in selection["selected_images"]
+    assert plan["views"][plan["train"][1]]["distance_group"] == "far"
+    assert plan["views"][plan["held_out"][1]]["distance_group"] == "far"
+    assert not set(plan["train"]).intersection(plan["held_out"])

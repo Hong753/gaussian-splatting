@@ -1,6 +1,7 @@
 """Train two native 3DGS models on the same physical floor patch from multiple photos."""
 
 import argparse
+from functools import lru_cache
 from hashlib import sha256
 from html import escape
 import json
@@ -31,7 +32,7 @@ from scripts.view_comparisons import image_id, model_info
 from utils.checkpoint_snapshots import atomic_json, atomic_write, digest, read_snapshot
 from utils.region_loss import mask_path
 
-REPORT = "multiview_floor_distance_v1"
+REPORT = "multiview_floor_distance_v2"
 ARMS = ("uniform", "distance_weighted")
 
 
@@ -79,14 +80,14 @@ def mask_interior(mask, radius):
     ).astype(bool)
 
 
-def find_floor_views(suite, output, allowed, count, search_window):
-    """Use geometry to identify the same supported floor texels in native photographs."""
+def find_floor_views(suite, output, allowed, count, search_window, far_min_ratio):
+    """Find near and far training and evaluation views of the same floor patch."""
     meta = json.loads((suite / "suite.json").read_text())
     source, cloud = Path(meta["source"]), Path(meta["cloud"]["cached"])
     folder = json.loads(Path(meta["selection"]).read_text()).get("image_directory", "images")
     _, cameras, images, stamps = read_model(source)
     records = {v.name: v for v in images}
-    ref, heldout = (records[n] for n in (REFERENCE, NEIGHBOR))
+    ref, near_eval = (records[n] for n in (REFERENCE, NEIGHBOR))
     ref_cam = cameras[ref.camera_id]
     x, y, right, bottom = [round(v * n) for v, n in zip(ROI_FRACTIONS, (ref_cam.width, ref_cam.height) * 2)]
     rect = (x, y, right - x, bottom - y)
@@ -96,72 +97,145 @@ def find_floor_views(suite, output, allowed, count, search_window):
     if fit is None:
         raise ValueError(f"Cannot fit the audited floor patch. {reason}")
     center, normal, world = fit
-    ref_index = next(i for i, v in enumerate(images) if v.name == REFERENCE)
-    nearby = images[max(0, ref_index - search_window) : ref_index + search_window + 1]
-    candidates = []
-    for view in nearby:
-        if view.name in (REFERENCE, NEIGHBOR) or view.name not in allowed:
-            continue
-        _, in_image = target_grid(world[::8, ::8], view, cameras[view.camera_id])
-        if in_image.mean() >= 0.8:
-            candidates.append(view)
-    print(f"{len(candidates)} training candidates project at least 80% of the reference crop", flush=True)
-    points = local_cloud(cloud, world, [v.C for v in [ref, heldout, *candidates]])
-
-    def support(view):
-        camera = cameras[view.camera_id]
-        xy, valid = target_grid(world, view, camera)
-        return visible_floor(points, center, normal, view, camera, xy, valid)
-
-    common = support(ref) & support(heldout)
-    reference_support = int(common.sum())
-    minimum = 0.5 * reference_support
-    mappings = {
-        v.name: native_projection(world, ref, ref_cam, rect, v, cameras[v.camera_id], center, normal)
-        for v in (ref, heldout)
-    }
-    if not all(mask_interior(native_mask(common, mapping), 5).any() for _, mapping in mappings.values()):
-        raise ValueError("Reference and held-out photos share no floor region large enough for SSIM")
-
-    patch_center = world[common].mean(axis=0)
+    corners = world[[0, 0, -1, -1], [0, -1, -1, 0]]
+    floor_min, floor_max = corners.min(axis=0), corners.max(axis=0)
+    # Keep the distance anchor identical even when a candidate changes the common pixel mask.
+    patch_center = world.mean(axis=(0, 1))
 
     def distance(view):
         return float(np.linalg.norm(view.C - patch_center))
 
-    distances = {view.name: distance(view) for view in [ref, heldout, *candidates]}
-    train = [ref]
-    while candidates and len(train) < count:
-        # Favor depth diversity, then prefer the smaller image name on a tie.
-        def separation(candidate):
-            log_distance = np.log(distances[candidate.name])
-            return min(abs(log_distance - np.log(distances[v.name])) for v in train)
+    ref_distance = distance(ref)
+    far_distance = far_min_ratio * ref_distance
+    ref_index = next(i for i, v in enumerate(images) if v.name == REFERENCE)
+    prescreen = world[::8, ::8]
+    near_candidates, far_candidates = [], []
+    for index, view in enumerate(images):
+        if view.name in (REFERENCE, NEIGHBOR):
+            continue
+        is_far = distance(view) >= far_distance
+        if not is_far and (
+            view.name not in allowed or (search_window is not None and abs(index - ref_index) > search_window)
+        ):
+            continue
+        _, in_image = target_grid(prescreen, view, cameras[view.camera_id])
+        if in_image.mean() >= 0.5:
+            (far_candidates if is_far else near_candidates).append(view)
+    near_candidates.sort(key=lambda v: (distance(v), v.name))
+    far_training = sorted(far_candidates, key=lambda v: (v.name not in allowed, -distance(v), v.name))
+    far_evaluation = sorted(far_candidates, key=lambda v: (v.name in allowed, -distance(v), v.name))
+    stride_candidates = sum(v.name in allowed for v in far_candidates)
+    print(
+        f"Full-scene search: {len(far_candidates)} distant candidates, including {stride_candidates} "
+        f"stride-3 training candidates. Distant means at least {far_distance:.2f} m "
+        f"({far_min_ratio:g}× {REFERENCE}).",
+        flush=True,
+    )
+    if len(far_candidates) < 2:
+        raise ValueError(
+            "Need distinct distant training and held-out cameras with this floor patch in frame. "
+            "The full capture was searched. Adjust --far-min-ratio if the capture has a shorter range."
+        )
+    points = local_cloud(cloud, world, [v.C for v in [ref, near_eval, *near_candidates, *far_candidates]])
 
-        view = min(candidates, key=lambda v: (-separation(v), v.name))
-        # Pose dataclasses carry NumPy arrays, so avoid equality on them.
-        candidates = [candidate for candidate in candidates if candidate.name != view.name]
-        if min(np.linalg.norm(view.C - v.C) for v in train) < 0.02:
-            continue
-        intersection = common & support(view)
-        if intersection.sum() < minimum:
-            continue
+    def support(view):
+        # Exclude points outside the camera-to-patch box before projecting the LiDAR.
+        low = np.minimum(floor_min, view.C) - 0.5
+        high = np.maximum(floor_max, view.C) + 0.5
+        local = points[((points >= low) & (points <= high)).all(axis=1)]
         camera = cameras[view.camera_id]
-        try:
-            bounds, mapping = native_projection(world, ref, ref_cam, rect, view, camera, center, normal)
-        except ValueError:
-            continue
-        projected_masks = [mapping] + [entry[1] for entry in mappings.values()]
-        if not all(mask_interior(native_mask(intersection, m), 5).any() for m in projected_masks):
-            continue
-        train.append(view)
-        mappings[view.name] = bounds, mapping
-        common = intersection
-        print(f"Selected {view.name}, {distances[view.name]:.2f} m from floor", flush=True)
-    if len(train) < 2:
-        raise ValueError("Need at least two training views of this floor. Try a wider --search-window.")
+        xy, valid = target_grid(world, view, camera)
+        return visible_floor(local, center, normal, view, camera, xy, valid)
 
-    patch_center = world[common].mean(axis=0)
+    base_mask = support(ref) & support(near_eval)
+    reference_support = int(base_mask.sum())
+    minimum = 0.5 * reference_support
+
+    def projection(view):
+        return native_projection(world, ref, ref_cam, rect, view, cameras[view.camera_id], center, normal)
+
+    def usable(mask, projections):
+        return mask.sum() >= minimum and all(
+            mask_interior(native_mask(mask, mapping), 5).any() for _, mapping in projections
+        )
+
+    mappings = {v.name: projection(v) for v in (ref, near_eval)}
+    reference_projections = list(mappings.values())
+    if not usable(base_mask, reference_projections):
+        raise ValueError("Reference and near held-out photos share no floor region large enough for SSIM")
+
+    rejected = set()
+
+    @lru_cache(maxsize=32)
+    def observe(name):
+        if name in rejected:
+            return None
+        view = records[name]
+        try:
+            projected = projection(view)
+        except ValueError:
+            rejected.add(name)
+            return None
+        mask = base_mask & support(view)
+        if usable(mask, [projected, *reference_projections]):
+            return mask, projected
+        rejected.add(name)
+        return None
+
+    # Find a compatible distant train/eval pair before adding extra training views.
+    train_far = eval_far = None
+    for train_view in far_training:
+        training = observe(train_view.name)
+        if training is None:
+            continue
+        for eval_view in far_evaluation:
+            if np.linalg.norm(eval_view.C - train_view.C) < 0.10:
+                continue
+            evaluation = observe(eval_view.name)
+            if evaluation is None:
+                continue
+            common = training[0] & evaluation[0]
+            if usable(common, [*mappings.values(), training[1], evaluation[1]]):
+                train_far, eval_far = train_view, eval_view
+                mappings[train_far.name], mappings[eval_far.name] = training[1], evaluation[1]
+                break
+        if train_far is not None:
+            break
+    if train_far is None:
+        raise ValueError(
+            f"No distant train/eval pair at {far_distance:.2f} m or farther shares enough visible floor "
+            "and native pixels with the reference. The full capture was searched. "
+            "Adjust --far-min-ratio if the capture has a shorter usable range."
+        )
+
+    train = [ref, train_far]
+    heldout = [near_eval, eval_far]
+    print(
+        f"Distant train {train_far.name} ({distance(train_far):.2f} m). "
+        f"Distant held out {eval_far.name} ({distance(eval_far):.2f} m).",
+        flush=True,
+    )
+    for group, extra in ((near_candidates, (count - 1) // 2), (far_training, count // 2 - 1)):
+        for view in group:
+            if extra == 0:
+                break
+            if min(np.linalg.norm(view.C - v.C) for v in [*train, *heldout]) < 0.02:
+                continue
+            if np.linalg.norm(view.C - eval_far.C) < 0.10:
+                continue
+            observation = observe(view.name)
+            if observation is None:
+                continue
+            mask, projected = observation
+            intersection = common & mask
+            if usable(intersection, [*mappings.values(), projected]):
+                train.append(view)
+                mappings[view.name] = projected
+                common = intersection
+                extra -= 1
+
     data = {}
-    for view in [*train, heldout]:
+    for view in [*train, *heldout]:
         name = view.name
         camera = cameras[view.camera_id]
         (left, top, width, height), mapping = mappings[name]
@@ -181,26 +255,34 @@ def find_floor_views(suite, output, allowed, count, search_window):
             cores=cores,
             detail=detail,
             distance=distance(view),
+            distance_group="far" if distance(view) >= far_distance else "near",
         )
     geometry = dict(
         plane=plane,
         camera_files=stamps,
         patch_center_m=patch_center.tolist(),
+        far_min_ratio=far_min_ratio,
+        far_min_distance_m=far_distance,
         common_reference_pixels=int(common.sum()),
         reference_heldout_pixels=reference_support,
     )
-    return [view.name for view in train], data, geometry
+    return [view.name for view in train], [view.name for view in heldout], data, geometry
 
 
-def write_gallery(root, status, iteration, train_names, data, weights, final):
+def write_gallery(root, status, iteration, train_names, data, weights, final, far_min_distance):
     cameras = []
     panels = []
-    for name in [REFERENCE, NEIGHBOR, *[n for n in train_names if n != REFERENCE]]:
+    heldout_names = [name for name in data if name not in weights]
+    for name in [*heldout_names, *train_names]:
         patch = data[name]
-        label = "Training" if name in weights else "Held out"
+        split = "Training" if name in weights else "Held out"
+        label = f"{split} · {patch['distance_group']}"
+        escaped_name = escape(name)
         distance = patch["distance"]
         weight = f"{weights[name]:.3f}×" if name in weights else "—"
-        cameras.append(f"<tr><td>{name}</td><td>{label}</td><td>{distance:.2f} m</td><td>{weight}</td></tr>")
+        cameras.append(
+            f"<tr><td>{escaped_name}</td><td>{label}</td><td>{distance:.2f} m</td><td>{weight}</td></tr>"
+        )
         files = [("Photo", f"{Path(name).stem}_gt.png")]
         for arm in final:
             result = final[arm][name]
@@ -209,10 +291,11 @@ def write_gallery(root, status, iteration, train_names, data, weights, final):
             title = "Uniform" if arm == "uniform" else "Distance weighted"
             files.append((f"{title} · {float(result['psnr_db']):.2f} dB{contrast_label}", result["render"]))
         images = "".join(
-            f'<figure><figcaption>{caption}</figcaption><a href="{file}"><img src="{file}" alt="{caption}"></a></figure>'
+            f'<figure><figcaption>{escape(caption)}</figcaption><a href="{escape(file)}">'
+            f'<img src="{escape(file)}" alt="{escape(caption)}"></a></figure>'
             for caption, file in files
         )
-        panels.append(f"<h2>{name} · {label}</h2><div class='panels'>{images}</div>")
+        panels.append(f"<h2>{escaped_name} · {label}</h2><div class='panels'>{images}</div>")
     links = (
         '<a href="uniform/debug_previews/index.html">Uniform previews</a> · '
         '<a href="distance_weighted/debug_previews/index.html">Distance-weighted previews</a> · '
@@ -234,7 +317,9 @@ def write_gallery(root, status, iteration, train_names, data, weights, final):
         "@media(max-width:720px){.panels{grid-template-columns:1fr}}</style>"
         f"<h1>Multiview floor loss</h1><p>{escape(status)} · {iteration:,} steps per run</p>"
         "<p>Both runs use the same floor region and original cameras. Each training view has weight 1× "
-        "in the uniform run. The distance-weighted run gives closer cameras greater weight.</p>"
+        "in the uniform run. The distance-weighted run gives closer cameras greater weight. "
+        f"Distant cameras are at least {far_min_distance:.2f} m from the patch. "
+        "Both models are evaluated from a near and a distant held-out camera.</p>"
         f"<p>{links}</p><table><tr><th>Photo</th><th>Split</th><th>Distance to floor</th><th>Distance weight</th></tr>"
         + "".join(cameras)
         + "</table>"
@@ -243,7 +328,9 @@ def write_gallery(root, status, iteration, train_names, data, weights, final):
     atomic_write(root / "index.html", lambda path: path.write_text(page))
 
 
-def launch(suite, gpu=None, *, count=4, steps_per_view=2000, search_window=180, prepare_only=False):
+def launch(
+    suite, gpu=None, *, count=4, steps_per_view=2000, search_window=None, far_min_ratio=2.0, prepare_only=False
+):
     root = suite / REPORT
     base = model_info(suite / "3dgs")
     if REFERENCE not in base["splits"]["train"]:
@@ -252,12 +339,20 @@ def launch(suite, gpu=None, *, count=4, steps_per_view=2000, search_window=180, 
         raise ValueError("The floor masks use the native-resolution stride-3 suite")
     extent, _, _ = split_settings(base)
     ratio = base["cfg"]["optimization_settings"]["percent_dense"]
-    # The explicit manifest defines every trained view and the one held-out preview.
+    # The explicit manifest defines the training and held-out preview cameras.
     native_base = dict(base, cfg=dict(base["cfg"], eval=False))
     with experiment_lock(root) as lock:
         root.mkdir(exist_ok=True)
-        train_names, data, geometry = find_floor_views(suite, root, base["splits"]["train"], count, search_window)
+        train_names, heldout_names, data, geometry = find_floor_views(
+            suite,
+            root,
+            base["splits"]["train"],
+            count,
+            search_window,
+            far_min_ratio,
+        )
         iteration = len(train_names) * steps_per_view
+        far_min_distance = geometry["far_min_distance_m"]
         weights = inverse_square_weights({name: data[name]["distance"] for name in train_names})
         masks = root / "masks"
         full_masks = {}
@@ -273,14 +368,14 @@ def launch(suite, gpu=None, *, count=4, steps_per_view=2000, search_window=180, 
         for arm in ARMS:
             cmd = training_command(native_base, root / arm, ratio, steps=(iteration,))
             cmd += ["--training_scene_extent", str(extent), "--loss_mask_dir", str(masks)]
-            cmd[cmd.index("--debug-preview-test") + 1] = "1"
+            cmd[cmd.index("--debug-preview-test") + 1] = str(len(heldout_names))
             if arm == "distance_weighted":
                 cmd += ["--view_loss_weights", str(weights_file)]
             commands[arm] = cmd
         plan = dict(
             commands=commands,
             train=train_names,
-            held_out=[NEIGHBOR],
+            held_out=heldout_names,
             iteration=iteration,
             steps_per_training_view=steps_per_view,
             original_cameras=True,
@@ -290,6 +385,7 @@ def launch(suite, gpu=None, *, count=4, steps_per_view=2000, search_window=180, 
             views={
                 name: dict(
                     distance_m=p["distance"],
+                    distance_group=p["distance_group"],
                     crop_xywh=list(p["rect"]),
                     supported_pixels=int(p["mask"].sum()),
                     photo_sha256=digest(p["path"]),
@@ -315,35 +411,38 @@ def launch(suite, gpu=None, *, count=4, steps_per_view=2000, search_window=180, 
             Image.fromarray(rgb).save(root / f"{Path(name).stem}_gt.png")
             print(
                 f"{name}: {patch['distance']:.2f} m, "
-                + (f"distance weight {weights[name]:.3f}×" if name in weights else "held out"),
-                flush=True,
-            )
-        if max(weights.values()) / min(weights.values()) < 1.1:
-            print(
-                "The selected cameras are nearly equidistant. The loss multipliers differ by less than 10%.",
+                + (f"distance weight {weights[name]:.3f}×" if name in weights else "held out")
+                + f" ({patch['distance_group']})",
                 flush=True,
             )
         print(f"Report: {root / 'index.html'}", flush=True)
         if prepare_only:
             if not (root / "results.json").exists():
-                write_gallery(root, "Prepared", iteration, train_names, data, weights, {})
+                write_gallery(root, "Prepared", iteration, train_names, data, weights, {}, far_min_distance)
             return
         gpu = select_gpu(gpu)
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu)
-        manifest = dict(selected_images=train_names, preview_heldout_images=[NEIGHBOR])
+        manifest = dict(selected_images=train_names, preview_heldout_images=heldout_names)
 
         def run(status, command):
             print(status, flush=True)
-            write_gallery(root, status, iteration, train_names, data, weights, {})
+            write_gallery(root, status, iteration, train_names, data, weights, {}, far_min_distance)
             try:
                 subprocess.run(command, cwd=ROOT, env=env, check=True, pass_fds=(lock.fileno(),))
             except subprocess.CalledProcessError as exc:
                 write_gallery(
-                    root, f"Stopped with exit code {exc.returncode}", iteration, train_names, data, weights, {}
+                    root,
+                    f"Stopped with exit code {exc.returncode}",
+                    iteration,
+                    train_names,
+                    data,
+                    weights,
+                    {},
+                    far_min_distance,
                 )
                 raise
 
-        write_gallery(root, "Preparing training", iteration, train_names, data, weights, {})
+        write_gallery(root, "Preparing training", iteration, train_names, data, weights, {}, far_min_distance)
         from scripts.refresh_orange4f_dashboard import refresh
 
         refresh(suite)
@@ -360,7 +459,7 @@ def launch(suite, gpu=None, *, count=4, steps_per_view=2000, search_window=180, 
                 raise RuntimeError(f"Missing final snapshot for {arm}")
 
         run(
-            "Rendering all training views and the held-out photo",
+            "Rendering the training cameras and both held-out photos",
             [
                 sys.executable,
                 "-u",
@@ -375,7 +474,7 @@ def launch(suite, gpu=None, *, count=4, steps_per_view=2000, search_window=180, 
                 "unselected",
                 "--frames",
                 *train_names,
-                NEIGHBOR,
+                *heldout_names,
                 "--gpu",
                 gpu,
                 "--output",
@@ -390,9 +489,10 @@ def launch(suite, gpu=None, *, count=4, steps_per_view=2000, search_window=180, 
                 image = root / "comparison" / split / f"model_{index}" / "renders" / (image_id(name) + ".png")
                 final[arm][name] = crop_result(image, patch, root / f"{arm}_{Path(name).stem}.png")
         atomic_json(
-            root / "results.json", dict(iteration=iteration, train=train_names, held_out=[NEIGHBOR], metrics=final)
+            root / "results.json",
+            dict(iteration=iteration, train=train_names, held_out=heldout_names, metrics=final),
         )
-        write_gallery(root, "Complete", iteration, train_names, data, weights, final)
+        write_gallery(root, "Complete", iteration, train_names, data, weights, final, far_min_distance)
         print(root / "index.html", flush=True)
 
 
@@ -405,20 +505,35 @@ def main(argv=None):
         "--steps-per-view", type=int, default=2000, help="Total steps divided by the training view count"
     )
     parser.add_argument(
-        "--search-window", type=int, default=180, help="Registered photos on either side of the reference"
+        "--search-window",
+        type=int,
+        help="Optional frame window for extra near training cameras. Distant views always use the full capture.",
+    )
+    parser.add_argument(
+        "--far-min-ratio",
+        type=float,
+        default=2.0,
+        help="Minimum distant camera range divided by the reference camera range",
     )
     parser.add_argument(
         "--prepare-only", action="store_true", help="Inspect the selected views and weights on CPU"
     )
     args = parser.parse_args(argv)
-    if args.train_views < 2 or min(args.steps_per_view, args.search_window) < 1:
+    if (
+        args.train_views < 2
+        or args.steps_per_view < 1
+        or (args.search_window is not None and args.search_window < 1)
+    ):
         parser.error("Need at least two training views and positive step and search budgets")
+    if not np.isfinite(args.far_min_ratio) or args.far_min_ratio <= 1:
+        parser.error("--far-min-ratio must be finite and greater than 1")
     launch(
         args.suite.expanduser().resolve(),
         args.gpu,
         count=args.train_views,
         steps_per_view=args.steps_per_view,
         search_window=args.search_window,
+        far_min_ratio=args.far_min_ratio,
         prepare_only=args.prepare_only,
     )
 

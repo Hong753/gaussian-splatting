@@ -47,17 +47,22 @@ Run `python -u scripts/orange4f_multiview_floor_distance.py` in the `3dgs`
 environment. This fits two adaptive 3DGS models with identical original
 cameras, initialization, crop masks, and numbers of visits per camera. Both
 use only the LiDAR-supported part of the `09882.jpg` floor patch that the
-selected views share. The launcher targets four training cameras with a range
-of distances and reserves `09884.jpg` for evaluation. Each run uses 2,000
-steps per selected training view. Use `--gpu 6` to choose a GPU or
-`--prepare-only` to inspect the view selection on CPU.
+selected views share. The launcher searches the full capture for distant
+views, which by default must be at least twice as far from the patch as the
+reference camera. It targets two near and two distant training views and
+requires at least one of each. It prefers stride-3 photos for training and
+can use other registered photos to reach the distant views. Evaluation uses
+`09884.jpg` and a separate
+distant camera. Each run uses 2,000 steps per selected training view. Use
+`--gpu 6` to choose a GPU, `--prepare-only` to inspect the selection on CPU,
+or `--far-min-ratio` to set the minimum distance ratio.
 
 The uniform run gives each camera's mean RGB loss equal weight. The distance
 run multiplies that same loss, including L1 and SSIM, by inverse-squared distance
 to the center of the common floor patch, normalized to a mean of one over the
-training cameras. Open `multiview_floor_distance_v1/index.html` on the suite
+training cameras. Open `multiview_floor_distance_v2/index.html` on the suite
 dashboard for the distances, weights, live previews, and final side-by-side
-crops. The page puts the reference and held-out photos first.
+crops. The page puts the near and distant held-out photos first.
 
 ## Single-photo control
 

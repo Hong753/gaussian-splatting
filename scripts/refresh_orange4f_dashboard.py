@@ -162,7 +162,9 @@ def refresh(root, *, native=None, viewer_port=None):
         weighted_probe = 'one_view_floor_weight_v1/index.html'
         if (root/weighted_probe).is_file():
             floor_link += f'<p><a href="{weighted_probe}">One-view floor weighting · 09882.jpg</a></p>'
-        multiview = 'multiview_floor_distance_v1/index.html'
+        multiview = 'multiview_floor_distance_v2/index.html'
+        if not (root/multiview).is_file():
+            multiview = 'multiview_floor_distance_v1/index.html'
         if (root/multiview).is_file():
             floor_link += f'<p><a href="{multiview}">Multiview floor distance weighting · 09882.jpg</a></p>'
         content = before + BEGIN + viewer + probes + floor_link + '<h2>Upstream Scaffold-GS</h2><ul>' + ''.join(rows) + '</ul>' + POLL + END + after
