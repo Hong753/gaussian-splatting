@@ -34,6 +34,10 @@ def parser():
                    help='Keep measured radius history through native growth until the pruning check')
     p.add_argument('--lidar-scp-cache',type=Path)
     p.add_argument('--lidar-scp-policy',default='',help='JSON overrides for the LiDAR adaptation of GSPrior')
+    p.add_argument('--ray-depth-gradients', action='store_true',
+                   help='Attenuate each pixel’s RGB gradient by its rendered ray range')
+    p.add_argument('--ray-depth-reference', type=float, default=2.)
+    p.add_argument('--ray-depth-start', type=int, default=1001)
     return p
 
 
@@ -133,6 +137,11 @@ def build_plan(args):
         if cfg['start']>=args.iterations: raise ValueError('LiDAR SCP must start before training ends')
         command+=['--lidar_scp_cache',str(cache),'--lidar_scp_policy',json.dumps(cfg,sort_keys=True)]
         plan['lidar_scp']=dict(cache=str(cache),policy=cfg,metadata=meta)
+    if getattr(args, 'ray_depth_gradients', False):
+        from utils.ray_depth_gradients import active_policy
+        plan['ray_depth_gradients'] = active_policy(args)
+        command += ['--ray_depth_gradients', '--ray_depth_reference', str(args.ray_depth_reference),
+                    '--ray_depth_start', str(args.ray_depth_start)]
     return plan
 
 
@@ -154,6 +163,8 @@ def execute_plan(args, plan):
             '--position-lr-divisor', str(args.position_lr_divisor),
             '--scaling-lr', str(plan.get('scaling_lr', .005)), '--iterations', str(args.iterations),
             '--output', str(Path(plan['model'])/'native_lidar_cuda_smoke.json')]
+    if plan.get('ray_depth_gradients'):
+        smoke.append('--ray-depth-gradients')
     if plan.get('preserve_densification_radii'):
         smoke.append('--preserve-densification-radii')
     if plan.get('freeze_lidar_positions'):

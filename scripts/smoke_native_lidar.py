@@ -39,6 +39,34 @@ def check_empty_rendering(render, device='cuda', antialiasing=True):
     return dict(empty_cloud_sh_backward=True,nonempty_invisible_view_backward=True)
 
 
+def check_ray_depth_gradients(render, camera, pipe):
+    import torch
+    from utils.ray_depth_gradients import render_weights, weight_rgb_backward
+
+    xyz = torch.tensor([[-1., 0., 2.], [2., 0., 4.]], device="cuda")
+    model = SimpleNamespace(
+        get_xyz=xyz,
+        get_opacity=xyz.new_full((2, 1), .8),
+        get_scaling=xyz.new_tensor([[.09] * 3, [.18] * 3]),
+        get_rotation=xyz.new_tensor([[1., 0., 0., 0.]] * 2),
+        active_sh_degree=0,
+    )
+    weights, supported = render_weights(
+        render, camera, model, pipe, dict(reference_m=2., min_weight=.05, min_opacity=.1),
+    )
+    y = camera.image_height // 2
+    near_x, far_x = camera.image_width // 4, 3 * camera.image_width // 4
+    assert supported[0, y, near_x] and supported[0, y, far_x]
+    assert not supported[0, 0, 0] and weights[0, 0, 0] == 1
+    assert .76 < weights[0, y, near_x] < .85 and .18 < weights[0, y, far_x] < .22
+    image = torch.ones((3, *weights.shape[1:]), device="cuda", requires_grad=True)
+    weight_rgb_backward(image, weights)
+    image.sum().backward()
+    torch.testing.assert_close(image.grad, weights.expand_as(image))
+    return dict(ray_depth_gradient_smoke=True,
+                near_ray_weight=float(weights[0, y, near_x]), far_ray_weight=float(weights[0, y, far_x]))
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--gpu', default='1')
@@ -55,6 +83,7 @@ def main(argv=None):
     p.add_argument('--preserve-densification-radii', action='store_true')
     p.add_argument('--freeze-lidar-positions', action='store_true')
     p.add_argument('--region-loss', action='store_true')
+    p.add_argument('--ray-depth-gradients', action='store_true')
     args = p.parse_args(argv)
     if not math.isfinite(args.percent_dense) or not 0 < args.percent_dense <= 1:
         p.error('percent-dense must be finite and in (0, 1]')
@@ -103,6 +132,8 @@ def main(argv=None):
         camera_center=torch.zeros(3, device='cuda'))
     pipe = SimpleNamespace(convert_SHs_python=False, compute_cov3D_python=False,
                            debug=True, antialiasing=args.antialiasing, occlusion_mode='off')
+    if args.ray_depth_gradients:
+        empty_checks.update(check_ray_depth_gradients(render, camera, pipe))
     for step in range(1, 4):
         lr = model.update_learning_rate(step)
         assert (lr == 0) if args.freeze_lidar_positions else (lr > 0)

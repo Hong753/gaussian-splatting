@@ -100,6 +100,9 @@ class OptimizationParams(ParamGroup):
         self.iterations = 30_000
         self.rgb_loss_weight_dir = ""
         self.view_loss_weights = ""
+        self.ray_depth_gradients = False
+        self.ray_depth_reference = 2.0
+        self.ray_depth_start = 1001
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01

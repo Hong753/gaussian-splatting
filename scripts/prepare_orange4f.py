@@ -22,6 +22,15 @@ RUNS = ('3dgs', '3dgs_fixed_lidar', 'gsprior', 'gsprior_fixed_lidar')
 DEFAULT_OUTPUT_ROOT = '/data/3dgs_outputs/orange4f/3dgs_finetuning'
 
 
+
+def native_run_arguments(source, model, keyframes, cloud, gpu, frames):
+    """Native adaptive Orange4F settings shared by the baseline and its ablations."""
+    return ['--source',str(source),'--model',str(model),'--keyframes',str(keyframes),
+            '--point-cloud',str(cloud),'--gpu',str(gpu),'--iterations','30000',
+            '--expected-frames',str(frames),'--resolution','1','--no-antialiasing',
+            '--position-lr-divisor','1','--pruning','--opacity-resets','--feature-lr','.0025',
+            '--opacity-lr','.05','--scaling-lr','.005','--rotation-lr','.001','--percent-dense','.01']
+
 def point_records(path):
     """Stream COLMAP points, skipping tracks instead of allocating observations."""
     if path.suffix == '.txt':
@@ -155,12 +164,9 @@ def main(argv=None):
         if gpu<2:
             model.mkdir()
             shutil.copyfile(manifest, model/'keyframes.json')
-            command = ['--source',str(source),'--model',str(model),'--keyframes',str(model/'keyframes.json'),
-                '--point-cloud',str(shared/'input.ply'),'--gpu',str(gpu),'--iterations','30000',
-                '--expected-frames',str(len(records)),'--resolution','1','--no-antialiasing',
-                '--position-lr-divisor','1','--pruning','--opacity-resets','--feature-lr','.0025',
-                '--opacity-lr','.05','--scaling-lr','.005','--rotation-lr','.001',
-                '--percent-dense','.01', *(['--freeze-lidar-positions'] if fixed else [])]
+            command = native_run_arguments(source, model, model/'keyframes.json', shared/'input.ply', gpu, len(records))
+            if fixed:
+                command.append('--freeze-lidar-positions')
             options = native.parser().parse_args(command)
             plan = native.build_plan(options)
             periodic.prepare_experiment(options, plan, 'native_lidar',

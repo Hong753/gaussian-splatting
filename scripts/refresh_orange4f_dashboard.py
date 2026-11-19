@@ -169,6 +169,11 @@ def refresh(root, *, native=None, viewer_port=None):
             multiview = 'multiview_floor_distance_v1/index.html'
         if (root/multiview).is_file():
             floor_link += f'<p><a href="{multiview}">Multiview floor distance weighting</a></p>'
+        ray_model = root/'3dgs_ray_depth_gradients_v1'
+        if (ray_model/'periodic_evaluation/plan.json').is_file():
+            floor_link += ('<p>3DGS ray-depth gradients · '
+                           '<a href="3dgs_ray_depth_gradients_v1/debug_previews/index.html">live previews</a> · '
+                           '<a href="3dgs_ray_depth_gradients_v1/periodic_evaluation/index.html">metrics</a></p>')
         content = before + BEGIN + viewer + probes + floor_link + '<h2>Upstream Scaffold-GS</h2><ul>' + ''.join(rows) + '</ul>' + POLL + END + after
         if content != old:
             atomic_write(index, lambda path: path.write_text(content))

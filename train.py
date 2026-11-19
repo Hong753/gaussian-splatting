@@ -58,6 +58,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     configure_discrete_lidar(opt, dataset)
     from utils.distance_updates import policy as distance_policy
     distance_config = distance_policy(opt)
+    from utils.ray_depth_gradients import active_policy as ray_gradient_policy, render_weights, weight_rgb_backward
+    ray_gradient_config = ray_gradient_policy(opt)
+    if ray_gradient_config is not None:
+        print(f"Ray-depth RGB gradient policy: {ray_gradient_config}", flush=True)
     dataset.antialiasing = pipe.antialiasing
     dataset.optimization_settings = vars(opt).copy()
     from utils.training_previews import DEFAULTS as PREVIEW_DEFAULTS, create_previewer
@@ -339,6 +343,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 ray_depth = training_occluders.pixel_depth(viewpoint_cam, gaussians.get_xyz.device)
             else:
                 training_tiles = training_occluders.tiles(viewpoint_cam, gaussians.get_xyz.device)
+        gradient_weights = None
+        if ray_gradient_config is not None and iteration >= ray_gradient_config["start"]:
+            # Render detached buffers before allocating the main pass's autograd state.
+            gradient_weights, supported = render_weights(
+                render, viewpoint_cam, gaussians, pipe, ray_gradient_config,
+                occlusion_tiles=training_tiles, occlusion_depth=ray_depth,
+            )
+            if iteration == ray_gradient_config["start"] or iteration % 500 == 0:
+                import json
+                diagnostics = dict(iteration=iteration, image=viewpoint_cam.image_name,
+                                   supported_fraction=supported.float().mean().item(),
+                                   mean_weight=gradient_weights.mean().item(),
+                                   downweighted_fraction=(gradient_weights < 1).float().mean().item())
+                with open(os.path.join(scene.model_path, "ray_depth_gradients.jsonl"), "a") as stream:
+                    stream.write(json.dumps(diagnostics, allow_nan=False) + "\n")
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp,
                             separate_sh=SPARSE_ADAM_AVAILABLE, occlusion_tiles=training_tiles, occlusion_depth=ray_depth)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
@@ -351,6 +370,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
             image *= alpha_mask
+
+        if gradient_weights is not None:
+            weight_rgb_backward(image, gradient_weights)
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()

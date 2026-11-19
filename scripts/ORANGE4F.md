@@ -41,6 +41,24 @@ floor band (red). The measurements use front-to-back compositing weights and
 the mutually LiDAR-supported pixels in the two photos. The results apply to
 this floor patch and these checkpoints.
 
+## Train full-scene 3DGS with ray-depth gradients
+
+Run `python -u scripts/run_orange4f_ray_depth_gradients.py` in the `3dgs`
+environment. It launches the 30,000-step sharp stride-3 native 3DGS preset
+with ray-depth weighting from step 1,001. Pass `--gpu N` to choose a physical
+GPU. The suite dashboard links to live previews and all-frame metrics at
+10k, 20k, and 30k.
+
+At each pixel, the RGB gradient from L1 and SSIM is multiplied by
+`clamp((2 m / ray_range)^2, 0.05, 1)`. A ray at 2 m gets 1×, at 4 m it gets
+0.25×, and at 8 m it gets 0.0625×. A detached native render supplies accumulated
+opacity and inverse depth. Dividing inverse depth by opacity gives the
+compositing-weighted inverse camera depth, which is converted to inverse
+Euclidean range via the pixel's ray direction. Rays with invalid estimates or
+less than 0.10 accumulated opacity use weight 1. The backward hook also
+affects the image-space gradients used by native densification. Each weighted
+step incurs one extra forward render.
+
 ## Compare uniform and distance-weighted multiview floor training
 
 Run `python -u scripts/orange4f_multiview_floor_distance.py` in the `3dgs`

@@ -16,6 +16,7 @@ import pytest
 
 from arguments import ModelParams, OptimizationParams, PipelineParams
 from scripts.prepare_orange4f import main, canonical_cloud, grid_geometry
+from scripts.run_orange4f_ray_depth_gradients import prepare as prepare_ray_gradients
 from scripts import run_native_lidar as native, run_soft_surface_long as periodic
 from utils.checkpoint_snapshots import digest
 from test_region_ablation import region_source
@@ -66,6 +67,21 @@ def test_four_runs_share_full_resolution_sharp_stride3_and_cloud(region_source):
             assert cfg['iterations']==40000 and cfg['tsdf_iterations']==[20000,30000,40000]
             assert cfg['cloud']==suite['cloud'] and cfg['grid']==suite['grid']
             assert cfg['preview_every']==500 and cfg['max_all_points']==6000000
+    ray_model = prepare_ray_gradients(root, gpu='7')
+    ray = periodic.load_plan(ray_model)
+    ordinary = periodic.load_plan(root/'3dgs')
+    assert ray['selected'] == ordinary['selected'] and ray['iterations'] == ordinary['iterations']
+    assert ray['plan']['antialiasing'] == ordinary['plan']['antialiasing']
+    assert ray['plan']['position_lr'] == ordinary['plan']['position_lr']
+    assert ray['plan']['densification'] == ordinary['plan']['densification']
+    assert ray['plan']['ray_depth_gradients'] == dict(reference_m=2., start=1001, min_weight=.05, min_opacity=.10)
+    assert '--ray_depth_gradients' in ray['plan']['stages'][0]['argv']
+    assert ray['gpu'] == '7'
+    assert prepare_ray_gradients(root) == ray_model
+    assert '3dgs_ray_depth_gradients_v1/debug_previews/index.html' in (root/'index.html').read_text()
+    with patch.object(native, 'invoke') as cuda_check, patch.object(native.fixed, 'execute_plan'):
+        native.execute_plan(argparse.Namespace(**ray['training_args']), ray['plan'])
+        assert '--ray-depth-gradients' in cuda_check.call_args.args[0]
     split=json.loads((root/'shared/gsprior_data/split.json').read_text())
     assert split['train']==selection['selected_images'] and len(split['test'])==4
     assert all(digest(Path(p))==v for p,v in before.items())
