@@ -151,7 +151,10 @@ def refresh(root, *, native=None, viewer_port=None):
             if not 1 <= port <= 65535:
                 raise ValueError('Invalid Scaffold viewer port')
             viewer = f'<p><a data-scaffold-viewer-port="{port}">Open Scaffold 3D viewer</a></p>'
-        content = before + BEGIN + viewer + probes + '<h2>Upstream Scaffold-GS</h2><ul>' + ''.join(rows) + '</ul>' + POLL + END + after
+        floor_report = 'floor_neighbors_09882_v1/index.html'
+        floor_link = (f'<p><a href="{floor_report}">Nearby floor photos · 09882.jpg</a></p>'
+                      if (root/floor_report).is_file() else '')
+        content = before + BEGIN + viewer + probes + floor_link + '<h2>Upstream Scaffold-GS</h2><ul>' + ''.join(rows) + '</ul>' + POLL + END + after
         if content != old:
             atomic_write(index, lambda path: path.write_text(content))
     return states

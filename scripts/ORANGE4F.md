@@ -59,6 +59,24 @@ first snapshot. For an already running or completed probe, run
 The default probe page is `/one_view/fixed_lidar_one_view_09882_knn2x/index.html`
 on that same server.
 
+To compare the real speckled floor in `09882.jpg` with nearby original training
+photos, run `python -u scripts/orange4f_floor_neighbors.py` on the Orange4F host.
+The CPU test uses the suite's original poses, intrinsics and cloud. Open
+`/floor_neighbors_09882_v1/index.html` on port 8098. Clicking a crop opens its
+native pixels. The JSON includes all examined neighbors and their rejection reasons.
+
+The test examines stride-3 training cameras within 48 registered frames on either
+side, closest camera centers first. It checks crop overlap and similar sampling
+in both image directions. Each warp must have at least 50% jointly supported
+area and retain at least 55% of the reference crop's high-frequency response.
+Up to six qualifying neighbors enter the matching test, independent of their
+match scores. A cell needs a nearby floor return and any nearer surface return
+outside the 2.5 cm plane tolerance vetoes that neighborhood. Both checks cover
+3×3 cells of 8 native pixels per side in each camera. Sparse LiDAR can miss
+occluders. A view needs 12 mutual matches, at least 25% of eligible features,
+and matches in three crop quadrants. The summary requires at least three measured
+views. The subpixel agreement and shift thresholds are diagnostic choices.
+
 ## PGSR with a fixed LiDAR warmup
 
 From the activated `3dgs` environment, launch the guided run and its matched control
