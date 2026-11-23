@@ -122,8 +122,8 @@ change the group size or supply any registered keyframe subset using
 views are rendered and scored. The launcher checks the frame count and RGB
 files before starting.
 
-The default run uses 30,000 iterations and stages images up to 640 pixels
-wide. `--width` changes that cap and increases host RAM use. RGB camera tensors
+The default run uses 30,000 iterations and stages images up to 1,600 pixels
+wide. Use `--width 640` for a lower-resolution debugging run. RGB camera tensors
 live on the CPU. Larger groups of render cameras run in batches. The source is
 the existing COLMAP BA export at
 `/data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full`. The trainer uses its
@@ -139,8 +139,10 @@ for train, test, and all views. `comparisons/` contains one labeled side-by-side
 GT and render per image. The `train/`, `test/`, and `all/` folders each contain
 an RGB and error gallery and per-frame scores.
 
-`original_trajectory.mp4` shows GT and renders side by side for all registered
-frames in natural filename order at 30 fps. `random_trajectory.mp4` is a
+`original_trajectory.mp4` shows GT and renders side by side at their staged
+resolution for all registered frames in natural filename order at 30 fps.
+At the default resolution each side is up to 1,600 pixels wide.
+`random_trajectory.mp4` is a
 40-second render along a seeded smooth path derived from a continuous capture
 segment, with no matching GT. Its actual poses and seed are recorded in
 `random_trajectory.json`. `--prepare-only` stages the data without starting
@@ -149,7 +151,7 @@ To also generate a fused TSDF mesh using stock code:
 
 ```bash
 conda activate triangle_splatting
-RUN=/data/3dgs_outputs/orange4f/3dgs_finetuning/triangle_splatting_stock_full_stride3_w640_30000
+RUN=/data/3dgs_outputs/orange4f/3dgs_finetuning/triangle_splatting_stock_full_stride3_w1600_30000
 cd ~/triangle-splatting-upstream
 time python mesh.py -s "$RUN/fit_input" -m "$RUN/model" -r 1 --data_device cpu \
   --iteration 30000 --skip_train --skip_test

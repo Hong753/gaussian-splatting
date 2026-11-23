@@ -165,9 +165,13 @@ def report_shard(directory, rows):
             error = np.abs(np.asarray(actual, dtype=np.float32) - np.asarray(prediction, dtype=np.float32))
             mse = float(np.mean((error / 255.0) ** 2))
             score = -10 * math.log10(max(mse, 1e-12))
-            if not pair.is_file():
+            current_size = None
+            if pair.is_file():
+                with Image.open(pair) as comparison:
+                    current_size = comparison.size
+            if current_size != (2 * actual.width, actual.height + 36):
                 temporary = pair.with_suffix(".tmp.jpg")
-                save_panel(actual, prediction, temporary, "Triangle Splatting", score)
+                save_panel(actual, prediction, temporary, "Triangle Splatting", score, max_width=None)
                 temporary.replace(pair)
         error_path = directory / "error" / name
         error_path.parent.mkdir(exist_ok=True)
@@ -194,7 +198,9 @@ def render_batch(upstream, run, model, iteration, label, batch, images, seed, co
 
 def encode_video(output, paths):
     if output.is_file():
-        return
+        video_mtime = output.stat().st_mtime_ns
+        if all(path.stat().st_mtime_ns <= video_mtime for path in paths):
+            return
     sizes = set()
     for path in paths:
         with Image.open(path) as image:
@@ -362,7 +368,7 @@ def main():
     split.add_argument("--keyframes", type=Path, help="Existing keyframes.json containing selected_images")
     split.add_argument("--keyframe-stride", type=int, default=3, help="Select the sharpest RGB in each group (default: 3)")
     parser.add_argument("--point-cloud", type=Path, help="Explicit initialization cloud in the supplied COLMAP coordinates")
-    parser.add_argument("--width", type=int, default=640, help="Maximum image width staged for stock training and rendering")
+    parser.add_argument("--width", type=int, default=1600, help="Maximum image width for training and rendering (default: 1600)")
     parser.add_argument("--iterations", type=int, default=30_000)
     parser.add_argument("--expected-frames", type=int, default=5009, help="Fail before training on an incomplete capture; 0 disables the check")
     parser.add_argument("--prepare-only", action="store_true")

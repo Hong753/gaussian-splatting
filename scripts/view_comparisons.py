@@ -182,13 +182,17 @@ def shared_iteration(specs, requested):
     return max(common)
 
 
-def save_panel(gt, pred, path, label, score):
+def save_panel(gt, pred, path, label, score, *, max_width=960):
     from PIL import Image, ImageDraw
-    width = min(960, gt.width)
+    width = gt.width if max_width is None else min(max_width, gt.width)
     height = max(1, round(gt.height * width / gt.width))
+    if (width, height) != gt.size:
+        gt = gt.resize((width, height))
+    if (width, height) != pred.size:
+        pred = pred.resize((width, height))
     panel = Image.new("RGB", (2 * width, height + 36), "#111827")
-    panel.paste(gt.resize((width, height)), (0, 36))
-    panel.paste(pred.resize((width, height)), (width, 36))
+    panel.paste(gt, (0, 36))
+    panel.paste(pred, (width, 36))
     draw = ImageDraw.Draw(panel)
     draw.text((12, 10), "Actual image", fill="white")
     draw.text((width + 12, 10), f"{label} | PSNR {score:.2f} dB", fill="white")
