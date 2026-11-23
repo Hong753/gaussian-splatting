@@ -122,6 +122,12 @@ change the group size or supply any registered keyframe subset using
 views are rendered and scored. The launcher checks the frame count and RGB
 files before starting.
 
+Training uses a copy of the pinned upstream source with a coverage fix. The
+trainer records triangle coverage from the first step so pruning can use it
+before a full pass over the training cameras. It skips densification windows
+with no eligible parents and pruning windows that would remove every triangle.
+`training_source.json` records the upstream revision and patch digest.
+
 The default run uses 30,000 iterations and stages images up to 1,600 pixels
 wide. Staging links existing RGB images that already fit the width cap and
 caches PNGs for images that require resizing or RGB conversion. Use `--width 640`

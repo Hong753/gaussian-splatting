@@ -2,6 +2,7 @@
 
 import argparse
 import fcntl
+import hashlib
 from importlib.util import find_spec
 import json
 import math
@@ -13,6 +14,7 @@ from statistics import mean
 import struct
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 from time import perf_counter
 from types import SimpleNamespace
 
@@ -33,6 +35,7 @@ UPSTREAM_SHA = "685ff270a8273afc3a2b094ae3148dd0b98e31e9"
 VIDEO_FPS = 30
 NOVEL_SECONDS = 40
 NOVEL_SEED = 42
+DENSIFICATION_PATCH = Path(__file__).resolve().parent / "indoor_triangles/stock_triangle_densification.patch"
 
 
 def choose_keyframes(source, run, names, explicit, stride):
@@ -133,6 +136,25 @@ def write_scene(path, rows, images, seed, *, fit=False):
             canonical_cloud(path, cloud, explicit=seed)
         else:
             cloud.symlink_to(seed)
+
+
+def prepare_training_source(upstream, run):
+    """Apply the coverage fix to a reproducible copy of the pinned training code."""
+    patch_hash = hashlib.sha256(DENSIFICATION_PATCH.read_bytes()).hexdigest()
+    source_dir = run / f"triangle_source_{UPSTREAM_SHA[:12]}_{patch_hash[:12]}"
+    if not source_dir.is_dir():
+        with TemporaryDirectory(prefix=".triangle_source_", dir=run) as temporary:
+            root = Path(temporary)
+            archive = root / "source.tar"
+            source = root / "source"
+            source.mkdir()
+            subprocess.run(["git", "archive", "-o", archive, UPSTREAM_SHA], cwd=upstream, check=True)
+            subprocess.run(["tar", "-xf", archive, "-C", source], check=True)
+            subprocess.run(["git", "apply", "--unidiff-zero", DENSIFICATION_PATCH], cwd=source, check=True)
+            source.rename(source_dir)
+    atomic_json(run / "training_source.json", dict(path=str(source_dir), revision=UPSTREAM_SHA,
+                                                  patch=str(DENSIFICATION_PATCH), patch_sha256=patch_hash))
+    return source_dir
 
 
 def invoke(upstream, run, label, options):
@@ -310,7 +332,9 @@ def run_scene(args, upstream, source, run):
     common = ["-m", model, "-r", "1", "--data_device", "cpu"]
     train_seconds_file = run / "training_seconds.json"
     if not checkpoint.is_file() or not checkpoint.with_name("hyperparameters.pt").is_file():
-        train_seconds = invoke(upstream, run, "train", ["train.py", "-s", fit_scene, *common, "--iterations", iteration])
+        training_source = prepare_training_source(upstream, run)
+        train_seconds = invoke(training_source, run, "train",
+                               ["train.py", "-s", fit_scene, *common, "--iterations", iteration])
         if not checkpoint.is_file() or not checkpoint.with_name("hyperparameters.pt").is_file():
             raise FileNotFoundError(f"Incomplete checkpoint at {checkpoint.parent}")
         atomic_json(train_seconds_file, train_seconds)

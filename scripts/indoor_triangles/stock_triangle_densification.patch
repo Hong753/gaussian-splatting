@@ -1,0 +1,32 @@
+diff --git a/train.py b/train.py
+--- a/train.py
++++ b/train.py
+@@ -131,3 +131,3 @@
+-        if new_round:
+-            mask = triangle_area > 1
+-            triangles.triangle_area[mask] += 1
++        # Densification can run before the first pass over the training cameras.
++        mask = triangle_area > 1
++        triangles.triangle_area[mask] += 1
+diff --git a/scene/triangle_model.py b/scene/triangle_model.py
+--- a/scene/triangle_model.py
++++ b/scene/triangle_model.py
+@@ -685 +685,4 @@
+-        sampled_idxs = torch.multinomial(probs, min(num, (probs>0).sum().item()), replacement=False)
++        sample_count = min(num, (probs > 0).sum().item())
++        if sample_count <= 0:
++            return torch.empty(0, dtype=torch.long, device=probs.device)
++        sampled_idxs = torch.multinomial(probs, sample_count, replacement=False)
+@@ -748,0 +752,6 @@
++        if add_idx.numel() == 0:
++            print("Skipping triangle densification: no eligible parents in the current window.")
++            self.triangle_area.zero_()
++            self.image_size.zero_()
++            self.importance_score.zero_()
++            return 0
+@@ -811 +820,4 @@
+-        self.prune_points(mask)
++        if mask.all():
++            print("Skipping triangle pruning: the current window would remove the entire model.")
++        else:
++            self.prune_points(mask)
