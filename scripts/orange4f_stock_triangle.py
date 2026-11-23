@@ -15,8 +15,9 @@ import struct
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
-from time import perf_counter
+from time import perf_counter, sleep
 from types import SimpleNamespace
+from zipfile import is_zipfile
 
 import numpy as np
 from PIL import Image
@@ -276,13 +277,88 @@ def novel_trajectory(run, staged):
     return entries, rgb
 
 
+def read_colmap_scene(sparse):
+    if (sparse / "cameras.bin").is_file() and (sparse / "images.bin").is_file():
+        return colmap.read_cameras_binary(sparse / "cameras.bin"), colmap.read_images_binary(sparse / "images.bin")
+    return colmap.read_cameras_text(sparse / "cameras.txt"), colmap.read_images_text(sparse / "images.txt")
+
+
+def evaluate_frames(upstream, run, model, iteration, staged, images, render_seed, common):
+    (run / "comparisons").mkdir(exist_ok=True)
+    scores = {}
+    for split in ("train", "test"):
+        entries = [entry for entry in staged if entry[0]["split"] == split]
+        for offset in range(0, len(entries), 256):
+            shard = f"{offset//256:03d}"
+            batch = entries[offset:offset+256]
+            destination = render_batch(upstream, run, model, iteration, (split, shard), batch,
+                                       images, render_seed, common)
+            scores.update((row["name"], row) for row in report_shard(destination, [row for row, _, _ in batch]))
+    all_rows = [scores[row["name"]] for row, _, _ in staged]
+    totals = {}
+    for split in ("train", "test", "all"):
+        scored = all_rows if split == "all" else [row for row in all_rows if row["split"] == split]
+        totals[split] = dict(count=len(scored), mean_psnr_db=mean(row["renders"][0]["psnr_db"] for row in scored))
+        gallery = run / split
+        gallery.mkdir(exist_ok=True)
+        write_gallery(gallery, f"Orange4F stock Triangle Splatting · {split}", scored,
+                      [dict(label="Stock Triangle Splatting")], totals[split])
+    return totals, all_rows
+
+
+def evaluation_snapshot(training_model, evaluation, iteration):
+    relative = Path("point_cloud") / f"iteration_{iteration}"
+    checkpoint_files = [relative / name for name in ("point_cloud_state_dict.pt", "hyperparameters.pt")]
+    model = evaluation / "model"
+    if model.is_dir():
+        return model
+    files = [Path("cfg_args"), *checkpoint_files]
+    print(f"Waiting for the complete {iteration:,}-step checkpoint in {training_model / relative}", flush=True)
+    while not (training_model / "cfg_args").is_file() or not all(is_zipfile(training_model / path) for path in checkpoint_files):
+        sleep(5)
+
+    def identity():
+        stats = [(training_model / path).stat() for path in files]
+        return [(stat.st_ino, stat.st_size, stat.st_mtime_ns) for stat in stats]
+
+    before = identity()
+    with TemporaryDirectory(prefix=".model_", dir=evaluation) as directory:
+        temporary = Path(directory) / "model"
+        (temporary / relative).mkdir(parents=True)
+        for path in files:
+            shutil.copy2(training_model / path, temporary / path)
+        if identity() != before or not all(is_zipfile(temporary / path) for path in checkpoint_files):
+            raise RuntimeError(f"Checkpoint at {training_model / relative} changed during the snapshot. Rerun evaluation.")
+        temporary.rename(model)
+    return model
+
+
+def evaluate_checkpoint(upstream, training_run, evaluation, iteration):
+    manifest = json.loads((training_run / "split_manifest.json").read_text())
+    images = training_run / "images"
+    seed = training_run / "fit_input" / "sparse/0/points3D.ply"
+    _, extrinsics = read_colmap_scene(Path(manifest["settings"]["colmap_model"]))
+    by_name = {frame.name: frame for frame in extrinsics.values()}
+    staged = []
+    for row in manifest["frames"]:
+        frame = by_name[row["name"]]
+        if not (images / row["staged_name"]).is_file():
+            raise FileNotFoundError(images / row["staged_name"])
+        staged.append((row, frame.qvec / np.linalg.norm(frame.qvec), frame.tvec))
+
+    training_model = training_run / "model"
+    model = evaluation_snapshot(training_model, evaluation, iteration)
+    common = ["-m", model, "-r", "1", "--data_device", "cpu"]
+    print(f"Rendering checkpoint {iteration:,} on {len(staged):,} views. Output: {evaluation}", flush=True)
+    totals, _ = evaluate_frames(upstream, evaluation, model, iteration, staged, images, seed, common)
+    checkpoint = training_model / "point_cloud" / f"iteration_{iteration}" / "point_cloud_state_dict.pt"
+    atomic_json(evaluation / "results.json", dict(iteration=iteration, checkpoint=str(checkpoint), splits=totals))
+    print(json.dumps(totals, indent=2), flush=True)
+
+
 def run_scene(args, upstream, source, run):
     sparse = colmap_model_dir(source)
-    binary = (sparse / "cameras.bin").is_file() and (sparse / "images.bin").is_file()
-    cameras = (colmap.read_cameras_binary(sparse / "cameras.bin") if binary
-               else colmap.read_cameras_text(sparse / "cameras.txt"))
-    extrinsics = (colmap.read_images_binary(sparse / "images.bin") if binary
-                  else colmap.read_images_text(sparse / "images.txt"))
+    cameras, extrinsics = read_colmap_scene(sparse)
     names = sorted((frame.name for frame in extrinsics.values()), key=natural_key)
     if (not names or len(names) != len(set(names)) or
             any(Path(name).is_absolute() or ".." in Path(name).parts for name in names)):
@@ -311,7 +387,6 @@ def run_scene(args, upstream, source, run):
     images = run / "images"
     staged = list(stage_images(source, images, frames, cameras, args.width))
     fitting = [entry for entry in staged if entry[0]["split"] == "train"]
-    heldout = [entry for entry in staged if entry[0]["split"] == "test"]
     fit_scene = run / "fit_input"
     write_scene(fit_scene, fitting, images, seed, fit=True)
     atomic_json(manifest_file, dict(settings=settings, frames=[row for row, _, _ in staged]))
@@ -348,24 +423,7 @@ def run_scene(args, upstream, source, run):
         temporary.replace(mesh)
 
     render_seed = fit_scene / "sparse/0/points3D.ply"
-    (run / "comparisons").mkdir(exist_ok=True)
-    scores = {}
-    for split, entries in (("train", fitting), ("test", heldout)):
-        for offset in range(0, len(entries), 256):
-            shard = f"{offset//256:03d}"
-            batch = entries[offset:offset+256]
-            destination = render_batch(upstream, run, model, iteration, (split, shard), batch,
-                                       images, render_seed, common)
-            scores.update((row["name"], row) for row in report_shard(destination, [row for row, _, _ in batch]))
-    all_rows = [scores[name] for name in names]
-    totals = {}
-    for split in ("train", "test", "all"):
-        scored = all_rows if split == "all" else [row for row in all_rows if row["split"] == split]
-        totals[split] = dict(count=len(scored), mean_psnr_db=mean(row["renders"][0]["psnr_db"] for row in scored))
-        gallery = run / split
-        gallery.mkdir(exist_ok=True)
-        write_gallery(gallery, f"Orange4F stock Triangle Splatting · {split}", scored,
-                      [dict(label="Stock Triangle Splatting")], totals[split])
+    totals, all_rows = evaluate_frames(upstream, run, model, iteration, staged, images, render_seed, common)
     train_seconds = json.loads(train_seconds_file.read_text()) if train_seconds_file.is_file() else None
     results = dict(splits=totals, checkpoint=str(checkpoint), direct_mesh=str(mesh), training_seconds=train_seconds)
     atomic_json(run / "results.json", results)
@@ -401,10 +459,14 @@ def main():
     parser.add_argument("--width", type=int, default=1600, help="Maximum image width for training and rendering (default: 1600)")
     parser.add_argument("--iterations", type=int, default=30_000)
     parser.add_argument("--expected-frames", type=int, default=5009, help="Fail before training on an incomplete capture; 0 disables the check")
-    parser.add_argument("--prepare-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--prepare-only", action="store_true")
+    mode.add_argument("--evaluate-iteration", type=int, help="Render and score the given checkpoint in an existing --run")
     args = parser.parse_args()
     if args.width < 1 or args.iterations < 1 or args.expected_frames < 0 or args.keyframe_stride < 2:
         parser.error("width and iterations must be positive, expected-frames nonnegative, and keyframe-stride at least 2")
+    if args.evaluate_iteration is not None and args.evaluate_iteration < 1:
+        parser.error("--evaluate-iteration must be positive")
     upstream, source = args.upstream.expanduser().resolve(), args.source.expanduser().resolve()
     revision = subprocess.check_output(["git", "-C", upstream, "rev-parse", "HEAD"], text=True).strip()
     changes = subprocess.check_output(["git", "-C", upstream, "status", "--porcelain", "--untracked-files=no"], text=True).strip()
@@ -419,7 +481,7 @@ def main():
                 f"  git submodule update --init --recursive -- {rasterizer}\n"
                 f"  python -m pip install --no-build-isolation --no-deps ./{rasterizer}"
             )
-        if shutil.which("ffmpeg") is None:
+        if args.evaluate_iteration is None and shutil.which("ffmpeg") is None:
             parser.error("ffmpeg with libx264 is required to encode the videos")
         preflight = subprocess.run([sys.executable, "-c", "import torch, lpips, plyfile; "
                                     "from simple_knn._C import distCUDA2; from triangle_renderer import render; "
@@ -430,6 +492,15 @@ def main():
     run = (args.run or OUTPUT / f"triangle_splatting_stock_full_{cohort}_w{args.width}_{args.iterations}").resolve()
     if run.is_relative_to(source) or run.is_relative_to(upstream):
         parser.error("Run directory must be outside the input dataset and upstream checkout")
+    if args.evaluate_iteration is not None:
+        if not (run / "split_manifest.json").is_file():
+            parser.error(f"Missing staged training run at {run}. Set --run to the active training run directory.")
+        evaluation = run / f"evaluation_{args.evaluate_iteration}"
+        evaluation.mkdir(exist_ok=True)
+        with (evaluation / "run.lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            evaluate_checkpoint(upstream, run, evaluation, args.evaluate_iteration)
+        return
     run.mkdir(parents=True, exist_ok=True)
     with (run / "run.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

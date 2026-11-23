@@ -147,6 +147,22 @@ for train, test, and all views. `comparisons/` contains one labeled side-by-side
 GT and render per image. The `train/`, `test/`, and `all/` folders each contain
 an RGB and error gallery and per-frame scores.
 
+To render and score the 7,000-step checkpoint while training continues on
+GPU 0, launch this in a separate terminal on GPU 1:
+
+```bash
+conda activate 3dgs
+cd ~/gaussian-splatting-orange4f
+CUDA_VISIBLE_DEVICES=1 python -u -m scripts.orange4f_stock_triangle \
+  --width 1600 --evaluate-iteration 7000
+```
+
+Evaluation waits for the checkpoint files to finish writing and takes a
+private snapshot. It reuses the staged images and split from the active run.
+The `evaluation_7000/` directory within that run contains renders, galleries,
+and train, test, and all-view PSNR in `results.json`. Pass `--run` for a custom
+training directory.
+
 `original_trajectory.mp4` shows GT and renders side by side at their staged
 resolution for all registered frames in natural filename order at 30 fps.
 At the default resolution each side is up to 1,600 pixels wide.
