@@ -86,7 +86,31 @@ python -u -m scripts.indoor_triangles evaluate --data "$ROOM_INPUT" --run "$ROOM
 python -m scripts.indoor_triangles lpips --eval "$ROOM_EVAL"
 ```
 
-The optional evaluator mask NPZ uses `kinds` of shape (final views, height, width), with 0 for floor, 1 for wall, 2 for doorway rear targets and −1 for unspecified. Without it only whole-scene metrics and RGB scores are defined. Set mask labels from evaluator geometry and view definitions independent of any candidate. Use repeating locked scene manifests. Classical stereo has a measured synthetic arm only. Orange4F has no run in this branch.
+The optional evaluator mask NPZ uses `kinds` of shape (final views, height, width), with 0 for floor, 1 for wall, 2 for doorway rear targets and −1 for unspecified. Without it only whole-scene metrics and RGB scores are defined. Set mask labels from evaluator geometry and view definitions independent of any candidate. Use repeating locked scene manifests. Classical stereo has a measured synthetic arm only.
+
+## Orange4F local-chart pilot
+
+Run directly on the Orange4F COLMAP BA export at
+`/data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full`. The default
+reference is `12569.jpg`, the floor diagnostic frame. The command selects
+nearby, same-facing cameras using the fixed COLMAP poses, reserves translated
+edit and final views, and rebuilds triangulated tracks from fitting RGB only.
+This is a CPU pilot on one local chart. It starts at 384 pixels wide and uses
+up to 18 fitting views, three edit views and four held-out views.
+
+```bash
+RUN="/data/3dgs_outputs/orange4f/3dgs_finetuning/elastic_hybrid_12569_$(date +%Y%m%d-%H%M%S)"
+python -u -m scripts.indoor_triangles orange4f --out "$RUN"
+```
+
+The command needs `pycolmap==3.11.1` in the active environment. If the source is
+elsewhere, set `--source`. Try another local chart with `--reference-view`, or
+adjust `--window` (registered frames on either side) and `--radius` (metres)
+if there are too few translated views. The camera split is saved in
+`split.json`. The hybrid checkpoint is `run/hybrid.npz`, and mesh exports,
+per-view RGB/depth/normal previews, and the metrics table are linked from
+`eval/index.html`. View depth and normals are predicted geometry. Supply
+`--reference-mesh` with a registered triangle mesh to also score geometry.
 
 ## Stock CUDA references
 

@@ -231,6 +231,31 @@ def montage(view_image,target,near_d,near_n,ref_n,wire,truth_d,goal,path):
     out.save(path)
 
 
+def rgb_montage(image, rgb, distance, normals, wire, title, path):
+    hit = np.isfinite(distance)
+    gray = np.zeros_like(distance)
+    if hit.any():
+        near, far = np.percentile(distance[hit], [5, 95])
+        gray[hit] = 1. - .85 * np.clip((distance[hit]-near)/max(far-near,1e-9),0,1)
+    error = np.abs(rgb-image).mean(axis=-1)
+    error_rgb = np.stack((np.minimum(1,4*error),np.clip(4*error-1,0,1),np.zeros_like(error)),axis=-1)
+    panels = (
+        ("Reference RGB", image), ("Rendered RGB", rgb), ("RGB error", error_rgb),
+        ("Mesh range", np.repeat(gray[...,None],3,axis=-1)),
+        ("Mesh normals", np.where(hit[...,None],.5+.5*normals,0.)),
+        ("Mesh wireframe", np.where(wire[...,None],[.09,.95,.78],rgb*.65)),
+    )
+    height,width = image.shape[:2]
+    canvas = Image.new("RGB",(3*width,36+2*(height+24)),"#161d26")
+    draw = ImageDraw.Draw(canvas)
+    draw.text((8,10),title,fill="#edf3fa")
+    for k,(label,panel) in enumerate(panels):
+        x,y = k%3*width,36+k//3*(height+24)
+        draw.text((x+6,y+4),label,fill="#edf3fa")
+        canvas.paste(as_image(panel),(x,y+24))
+    canvas.save(path)
+
+
 def compare_arm(checkpoint,images,cameras,refs,folder,cfg,target,*,first_hit=False):
     start=perf_counter()
     mesh=Mesh.read(checkpoint)
@@ -238,38 +263,47 @@ def compare_arm(checkpoint,images,cameras,refs,folder,cfg,target,*,first_hit=Fal
     local=Path(folder)/arm
     local.mkdir(parents=True,exist_ok=True)
     tick=perf_counter()
-    export(checkpoint,local,cfg["soft_export_threshold"])
+    exports=export(checkpoint,local,cfg["soft_export_threshold"])
     extraction=perf_counter()-tick
     direct=mesh.clone(hard=np.ones(len(mesh.faces),bool))
     photometric = mesh.clone(hard=~mesh.transmitting, elastic_sigma=0.) if first_hit else mesh
-    depths=[item[1] for item in refs]
+    depths=[item[1] for item in refs] if refs is not None else None
     render_metrics=[]
-    for index,(image,cam,ref) in enumerate(zip(images,cameras,refs)):
+    for index,(image,cam) in enumerate(zip(images,cameras)):
         pred=render_view(photometric,cam,cfg["tau_px"])
         geom=render_view(direct,cam,cfg["tau_px"],direct=True)
         rgb=pred["rgb"].mean(axis=2)
         distance=geom["range_m"][...,0]
-        _,truth_d,kind,truth_n=ref
+        mesh_normals=geom["normal"][...,0,:]
+        wire=geom["wire"][...,0]
         mse=float(np.mean((rgb-image)**2))
-        first_render=pred["range_m"][...,0]
         score=dict(view=index,psnr_db=float(-10*np.log10(max(mse,1e-14))),
                    ssim=ssim(rgb,image),lpips=None,
-                   opaque_subsample_fraction=float(pred["hard"].mean()),
-                   floor=region_depth(distance,truth_d,kind==0),wall=region_depth(distance,truth_d,kind==1),
-                   doorway=region_depth(distance,truth_d,kind==2),
-                   doorway_render_event=region_depth(first_render,truth_d,kind==2))
+                   mesh_hit_fraction=float(np.isfinite(distance).mean()),
+                   opaque_subsample_fraction=float(pred["hard"].mean()))
+        title=f"{arm}  |  final view {index:02}  |  {score['psnr_db']:.2f} dB PSNR"
+        preview=local/f"final_{index:02}.png"
+        arrays=dict(rgb=rgb,reference_rgb=image,mesh_range=distance,normals=mesh_normals,
+                    wire=wire,hard_coverage=pred["hard"].mean(-1))
+        if refs is None:
+            rgb_montage(image,rgb,distance,mesh_normals,wire,title,preview)
+        else:
+            _,truth_d,kind,truth_n=refs[index]
+            score.update(floor=region_depth(distance,truth_d,kind==0),
+                         wall=region_depth(distance,truth_d,kind==1),
+                         doorway=region_depth(distance,truth_d,kind==2),
+                         doorway_render_event=region_depth(pred["range_m"][...,0],truth_d,kind==2))
+            montage(image,rgb,distance,mesh_normals,truth_n,wire,truth_d,title,preview)
+            arrays.update(reference_range=truth_d,reference_kind=kind,reference_normals=truth_n)
         render_metrics.append(score)
-        montage(image,rgb,distance,geom["normal"][...,0,:],truth_n,geom["wire"][...,0],truth_d,
-                f"{arm}  |  final view {index:02}  |  {score['psnr_db']:.2f} dB PSNR",
-                local/f"final_{index:02}.png")
-        np.savez_compressed(local/f"final_{index:02}.npz",rgb=rgb,reference_rgb=image,
-                            mesh_range=distance,reference_range=truth_d,reference_kind=kind,
-                            normals=geom["normal"][...,0,:],reference_normals=truth_n,
-                            wire=geom["wire"][...,0],hard_coverage=pred["hard"].mean(-1))
+        np.savez_compressed(local/f"final_{index:02}.npz",**arrays)
     surfaces={}
-    for label in ("all","thresholded","committed"):
-        v,f=read_ascii_mesh(local/f"{label}.ply")
-        surfaces[label]=surface_score(v,f,cameras,depths,target,cfg) | {"exported_faces":len(f)}
+    for label,(_,faces) in exports.items():
+        if target is None:
+            surfaces[label]={"exported_faces":len(faces)}
+        else:
+            v,f=read_ascii_mesh(local/f"{label}.ply")
+            surfaces[label]=surface_score(v,f,cameras,depths,target,cfg) | {"exported_faces":len(f)}
     return dict(wall_s=perf_counter()-start,export_s=extraction,views=render_metrics,surface=surfaces,
                 rgb_visibility="first_hit" if first_hit else "checkpoint")
 

@@ -21,12 +21,15 @@ def config(path):
     return json.loads(Path(path).read_text())
 
 
-def evaluate(data,run_folder,output,reference_mesh=None,reference_masks=None,first_hit=False):
+def evaluate(data,run_folder,output,reference_mesh=None,reference_masks=None,first_hit=False,
+             rgb_only=False,checkpoint_name=None):
     data,run_folder,output=Path(data),Path(run_folder),Path(output)
     output.mkdir(parents=True,exist_ok=True)
     cfg=config(run_folder/"config.json")
     images,cameras=load_views(data/"final.npz")
-    if reference_mesh:
+    if rgb_only:
+        refs = None
+    elif reference_mesh:
         from .room import reference_views
         vertices,faces,refs=reference_views(reference_mesh,cameras,reference_masks)
     else:
@@ -35,26 +38,28 @@ def evaluate(data,run_folder,output,reference_mesh=None,reference_masks=None,fir
         vertices,faces,kinds=reference
         refs=[ref_view(reference,cam) for cam in cameras]
         vertices,faces=vertices,faces[kinds!=4]
-    target=surface_context(vertices,faces,cameras,[r[1] for r in refs],cfg)
+    target=None if refs is None else surface_context(vertices,faces,cameras,[r[1] for r in refs],cfg)
     table=[]
-    for ckpt in sorted(run_folder.glob("*.npz")):
+    checkpoints = sorted(run_folder.glob("*.npz")) if checkpoint_name is None else [run_folder/checkpoint_name]
+    for ckpt in checkpoints:
         if ckpt.name=="fitting_tracks.npz":
             continue
         result=compare_arm(ckpt,images,cameras,refs,output,cfg,target,first_hit=first_hit)
         save_json(output/f"{ckpt.stem}.json",result)
         print(ckpt.stem,flush=True)
         views=result["views"]
-        doorway=sum(v["doorway"]["reference_pixels"] for v in views)
+        doorway=sum(v.get("doorway",{}).get("reference_pixels",0) for v in views)
         curve=config(run_folder/f"{ckpt.stem}.json")
         extra=curve.get("edit_wall_s",0)
         for mode,s in result["surface"].items():
             table.append(dict(arm=ckpt.stem,export=mode,faces=s["exported_faces"],
-                              accuracy_m=s["accuracy_m"],completeness_m=s["completeness_m"],
-                              chamfer_l1_m=s["chamfer_l1_m"],fscore_5cm=s["fscore"],
-                              normal_consistency=s["normal_consistency"],
+                              accuracy_m=s.get("accuracy_m"),completeness_m=s.get("completeness_m"),
+                              chamfer_l1_m=s.get("chamfer_l1_m"),fscore_5cm=s.get("fscore"),
+                              normal_consistency=s.get("normal_consistency"),
                               psnr_db=float(np.mean([v["psnr_db"] for v in views])),
                               ssim=float(np.mean([v["ssim"] for v in views])),
                               opaque_fraction=float(np.mean([v["opaque_subsample_fraction"] for v in views])),
+                              mesh_hit_fraction=float(np.mean([v["mesh_hit_fraction"] for v in views])),
                               early_doorway_fraction=sum(v["doorway"]["early"] for v in views)/doorway if doorway else None,
                               missed_doorway_fraction=sum(v["doorway"]["missed"] for v in views)/doorway if doorway else None,
                               appearance_bytes=curve["appearance_bytes"],
@@ -93,7 +98,10 @@ def main():
     p.add_argument("--data",type=Path,required=True)
     p.add_argument("--run",type=Path,required=True)
     p.add_argument("--out",type=Path,required=True)
-    p.add_argument("--reference-mesh",type=Path)
+    reference=p.add_mutually_exclusive_group()
+    reference.add_argument("--reference-mesh",type=Path)
+    reference.add_argument("--rgb-only",action="store_true",
+                           help="Score held-out RGB and render mesh diagnostics without reference geometry.")
     p.add_argument("--reference-masks",type=Path)
     p.add_argument("--first-hit",action="store_true",
                    help="Render all nontransmitting faces opaque for a common RGB comparison.")
@@ -131,6 +139,24 @@ def main():
     p.add_argument("--pose-provenance",required=True)
     p.add_argument("--cell",type=int,default=18)
     p.add_argument("--gpu-features",action="store_true")
+    from .orange4f import REFERENCE_VIEW, SOURCE
+    p=sub.add_parser("orange4f",help="Fit and evaluate a local chart from the Orange4F COLMAP export.")
+    p.add_argument("--source",type=Path,default=SOURCE)
+    p.add_argument("--images",type=Path)
+    p.add_argument("--out",type=Path,required=True)
+    p.add_argument("--config",type=Path,default=DEFAULT.with_name("room_config.json"))
+    p.add_argument("--reference-view",default=REFERENCE_VIEW)
+    p.add_argument("--reference-mesh",type=Path)
+    p.add_argument("--seed",type=int,default=17)
+    p.add_argument("--fit-views",type=int,default=18)
+    p.add_argument("--edit-views",type=int,default=3)
+    p.add_argument("--final-views",type=int,default=4)
+    p.add_argument("--window",type=int,default=160)
+    p.add_argument("--radius",type=float,default=2.5)
+    p.add_argument("--width",type=int,default=384)
+    p.add_argument("--cell",type=int,default=20)
+    p.add_argument("--gpu-features",action="store_true")
+    p.add_argument("--kernel",choices=("smoothstep","elastic"),default="elastic")
     args=parser.parse_args()
     if args.action=="make-synthetic":
         manifest=generate(args.out)
@@ -148,7 +174,8 @@ def main():
         run(args.data,args.out,cfg,args.seed,args.dense,args.tracks,args.minimal,
             kernel_comparison=args.compare_kernels,hybrid=args.hybrid)
     elif args.action=="evaluate":
-        evaluate(args.data,args.run,args.out,args.reference_mesh,args.reference_masks,args.first_hit)
+        evaluate(args.data,args.run,args.out,args.reference_mesh,args.reference_masks,args.first_hit,
+                 rgb_only=args.rgb_only)
     elif args.action=="export":
         export(args.checkpoint,args.out,args.threshold)
     elif args.action=="render":
@@ -167,6 +194,15 @@ def main():
     elif args.action=="fit-diagnostics":
         from .evaluate import fitting_diagnostics
         fitting_diagnostics(args.checkpoint,args.fit,config(args.config),args.out)
+    elif args.action=="orange4f":
+        from .orange4f import prepare_orange4f, write_report
+        cfg = config(args.config) | {"kernel": args.kernel}
+        prepare_orange4f(args)
+        data,out = args.out/"input",args.out/"run"
+        run(data,out,cfg,args.seed,tracks_path=data/"fitting_tracks.npz",hybrid=True)
+        evaluate(data,out,args.out/"eval",args.reference_mesh,rgb_only=args.reference_mesh is None,
+                 checkpoint_name="hybrid.npz")
+        write_report(args.out)
     elif args.action=="lpips":
         from .perceptual import score_folder
         score_folder(args.eval)

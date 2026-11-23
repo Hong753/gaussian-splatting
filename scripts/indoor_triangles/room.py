@@ -21,10 +21,13 @@ def colmap_loader():
 
 def model_cameras(model):
     col=colmap_loader()
-    binary=(model/"cameras.bin").is_file()
+    binary=all((model/name).is_file() for name in ("cameras.bin","images.bin"))
     if binary:
         return col,col.read_intrinsics_binary(model/"cameras.bin"),col.read_extrinsics_binary(model/"images.bin")
     return col,col.read_intrinsics_text(model/"cameras.txt"),col.read_extrinsics_text(model/"images.txt")
+
+
+HOLDOUT_GAP_M = {"edit": .08, "final": .15}
 
 
 def write_pinhole(path, records, points=()):
@@ -122,11 +125,11 @@ def candidate_tracks(model,fit,ref,cell):
                 tolerance=np.clip(.04+.04*error,.04,.09),score=1/(1+error)),list(zip(xyz,colors.tolist(),error))
 
 
-def prepare(args):
+def prepare(args, calibration_data=None):
     import json
 
     start=perf_counter()
-    col,calibration,frames=model_cameras(args.model)
+    col,calibration,frames=calibration_data if calibration_data is not None else model_cameras(args.model)
     if not args.pose_provenance.strip():
         raise ValueError("Record a concrete calibration origin.")
     by_name={im.name:im for im in frames.values()}
@@ -165,7 +168,7 @@ def prepare(args):
     centers=np.array([item["center"] for item in fit])
     distances={n:float(np.linalg.norm(centers-loaded[n]["center"],axis=1).min())
                for role in ("edit","final") for n in split[role]}
-    if min(distances[n] for n in split["final"])<.15 or min(distances[n] for n in split["edit"])<.08:
+    if any(min(distances[n] for n in split[role])<gap for role,gap in HOLDOUT_GAP_M.items()):
         raise ValueError(f"Retain translated blocks. Minimum nearest-fitting distances are 0.15/0.08 m "
                          f"for final/edit views. Got {distances}.")
     out=args.out.resolve()
