@@ -1,5 +1,6 @@
 """Fitting-only CPU optimizer and reproducible local validation trials."""
 
+from hashlib import sha256
 from pathlib import Path
 from time import perf_counter
 
@@ -105,6 +106,7 @@ def train(model, images, cams, tracks, cfg, steps, seed, logfile=None, assignmen
           region=None, active=None, fixed_geometry=False, fixed_color=False):
     starts, start = render.subsamples, perf_counter()
     rng = np.random.default_rng(seed)
+    ray_digest = sha256()
     scale, cap = cfg["track_scale_m"], cfg["anchor_cap"]
     w = np.array([cfg["weights"][k] for k in NAME])
     assignments, free = fit_evidence(model,tracks,cams,assignments)
@@ -129,6 +131,9 @@ def train(model, images, cams, tracks, cfg, steps, seed, logfile=None, assignmen
         cam_id, xy, depth, tolerance = free[step%len(free)]
         indices = rng.choice(len(xy),min(cfg["free_rays"],len(xy)),replace=False)
         freedata = xy[indices],depth[indices],tolerance[indices]
+        ray_digest.update(np.array([i,j,cam_id],dtype="<i8").tobytes())
+        ray_digest.update(coords.astype("<f8").tobytes())
+        ray_digest.update(indices.astype("<i8").tobytes())
 
         def objective(want_color=False):
             pred = render(model,camera,coords,cfg["tau_px"],color_basis=want_color)
@@ -149,9 +154,13 @@ def train(model, images, cams, tracks, cfg, steps, seed, logfile=None, assignmen
         if not fixed_geometry:
             probes = cfg["geometry_probes"]
             normalizes = eps*2*probes
+            # Topology and texture-only trials may consume different probe counts.
+            # Keep those draws independent of the local fitting-ray sequence.
+            probe_rng = rng if region is None else np.random.default_rng(
+                np.random.SeedSequence([seed,step,173]))
             for _ in range(probes):
-                dv = rng.choice((-1.,1.),model.vertices.shape)*active[:,None]
-                da = rng.choice((-1.,1.),model.opacity.shape)*opacity_active
+                dv = probe_rng.choice((-1.,1.),model.vertices.shape)*active[:,None]
+                da = probe_rng.choice((-1.,1.),model.opacity.shape)*opacity_active
                 v, opacity = model.vertices.copy(),model.opacity.copy()
                 pair_values = []
                 for sign in (1,-1):
@@ -184,6 +193,7 @@ def train(model, images, cams, tracks, cfg, steps, seed, logfile=None, assignmen
                             wall_s=perf_counter()-start))
     stats = dict(steps=steps, rendered_subsamples=render.subsamples-starts,
                  valid_totals=dict(zip(NAME,totals.tolist())), wall_s=perf_counter()-start,
+                 fitting_rays_sha256=ray_digest.hexdigest(),
                  active_geometry_scalars=int(active.sum()*3) if not fixed_geometry else 0,
                  valid_count_units={"rgb":"pixels","warp":"patches","free":"track rays",
                                     "anchor":"points including missing","bend":"edges","quality":"faces"},
@@ -258,6 +268,9 @@ def compare_edit(mesh, face_id, fit, dev, tracks, cfg, seed, actions):
         logs[action] = dict(score=score,rgb=mean(val_loss),anchor=anchor,free=mean(track_err),
                             early_blockers=blocked,track_rays=visits,local_track_rays=local_track_count,
                             validation_pixels=val_counts,fit=stats)
+    hashes={row["fit"]["fitting_rays_sha256"] for row in logs.values()}
+    if len(hashes)!=1:
+        raise RuntimeError("Local trials must use identical fitting samples.")
     return candidates,logs
 
 
