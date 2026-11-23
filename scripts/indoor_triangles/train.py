@@ -77,7 +77,7 @@ def support_faces(model, tracks, cams, threshold, minimum_anchors, maximum_unsup
         for ids in chunks(np.arange(len(xyz))):
             p = xyz[ids]
             d,_ = plane_hits(hard.vertices,hard.faces,cam.center,cam.rays(cam.project(p)))
-            edges,_ = screen_edges(cam,cam.project(p),hard.vertices[hard.faces],.05)
+            edges,_,_ = screen_edges(cam,cam.project(p),hard.vertices[hard.faces],.05)
             conflicts = (d>.05) & (edges.min(-1)>=-1e-8) & (
                 np.linalg.norm(p-cam.center,axis=1)[:,None]-d > np.maximum(threshold,eps[ids,None]))
             bad |= conflicts.any(0)
@@ -102,8 +102,22 @@ def draw(rng, cam, count, region):
     return np.stack((x,y),axis=1)
 
 
+def elastic_schedule(cfg):
+    kernel = cfg.get("kernel", "smoothstep")
+    if kernel == "smoothstep":
+        return 0., 0.
+    if kernel != "elastic":
+        raise ValueError(f"Unknown triangle fitting kernel: {kernel}")
+    start = float(cfg.get("elastic_sigma_start", .45))
+    end = float(cfg.get("elastic_sigma_end", .055))
+    if not np.isfinite(start) or not .01 <= end <= start <= 1.:
+        raise ValueError("Elastic softness must satisfy 0.01 <= end <= start <= 1.")
+    return start, end
+
+
 def train(model, images, cams, tracks, cfg, steps, seed, logfile=None, assignments=None,
-          region=None, active=None, fixed_geometry=False, fixed_color=False):
+          region=None, active=None, fixed_geometry=False, fixed_color=False,
+          elastic_progress=(0., 1.)):
     starts, start = render.subsamples, perf_counter()
     rng = np.random.default_rng(seed)
     ray_digest = sha256()
@@ -118,7 +132,19 @@ def train(model, images, cams, tracks, cfg, steps, seed, logfile=None, assignmen
     log, totals = [],np.zeros(len(NAME),int)
     eps = cfg["geometry_probe_m"]
     initial = model.vertices.copy()
+    sigma_start, sigma_end = elastic_schedule(cfg)
+    if sigma_start:
+        if region is not None or fixed_geometry:
+            sigma_start = sigma_end = model.elastic_sigma or sigma_end
+        else:
+            schedule = np.exp(np.interp(elastic_progress, (0., 1.), np.log([sigma_start, sigma_end])))
+            sigma_start, sigma_end = map(float, schedule)
     for step in range(1,steps+1):
+        if sigma_start:
+            fraction = (step-1) / (steps-1) if steps > 1 else 1.
+            model.elastic_sigma = sigma_start * (sigma_end / sigma_start)**fraction
+        else:
+            model.elastic_sigma = 0.
         i,j = rng.choice(len(cams),2,replace=False)
         camera = cams[i]
         pix = draw(rng,camera,cfg["batch_pixels"],region)
@@ -190,10 +216,12 @@ def train(model, images, cams, tracks, cfg, steps, seed, logfile=None, assignmen
         if step == 1 or step == steps or step % cfg["log_every"] == 0:
             log.append(dict(step=step,total=float(values@w),loss=dict(zip(NAME,values.tolist())),
                             count=dict(zip(NAME,count.tolist())),weights=dict(zip(NAME,w.tolist())),
-                            wall_s=perf_counter()-start))
+                            elastic_sigma=model.elastic_sigma,wall_s=perf_counter()-start))
     stats = dict(steps=steps, rendered_subsamples=render.subsamples-starts,
                  valid_totals=dict(zip(NAME,totals.tolist())), wall_s=perf_counter()-start,
                  fitting_rays_sha256=ray_digest.hexdigest(),
+                 kernel=cfg.get("kernel", "smoothstep"),elastic_sigma_start=sigma_start,
+                 elastic_sigma_end=sigma_end,
                  active_geometry_scalars=int(active.sum()*3) if not fixed_geometry else 0,
                  valid_count_units={"rgb":"pixels","warp":"patches","free":"track rays",
                                     "anchor":"points including missing","bend":"edges","quality":"faces"},

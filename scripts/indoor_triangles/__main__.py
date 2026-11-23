@@ -21,7 +21,7 @@ def config(path):
     return json.loads(Path(path).read_text())
 
 
-def evaluate(data,run_folder,output,reference_mesh=None,reference_masks=None):
+def evaluate(data,run_folder,output,reference_mesh=None,reference_masks=None,first_hit=False):
     data,run_folder,output=Path(data),Path(run_folder),Path(output)
     output.mkdir(parents=True,exist_ok=True)
     cfg=config(run_folder/"config.json")
@@ -40,7 +40,7 @@ def evaluate(data,run_folder,output,reference_mesh=None,reference_masks=None):
     for ckpt in sorted(run_folder.glob("*.npz")):
         if ckpt.name=="fitting_tracks.npz":
             continue
-        result=compare_arm(ckpt,images,cameras,refs,output,cfg,target)
+        result=compare_arm(ckpt,images,cameras,refs,output,cfg,target,first_hit=first_hit)
         save_json(output/f"{ckpt.stem}.json",result)
         print(ckpt.stem,flush=True)
         views=result["views"]
@@ -80,7 +80,14 @@ def main():
     p.add_argument("--config",type=Path,default=DEFAULT)
     p.add_argument("--seed",type=int,default=17)
     p.add_argument("--dense",action="store_true")
-    p.add_argument("--minimal",action="store_true")
+    mode=p.add_mutually_exclusive_group()
+    mode.add_argument("--minimal",action="store_true")
+    mode.add_argument("--compare-kernels",action="store_true",
+                      help="Fit smoothstep and elastic coverage from a shared connected checkpoint.")
+    mode.add_argument("--hybrid",action="store_true",
+                      help="Fit and selectively harden an indoor mesh. Defaults to elastic coverage.")
+    p.add_argument("--kernel",choices=("smoothstep","elastic"),
+                   help="Coverage kernel for provisional triangles.")
     p.add_argument("--tracks",type=Path)
     p=sub.add_parser("evaluate")
     p.add_argument("--data",type=Path,required=True)
@@ -88,6 +95,8 @@ def main():
     p.add_argument("--out",type=Path,required=True)
     p.add_argument("--reference-mesh",type=Path)
     p.add_argument("--reference-masks",type=Path)
+    p.add_argument("--first-hit",action="store_true",
+                   help="Render all nontransmitting faces opaque for a common RGB comparison.")
     p=sub.add_parser("export")
     p.add_argument("--checkpoint",type=Path,required=True)
     p.add_argument("--out",type=Path,required=True)
@@ -131,9 +140,15 @@ def main():
     elif args.action=="fit":
         if args.dense and args.tracks:
             parser.error("--dense and externally triangulated --tracks are mutually exclusive.")
-        run(args.data,args.out,config(args.config),args.seed,args.dense,args.tracks,args.minimal)
+        if args.compare_kernels and args.kernel:
+            parser.error("--compare-kernels fits both kernels and does not take --kernel.")
+        cfg = config(args.config)
+        if args.kernel:
+            cfg["kernel"] = args.kernel
+        run(args.data,args.out,cfg,args.seed,args.dense,args.tracks,args.minimal,
+            kernel_comparison=args.compare_kernels,hybrid=args.hybrid)
     elif args.action=="evaluate":
-        evaluate(args.data,args.run,args.out,args.reference_mesh,args.reference_masks)
+        evaluate(args.data,args.run,args.out,args.reference_mesh,args.reference_masks,args.first_hit)
     elif args.action=="export":
         export(args.checkpoint,args.out,args.threshold)
     elif args.action=="render":

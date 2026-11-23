@@ -71,15 +71,16 @@ def clip_front(polygon, near):
 
 
 def screen_edges(camera, pixels, triangles, near):
-    """Distance to three original edges, with a clipped polygon at the near plane."""
+    """Signed pixel distances, unclipped-face mask, and projected edge altitudes."""
     local = camera.local(triangles)
     regular = (local[..., 2] >= near).all(axis=1)
     safe_z = np.where(regular[:, None, None], local[..., 2:], 1.)
     xy = local[..., :2] / safe_z * camera.intrinsics[:2] + camera.intrinsics[2:]
     delta = np.roll(xy, -1, axis=1) - xy
-    winding = np.sign(cross2(delta[:, 0], delta[:, 1]))
+    double_area = cross2(delta[:, 0], delta[:, 1])
+    edge_length = np.maximum(np.linalg.norm(delta, axis=-1), 1e-10)
     distance = cross2(delta, pixels[:, None, None, :] - xy[None])
-    distance *= winding[:, None] / np.maximum(np.linalg.norm(delta, axis=-1), 1e-10)
+    distance *= np.sign(double_area)[:, None] / edge_length
     for i in np.flatnonzero(~regular):
         poly = clip_front(local[i], near)
         if len(poly) < 3:
@@ -91,7 +92,20 @@ def screen_edges(camera, pixels, triangles, near):
         d = cross2(edge, pixels[:, None] - q) * sign
         d /= np.maximum(np.linalg.norm(edge, axis=-1), 1e-10)
         distance[:, i] = d.min(axis=1, keepdims=True)
-    return distance, regular
+    return distance, regular, np.abs(double_area)[:, None] / edge_length
+
+
+def elastic_coverage(distance, altitude, shared, sigma):
+    """ETS kernel on exposed edges in projected barycentric coordinates."""
+    edge_coordinates = distance / altitude
+    # Each signed distance divided by its altitude is the opposing barycentric
+    # coordinate. Preserve exact ownership at shared edges in the caller.
+    x = np.maximum(0., 1. - 3. * np.min(np.where(shared, np.inf, edge_coordinates), axis=-1))
+    bounded = np.minimum(x, 2.)
+    # Cap the exponent before exp. Beyond this value the coverage rounds to zero.
+    with np.errstate(divide="ignore", over="ignore"):
+        log_exponent = np.minimum(np.log(sigma) + (2. / sigma) * np.log(bounded), 7.)
+    return np.where(x <= 2., np.exp(-np.exp(log_exponent)), 0.)
 
 
 def plane_hits(vertices, faces, center, directions):
@@ -176,7 +190,7 @@ def render(model, camera, pixels, tau=.8, near=.05, color_basis=False):
     triangles = vertices[faces]
     directions = camera.rays(pixels)
     depth, beta = plane_hits(vertices, faces, camera.center, directions)
-    distance, regular = screen_edges(camera, pixels, triangles, near)
+    distance, regular, altitude = screen_edges(camera, pixels, triangles, near)
     # Half-plane ownership for shared edges, with exact ties owned by face index.
     shared = (model.neighbors >= 0) & regular[:, None]
     tied = np.abs(distance) < 1e-8
@@ -197,6 +211,13 @@ def render(model, camera, pixels, tau=.8, near=.05, color_basis=False):
     exterior = np.min(np.where(shared, np.inf, distance), axis=-1)
     smooth = np.clip((exterior + tau) / (2 * tau), 0, 1)
     smooth = smooth**2 * (3 - 2 * smooth)
+    if model.elastic_sigma > 0:
+        # The original projected barycentrics are ill-defined when a face
+        # crosses the near plane. Clipped polygons keep the pixel-distance kernel.
+        elastic = regular & ~model.hard & (altitude > 1e-10).all(axis=1)
+        if elastic.any():
+            smooth[:, elastic] = elastic_coverage(distance[:, elastic], altitude[elastic],
+                                                  shared[elastic], model.elastic_sigma)
     soft = model.opacity * smooth * soft_gate
     alpha = np.where(model.hard, inside, soft) * front
     order = np.argsort(np.where(alpha > 0, depth, np.inf), axis=1, kind="stable")

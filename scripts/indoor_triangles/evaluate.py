@@ -231,7 +231,7 @@ def montage(view_image,target,near_d,near_n,ref_n,wire,truth_d,goal,path):
     out.save(path)
 
 
-def compare_arm(checkpoint,images,cameras,refs,folder,cfg,target):
+def compare_arm(checkpoint,images,cameras,refs,folder,cfg,target,*,first_hit=False):
     start=perf_counter()
     mesh=Mesh.read(checkpoint)
     arm=Path(checkpoint).stem
@@ -241,10 +241,11 @@ def compare_arm(checkpoint,images,cameras,refs,folder,cfg,target):
     export(checkpoint,local,cfg["soft_export_threshold"])
     extraction=perf_counter()-tick
     direct=mesh.clone(hard=np.ones(len(mesh.faces),bool))
+    photometric = mesh.clone(hard=~mesh.transmitting, elastic_sigma=0.) if first_hit else mesh
     depths=[item[1] for item in refs]
     render_metrics=[]
     for index,(image,cam,ref) in enumerate(zip(images,cameras,refs)):
-        pred=render_view(mesh,cam,cfg["tau_px"])
+        pred=render_view(photometric,cam,cfg["tau_px"])
         geom=render_view(direct,cam,cfg["tau_px"],direct=True)
         rgb=pred["rgb"].mean(axis=2)
         distance=geom["range_m"][...,0]
@@ -269,7 +270,8 @@ def compare_arm(checkpoint,images,cameras,refs,folder,cfg,target):
     for label in ("all","thresholded","committed"):
         v,f=read_ascii_mesh(local/f"{label}.ply")
         surfaces[label]=surface_score(v,f,cameras,depths,target,cfg) | {"exported_faces":len(f)}
-    return dict(wall_s=perf_counter()-start,export_s=extraction,views=render_metrics,surface=surfaces)
+    return dict(wall_s=perf_counter()-start,export_s=extraction,views=render_metrics,surface=surfaces,
+                rgb_visibility="first_hit" if first_hit else "checkpoint")
 
 
 def score_external(data, reference_mesh, candidate_mesh, config, output, renders=None, masks=None):

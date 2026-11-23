@@ -27,6 +27,47 @@ def fixtures():
     return cam,model
 
 
+def check_elastic(cam, room, coords, exact):
+    projected = np.array([[10., 10.], [46., 10.], [10., 46.]])
+    rays = cam.rays(projected)
+    vertices = cam.center + rays * (3. / (rays @ cam.rotation[2]))[:, None]
+    smooth = initial_mesh(vertices, np.array([[0, 1, 2]]), cam, room.background)
+    elastic = smooth.clone(elastic_sigma=.45)
+    samples = np.array([[22., 22.], [22., 10.], [22., 9.], [22., -4.]])
+    alpha = render(elastic, cam, samples)["weight"][:, 0]
+    expected = elastic.opacity[0] * np.array([1., np.exp(-.45),
+                                               np.exp(-.45 * (1. + 3. / 36.)**(2. / .45)), 0.])
+    np.testing.assert_allclose(alpha, expected, atol=1e-12, rtol=0.)
+    sharp = render(elastic.clone(elastic_sigma=.055), cam, samples)["weight"][:, 0]
+    assert sharp[1] > alpha[1] and sharp[2] < alpha[2]
+
+    # Move the boundary toward a pixel beyond the smoothstep support.
+    delta = .001
+    outside = samples[2:3]
+    motion = np.array([0., delta, 0.])
+    gradients = []
+    for mesh in (smooth, elastic):
+        plus = render(mesh.clone(vertices=vertices-motion), cam, outside)["weight"][0, 0]
+        minus = render(mesh.clone(vertices=vertices+motion), cam, outside)["weight"][0, 0]
+        gradients.append(float((plus-minus) / (2. * delta)))
+    assert gradients[0] == 0. and gradients[1] > 0.
+
+    mixed = render(room.clone(elastic_sigma=.45), cam, coords)
+    np.testing.assert_array_equal(mixed["hard_hit"], exact["hard_hit"])
+    # Near-wall opaque hits cannot be influenced by the farther wall.
+    blocked = (exact["hard_hit"] >= 0) & (exact["hard_hit"] < 2)
+    np.testing.assert_array_equal(mixed["weight"][blocked, 2:4], 0.)
+    seam = cam.project(np.array([[-1., 0., 3.]]))
+    connected = room.clone(hard=np.zeros(len(room.faces), bool), elastic_sigma=.45)
+    seam_alpha = render(connected, cam, seam)["weight"][0, :2]
+    assert np.count_nonzero(seam_alpha) == 1
+    np.testing.assert_allclose(seam_alpha.sum(), connected.opacity[0])
+    return dict(edge_weight=float(alpha[1]/elastic.opacity[0]),
+                sharpened_edge_weight=float(sharp[1]/elastic.opacity[0]),
+                exterior_alpha_gradient_per_m=gradients,
+                mixed_exact_hit_checks=len(coords))
+
+
 def run_checks():
     cam,model=fixtures()
     cx,cy=cam.intrinsics[2:]
@@ -151,4 +192,5 @@ def run_checks():
                 four_sample_unresolved_silhouette_rgb_per_m=unresolved,
                 subdivision_max_rgb_delta=subdivision,subdivision_rgb_gradient_delta=gradient_error,
                 subdivided_silhouette_rgb_per_m=moved_subdivided,
-                clipped_hits=int(np.count_nonzero(ref)),clipped_shared_edge_owner=0,passed=True)
+                clipped_hits=int(np.count_nonzero(ref)),clipped_shared_edge_owner=0,
+                elastic=check_elastic(cam,model,coords,pred),passed=True)

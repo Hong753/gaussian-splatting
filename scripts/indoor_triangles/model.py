@@ -22,6 +22,7 @@ class Mesh:
     transmitting: np.ndarray
     vertex_color: bool = False
     shader: str = "atlas"
+    elastic_sigma: float = 0.0
 
     def clone(self, **fields):
         return replace(self, **{k: v.copy() if isinstance(v, np.ndarray) else v
@@ -33,8 +34,10 @@ class Mesh:
     @classmethod
     def read(cls, path):
         with np.load(path) as state:
-            return cls(**{k: state[k] for k in state.files if k not in ("vertex_color","shader")},
-                       vertex_color=bool(state["vertex_color"]), shader=str(state["shader"]))
+            scalars = ("vertex_color", "shader", "elastic_sigma")
+            return cls(**{k: state[k] for k in state.files if k not in scalars},
+                       vertex_color=bool(state["vertex_color"]), shader=str(state["shader"]),
+                       elastic_sigma=float(state.get("elastic_sigma", 0.0)))
 
 
 def initial_mesh(vertices, faces, camera, background):
@@ -63,7 +66,8 @@ def connect(soup, template, image, size):
                       np.linspace(0,image.shape[1]-1,w), indexing="ij")
     blurred = ndimage.gaussian_filter(image, (1.25,1.25,0))
     colors = np.stack([ndimage.map_coordinates(blurred[...,c],[y,x],order=1) for c in range(3)],axis=-1)
-    return template.clone(vertices=vertices, colors=colors, opacity=soup.opacity.copy(), vertex_color=False)
+    return template.clone(vertices=vertices, colors=colors, opacity=soup.opacity.copy(),
+                          vertex_color=False, elastic_sigma=soup.elastic_sigma)
 
 
 def subset_faces(mesh, keep):

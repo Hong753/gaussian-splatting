@@ -35,6 +35,36 @@ The sparse initialization uses rectified, multiview patch correspondences at cor
 
 Range comes from per-sample ray–plane intersections. Welded edges get deterministic exact ownership, and committed opacity is always one on the interior. Each sample composites positive events in range order. The CPU implementation evaluates the surrogate geometry derivative by paired finite-displacement probes with shared subpixel jitter. It is sensitive to sample count and does not implement an exact visibility-boundary gradient, GPU rasterization, mipmapping, or scan-scale topology. The appearance gradient is analytic. Warps gate low variance, saturation, view translation, support at five reference and target patch locations and same-face visibility before computing robust ZNCC. Track free-space uses actual transmittance weights, and missing anchor assignments pay the capped penalty. Bending uses a frozen initial per-phase dihedral gate, with zero coupling beyond 28 degrees. Stage transitions reset Adam. The Gaussian color control has fixed chart-lattice RBF locations and widths, equal trainable color bytes and fixed hard-hit geometry. The analytic pane is supported by the compositor. The fitted arms lack a translucency classifier.
 
+## Elastic fitting with track-supported occlusion
+
+`fit --hybrid` uses the elastic kernel on exposed edges while fitting provisional triangles. Shared-edge ownership stays exact. Candidate commitments still need the fitting-track support and local edit-validation checks. Committed triangles use unit-opacity first hits, and rejected or unsupported faces retain soft coverage. A final fitting-track check can reopen faces whose adjusted geometry loses support. Clipped faces use the existing pixel-distance kernel on their clipped polygon.
+
+The elastic weight follows Eq. (5) of [Elastic Triangle Splatting](https://arxiv.org/abs/2608.29106). It is `exp(-sigma * x ** (2 / sigma))`, where `x = max(0, 1 - 3 * min_barycentric)` on the exposed edges. The prototype uses a shared geometric anneal from 0.45 to 0.055 instead of optimizing softness. Override these values in `elastic_sigma_start` and `elastic_sigma_end` in the JSON config. Local edit trials and appearance-only passes keep softness fixed. Other fitting modes keep their smoothstep default and also accept `--kernel elastic`.
+
+```bash
+python -u -m scripts.indoor_triangles fit --data "$OUT/data" \
+  --out "$OUT/elastic_hybrid" --seed 17 --dense --hybrid
+python -u -m scripts.indoor_triangles evaluate --data "$OUT/data" \
+  --run "$OUT/elastic_hybrid" --out "$OUT/elastic_hybrid_eval"
+
+python -u -m scripts.indoor_triangles fit --data "$OUT/data" \
+  --out "$OUT/kernel_pair" --seed 17 --dense --compare-kernels
+python -u -m scripts.indoor_triangles evaluate --data "$OUT/data" \
+  --run "$OUT/kernel_pair" --out "$OUT/kernel_pair_eval" --first-hit
+```
+
+The paired run fits the same connected mesh, atlas and camera rays with both kernels. In this comparison `--first-hit` gives both fits the same opaque renderer for RGB, leaving transmitting faces soft. Mesh scoring and export keep the checkpoints' metadata. For room data replace `--dense` with the prepared `--tracks` file, and supply the registered reference via `evaluate --reference-mesh`.
+
+On the synthetic room, denser stereo initialization and 125 fitting steps gave the following all-face F-scores at 5 cm and held-out RGB results. The paired runs use the common first-hit renderer. The end-to-end runs render each checkpoint with its fitted visibility.
+
+| Comparison | F-score, smoothstep → elastic | PSNR, smoothstep → elastic | LPIPS, smoothstep → elastic |
+|---|---:|---:|---:|
+| Same initializer, seed 17 | 39.58% → 38.61% | 9.47 → 9.48 | 0.457 → 0.466 |
+| Same initializer, seed 29 | 40.01% → 39.15% | 9.48 → 9.49 | 0.464 → 0.476 |
+| End-to-end hybrid, seed 17 | 39.09% → 39.93% | 9.69 → 9.66 | 0.446 → 0.445 |
+
+The synthetic results show similar image quality and mixed mesh results. They do not establish a ScanNet++ gain.
+
 ## Room preparation and candidate commands
 
 Prefer the first available suitable room among `8b5caf3398`, `b20a261fdf`, `66c98f4a9b`, and `88cf747085`, in this order, after inspecting fitting RGB coverage and checking that a co-registered scan exists. Keep the reference scan out of fitting and choice of hyperparameters. Record the exact release and pose files. Use the official [ScanNet++ DSLR undistortion](https://github.com/scannetpp/scannetpp) if the supplied cameras are fisheye, and export the calibration as an undistorted PINHOLE COLMAP model. Original transforms can have been estimated from all views. The procedure preserves those calibration parameters and rebuilds the actual feature tracks from fitting images only. The measured integration preflight used synthetic fixed calibration.
