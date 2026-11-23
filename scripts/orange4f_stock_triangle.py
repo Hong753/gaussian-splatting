@@ -44,6 +44,8 @@ DENSIFICATION_PATCH = Path(__file__).resolve().parent / "indoor_triangles/stock_
 PRIOR_PATCH = DENSIFICATION_PATCH.with_name("stock_triangle_geometry_priors.patch")
 PRIOR_LOSS = DENSIFICATION_PATCH.with_name("triangle_prior_loss.py")
 PREVIEW_PATCH = DENSIFICATION_PATCH.with_name("stock_triangle_previews.patch")
+WARM_START_PATCH = DENSIFICATION_PATCH.with_name("stock_triangle_warm_start.patch")
+WARM_START_LOADER = DENSIFICATION_PATCH.with_name("triangle_warm_start.py")
 REPO = Path(__file__).resolve().parents[1]
 PREVIEW_FILES = {
     "utils/triangle_preview.py": DENSIFICATION_PATCH.with_name("triangle_preview.py"),
@@ -184,13 +186,16 @@ def write_preview_input(run, staged, images, every, requested):
     return path
 
 
-def prepare_training_source(upstream, run, geometry_priors=False, debug_previews=False):
+def prepare_training_source(upstream, run, geometry_priors=False, debug_previews=False, warm_start=False):
     """Apply local training patches to a reproducible copy of pinned upstream code."""
     patches = [DENSIFICATION_PATCH, PRIOR_PATCH] if geometry_priors else [DENSIFICATION_PATCH]
     copies = {"geometry_priors.py": PRIOR_LOSS} if geometry_priors else {}
     if debug_previews:
         patches.append(PREVIEW_PATCH)
         copies.update(PREVIEW_FILES)
+    if warm_start:
+        patches.append(WARM_START_PATCH)
+        copies["utils/triangle_warm_start.py"] = WARM_START_LOADER
     inputs = patches + list(copies.values())
     patch_hash = hashlib.sha256(b"".join(path.read_bytes() for path in inputs)).hexdigest()
     source_dir = run / f"triangle_source_{UPSTREAM_SHA[:12]}_{patch_hash[:12]}"
@@ -517,6 +522,22 @@ def stage_rgb_run(args, upstream, source, run):
     return staged
 
 
+def link_staged_run(run, original, manifest):
+    manifest_file = run / "split_manifest.json"
+    if manifest_file.is_file() and json.loads(manifest_file.read_text()) != manifest:
+        raise ValueError(f"Inputs differ from {manifest_file}; specify a fresh --run directory")
+    for name in ("images", "fit_input"):
+        link = run / name
+        target = original / name
+        if not link.exists():
+            link.symlink_to(target, target_is_directory=True)
+        elif not link.is_symlink() or link.resolve() != target.resolve():
+            raise ValueError(f"Expected {link} to link to {target}")
+    staged = read_staged_views(run, manifest)
+    atomic_json(manifest_file, manifest)
+    return staged
+
+
 def stage_prior_run(args, upstream, run):
     baseline = args.match_run.resolve()
     if run == baseline:
@@ -544,25 +565,53 @@ def stage_prior_run(args, upstream, run):
                     geometry_priors=dict(baseline=str(baseline), cache=str(cache),
                                          cache_sha256=hashlib.sha256(prior_bytes).hexdigest(),
                                          depth_weight=args.da3_depth_weight, plane_weight=args.plane_weight))
-    manifest_file = run / "split_manifest.json"
-    if manifest_file.is_file() and json.loads(manifest_file.read_text()) != manifest:
-        raise ValueError(f"Inputs differ from {manifest_file}; specify a fresh --run directory")
-    for name in ("images", "fit_input"):
-        link = run / name
-        target = baseline / name
-        if not link.exists():
-            link.symlink_to(target, target_is_directory=True)
-        elif not link.is_symlink() or link.resolve() != target.resolve():
-            raise ValueError(f"Expected {link} to link to {target}")
-    atomic_json(manifest_file, manifest)
-    return read_staged_views(run, manifest)
+    return link_staged_run(run, baseline, manifest)
+
+
+def stage_resume_run(args, upstream, run):
+    original = args.resume_from.resolve()
+    if run == original:
+        raise ValueError("A warm restart needs a separate output directory")
+    manifest = json.loads((original / "split_manifest.json").read_text())
+    settings = manifest["settings"]
+    if settings["upstream_revision"] != UPSTREAM_SHA:
+        raise ValueError("The saved run uses a different upstream revision")
+    if not (original / "fit_input/sparse/0/points3D.ply").is_file():
+        raise FileNotFoundError(f"Missing staged point cloud for {original}")
+    snapshot = original / "model" / "point_cloud" / f"iteration_{args.resume_iteration}"
+    snapshot_files = [snapshot / name for name in ("point_cloud_state_dict.pt", "hyperparameters.pt")]
+    if not all(is_zipfile(path) for path in snapshot_files):
+        raise FileNotFoundError(f"Missing or incomplete checkpoint at {snapshot}")
+    priors = settings.get("geometry_priors")
+    if priors is not None:
+        cache = Path(priors["cache"])
+        if hashlib.sha256((cache / "manifest.json").read_bytes()).hexdigest() != priors["cache_sha256"]:
+            raise ValueError(f"The DA3 cache has changed since the original run: {cache}")
+        for row in manifest["frames"]:
+            if row["split"] == "train":
+                name = Path(row["staged_name"]).stem
+                if not (cache / "frames" / f"{name}.npz").is_file():
+                    raise FileNotFoundError(cache / "frames" / f"{name}.npz")
+    settings.update(upstream=str(upstream), iterations=args.iterations,
+                    warm_start=dict(snapshot=str(snapshot), iteration=args.resume_iteration,
+                                    optimizer="fresh Adam", camera_sampling="new cycle",
+                                    files=[dict(name=path.name, size=stat.st_size, mtime_ns=stat.st_mtime_ns)
+                                           for path in snapshot_files for stat in (path.stat(),)]))
+    return link_staged_run(run, original, manifest)
 
 
 def run_scene(args, upstream, source, run):
-    guided = args.da3_priors is not None
-    staged = stage_prior_run(args, upstream, run) if guided else stage_rgb_run(args, upstream, source, run)
+    if args.resume_from:
+        staged = stage_resume_run(args, upstream, run)
+    elif args.da3_priors:
+        staged = stage_prior_run(args, upstream, run)
+    else:
+        staged = stage_rgb_run(args, upstream, source, run)
     if args.prepare_only:
         return
+    settings = json.loads((run / "split_manifest.json").read_text())["settings"]
+    priors = settings.get("geometry_priors")
+    warm_start = settings.get("warm_start")
 
     # Upstream opens all fitting images with PIL before loading the tensors.
     # Raise the soft limit for the trainer and retain RGB tensors in host memory.
@@ -583,13 +632,16 @@ def run_scene(args, upstream, source, run):
         preview_input = None
         if args.debug_preview_every:
             preview_input = write_preview_input(run, staged, images, args.debug_preview_every, args.debug_preview_image)
-        training_source = prepare_training_source(upstream, run, geometry_priors=guided,
-                                                  debug_previews=preview_input is not None)
+        training_source = prepare_training_source(upstream, run, geometry_priors=priors is not None,
+                                                  debug_previews=preview_input is not None, warm_start=warm_start is not None)
         preview_flags = ["--debug-preview-input", preview_input] if preview_input is not None else []
-        prior_flags = ["--geometry-priors", args.da3_priors.resolve(), "--da3-depth-weight", args.da3_depth_weight,
-                       "--plane-weight", args.plane_weight] if guided else []
+        prior_flags = ["--geometry-priors", priors["cache"], "--da3-depth-weight", priors["depth_weight"],
+                       "--plane-weight", priors["plane_weight"]] if priors is not None else []
+        warm_flags = ["--warm-start-snapshot", warm_start["snapshot"],
+                      "--warm-start-iteration", warm_start["iteration"]] if warm_start is not None else []
         train_seconds = invoke(training_source, run, "train",
-                               ["train.py", "-s", fit_scene, *common, "--iterations", iteration, *prior_flags, *preview_flags])
+                               ["train.py", "-s", fit_scene, *common, "--iterations", iteration,
+                                *prior_flags, *preview_flags, *warm_flags])
         if not checkpoint.is_file() or not checkpoint.with_name("hyperparameters.pt").is_file():
             raise FileNotFoundError(f"Incomplete checkpoint at {checkpoint.parent}")
         atomic_json(train_seconds_file, train_seconds)
@@ -603,13 +655,14 @@ def run_scene(args, upstream, source, run):
         temporary.replace(mesh)
 
     render_seed = fit_scene / "sparse/0/points3D.ply"
-    priors = json.loads((run / "split_manifest.json").read_text())["settings"].get("geometry_priors")
     totals, all_rows = evaluate_frames(upstream, run, model, iteration, staged, images, render_seed, common,
                                        label=experiment_label(priors))
     train_seconds = json.loads(train_seconds_file.read_text()) if train_seconds_file.is_file() else None
     results = dict(splits=totals, checkpoint=str(checkpoint), direct_mesh=str(mesh), training_seconds=train_seconds)
     if priors is not None:
         results["geometry_priors"] = priors
+    if warm_start is not None:
+        results["warm_start"] = warm_start
     atomic_json(run / "results.json", results)
     print(json.dumps(totals, indent=2), flush=True)
 
@@ -651,10 +704,12 @@ def main():
     parser.add_argument("--width", type=int, default=1600, help="Maximum image width for training and rendering (default: 1600)")
     parser.add_argument("--iterations", type=int, default=30_000)
     parser.add_argument("--expected-frames", type=int, default=5009, help="Fail before training on an incomplete capture; 0 disables the check")
+    parser.add_argument("--resume-iteration", type=int, help="Saved model step to warm start from (default: 7000)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--prepare-only", action="store_true")
     mode.add_argument("--evaluate-iteration", type=int, help="Render and score the given checkpoint in an existing --run")
     mode.add_argument("--link-rendered-iteration", type=int, help="Link already rendered frames from a checkpoint evaluation")
+    mode.add_argument("--resume-from", type=Path, help="Warm start from an existing run with a fresh optimizer")
     args = parser.parse_args()
     if args.width < 1 or args.iterations < 1 or args.expected_frames < 0 or args.keyframe_stride < 2:
         parser.error("width and iterations must be positive, expected-frames nonnegative, and keyframe-stride at least 2")
@@ -668,11 +723,23 @@ def main():
         parser.error("Prior weights must be finite and nonnegative")
     if args.plane_weight and args.da3_priors is None:
         parser.error("--plane-weight requires --da3-priors")
+    if args.resume_from:
+        if args.match_run or args.keyframes or args.point_cloud:
+            parser.error("--resume-from uses the original run's split and priors")
+        if args.resume_iteration is None:
+            args.resume_iteration = 7000
+        if not 0 < args.resume_iteration < args.iterations:
+            parser.error("--resume-iteration must be positive and less than --iterations")
+    elif args.resume_iteration is not None:
+        parser.error("--resume-iteration requires --resume-from")
     cohort = "keyframes" if args.keyframes else f"stride{args.keyframe_stride}"
     run_name = f"triangle_splatting_stock_full_{cohort}_w{args.width}_{args.iterations}"
     if args.da3_priors:
         run_name += "_da3_planes" if args.plane_weight else "_da3_depth"
     run = (args.run or OUTPUT / run_name).resolve()
+    if args.resume_from is not None and args.run is None:
+        original = args.resume_from.resolve()
+        run = original.with_name(f"{original.name}_warm_{args.resume_iteration}_to_{args.iterations}")
     if args.link_rendered_iteration is not None:
         if args.link_rendered_iteration < 1:
             parser.error("--link-rendered-iteration must be positive")

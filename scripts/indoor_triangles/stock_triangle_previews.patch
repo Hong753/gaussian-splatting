@@ -7,14 +7,19 @@ diff --git a/train.py b/train.py
 +from utils.triangle_preview import create_triangle_previewer, capture_triangle_preview
  import sys
  from scene import Scene, TriangleModel
-@@ -65,4 +66,6 @@
-         (model_params, first_iter) = torch.load(checkpoint)
+@@ -66,6 +67,11 @@
          triangles.restore(model_params, opt)
-+
-+    preview = create_triangle_previewer(args.debug_preview_input, scene, dataset, first_iter)
 
++    preview = create_triangle_previewer(args.debug_preview_input, scene, dataset, first_iter)
++
      bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
-@@ -184,4 +187,7 @@
+     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
++
++    if preview and first_iter and not (preview.root / f"iteration_{first_iter:06d}").exists():
++        capture_triangle_preview(preview, first_iter, triangles, render, pipe, background, tb_writer)
+
+     iter_start = torch.cuda.Event(enable_timing = True)
+@@ -184,4 +190,7 @@
              if iteration == opt.iterations:
                  progress_bar.close()
 +
@@ -22,7 +27,7 @@ diff --git a/train.py b/train.py
 +                capture_triangle_preview(preview, iteration, triangles, render, pipe, background, tb_writer)
 
              # Log and save
-@@ -340,4 +346,5 @@
+@@ -340,4 +349,5 @@
      parser.add_argument('--debug_from', type=int, default=-1)
      parser.add_argument('--detect_anomaly', action='store_true', default=False)
 +    parser.add_argument("--debug-preview-input")

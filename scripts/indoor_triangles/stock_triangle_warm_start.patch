@@ -1,0 +1,35 @@
+diff --git a/train.py b/train.py
+--- a/train.py
++++ b/train.py
+@@ -60,3 +60,6 @@
+     triangles = TriangleModel(dataset.sh_degree)
+-    scene = Scene(dataset, triangles, opt.set_opacity, opt.triangle_size, opt.nb_points, opt.set_sigma, no_dome)
++    scene = Scene(dataset, triangles, opt.set_opacity, opt.triangle_size, opt.nb_points, opt.set_sigma, no_dome,
++                  warm_start_snapshot=args.warm_start_snapshot)
++    if args.warm_start_snapshot is not None:
++        first_iter = args.warm_start_iteration
+     triangles.training_setup(opt, opt.lr_mask, opt.feature_lr, opt.opacity_lr, opt.lr_sigma, opt.lr_triangles_points_init)
+@@ -344,2 +347,4 @@
+     parser.add_argument("--quiet", action="store_true")
++    parser.add_argument("--warm-start-snapshot")
++    parser.add_argument("--warm-start-iteration", type=int, default=0)
+     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+diff --git a/scene/__init__.py b/scene/__init__.py
+--- a/scene/__init__.py
++++ b/scene/__init__.py
+@@ -34,5 +34,5 @@
+     triangles : TriangleModel
+
+-    def __init__(self, args : ModelParams, triangles : TriangleModel, init_opacity, init_size, nb_points, set_sigma, no_dome=False, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
++    def __init__(self, args : ModelParams, triangles : TriangleModel, init_opacity, init_size, nb_points, set_sigma, no_dome=False, load_iteration=None, shuffle=True, resolution_scales=[1.0], warm_start_snapshot=None):
+         """b
+         :param path: Path to colmap scene main folder.
+@@ -92,4 +92,8 @@
+                                                 )
+                                     )
++        elif warm_start_snapshot is not None:
++            from utils.triangle_warm_start import load_training_snapshot
++
++            load_training_snapshot(self.triangles, warm_start_snapshot, self.cameras_extent)
+         else:
+             self.triangles.create_from_pcd(scene_info.point_cloud, self.cameras_extent, init_opacity, init_size, nb_points, set_sigma, no_dome)

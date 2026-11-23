@@ -187,6 +187,23 @@ Open `http://localhost:8082/` locally or forward port `8082` from the server
 through your SSH session. The dashboard follows the latest step and lets you
 inspect earlier steps. Images and `latest.json` are in `model/debug_previews/`.
 
+To continue training an earlier run from its 7k snapshot, set `RUN` to the
+original run directory and launch the updated trainer:
+
+```bash
+conda activate 3dgs
+cd ~/gaussian-splatting-orange4f
+CUDA_VISIBLE_DEVICES=0 python -u -m scripts.orange4f_stock_triangle \
+  --resume-from "$RUN" --resume-iteration 7000
+```
+
+The original snapshots stay in place. The new run is written beside `RUN`
+with the suffix `_warm_7000_to_30000`. It inherits the source split, camera
+calibration, and DA3 and plane weights, if present. The first preview shows
+the loaded 7k model. Training starts at 7,001 with fresh Adam moments,
+camera sampling, and densification statistics because the older snapshots
+only saved render state.
+
 Open `frames/` in the run or inside `evaluation_7000/` to browse rendered PNGs
 in one folder by capture filename. Render batches are internal and keep memory
 use bounded. To create the same flat view for an existing 7k evaluation,
