@@ -1,11 +1,13 @@
 """Train and render upstream Triangle Splatting on the full Orange4F capture."""
 
 import argparse
+from collections import Counter
 import fcntl
 import hashlib
 from importlib.util import find_spec
 import json
 import math
+import os
 from pathlib import Path
 import resource
 import shlex
@@ -36,6 +38,7 @@ UPSTREAM_SHA = "685ff270a8273afc3a2b094ae3148dd0b98e31e9"
 VIDEO_FPS = 30
 NOVEL_SECONDS = 40
 NOVEL_SEED = 42
+BATCH_SIZE = 256
 DENSIFICATION_PATCH = Path(__file__).resolve().parent / "indoor_triangles/stock_triangle_densification.patch"
 
 
@@ -211,9 +214,63 @@ def report_shard(directory, rows):
                                  error="../" + str(error_path.relative_to(run)), psnr_db=score)])
 
 
+def render_batch_path(run, split, shard):
+    previous = run / "renders" / split / shard
+    if previous.is_dir():
+        return previous
+    return run / ".render_batches" / split / shard
+
+
+def frame_output_names(rows):
+    names = {row["name"]: Path(row["name"]).with_suffix(".png").name for row in rows}
+    counts = Counter(names.values())
+    used = set(counts)
+    for row in rows:
+        frame = row["name"]
+        if counts[names[frame]] > 1:
+            suffix = Path(row["staged_name"]).stem
+            name = f"{suffix}_{names[frame]}"
+            while name in used:
+                name = "_" + name
+            names[frame] = name
+            used.add(name)
+    return names
+
+
+def link_batch_frames(run, directory, rows, names):
+    frames = run / "frames"
+    frames.mkdir(exist_ok=True)
+    for index, row in enumerate(rows):
+        source = directory / "renders" / f"{index:05d}.png"
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        link = frames / names[row["name"]]
+        target = os.path.relpath(source, frames)
+        try:
+            link.symlink_to(target)
+        except FileExistsError:
+            if not link.is_symlink() or os.readlink(link) != target:
+                raise FileExistsError(f"Conflicting render filename: {link}") from None
+
+
+def link_saved_frames(training_run, evaluation):
+    manifest = json.loads((training_run / "split_manifest.json").read_text())
+    names = frame_output_names(manifest["frames"])
+    count = 0
+    for split in ("train", "test"):
+        rows = [row for row in manifest["frames"] if row["split"] == split]
+        for offset in range(0, len(rows), BATCH_SIZE):
+            directory = render_batch_path(evaluation, split, f"{offset//BATCH_SIZE:03d}")
+            if directory.is_dir():
+                batch = rows[offset:offset+BATCH_SIZE]
+                link_batch_frames(evaluation, directory, batch, names)
+                count += len(batch)
+    print(f"{count:,} rendered frames available in {evaluation / 'frames'}", flush=True)
+
+
 def render_batch(upstream, run, model, iteration, label, batch, images, seed, common):
     split, shard = label
-    destination = run / "renders" / split / shard
+    destination = render_batch_path(run, split, shard)
     if not destination.exists():
         scene = run / "render_inputs" / split / shard
         write_scene(scene, batch, images, seed)
@@ -285,15 +342,18 @@ def read_colmap_scene(sparse):
 
 def evaluate_frames(upstream, run, model, iteration, staged, images, render_seed, common):
     (run / "comparisons").mkdir(exist_ok=True)
+    names = frame_output_names([row for row, _, _ in staged])
     scores = {}
     for split in ("train", "test"):
         entries = [entry for entry in staged if entry[0]["split"] == split]
-        for offset in range(0, len(entries), 256):
-            shard = f"{offset//256:03d}"
-            batch = entries[offset:offset+256]
+        for offset in range(0, len(entries), BATCH_SIZE):
+            shard = f"{offset//BATCH_SIZE:03d}"
+            batch = entries[offset:offset+BATCH_SIZE]
             destination = render_batch(upstream, run, model, iteration, (split, shard), batch,
                                        images, render_seed, common)
-            scores.update((row["name"], row) for row in report_shard(destination, [row for row, _, _ in batch]))
+            rows = [row for row, _, _ in batch]
+            link_batch_frames(run, destination, rows, names)
+            scores.update((row["name"], row) for row in report_shard(destination, rows))
     all_rows = [scores[row["name"]] for row, _, _ in staged]
     totals = {}
     for split in ("train", "test", "all"):
@@ -436,9 +496,9 @@ def run_scene(args, upstream, source, run):
     if not random.is_file():
         novel, rgb = novel_trajectory(run, staged)
         novel_renders = []
-        for offset in range(0, len(novel), 256):
-            batch = novel[offset:offset+256]
-            destination = render_batch(upstream, run, model, iteration, ("random", f"{offset//256:03d}"),
+        for offset in range(0, len(novel), BATCH_SIZE):
+            batch = novel[offset:offset+BATCH_SIZE]
+            destination = render_batch(upstream, run, model, iteration, ("random", f"{offset//BATCH_SIZE:03d}"),
                                        batch, rgb, render_seed, common)
             novel_renders.extend(destination / "renders" / f"{i:05d}.png" for i in range(len(batch)))
         encode_video(random, novel_renders)
@@ -462,11 +522,22 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--prepare-only", action="store_true")
     mode.add_argument("--evaluate-iteration", type=int, help="Render and score the given checkpoint in an existing --run")
+    mode.add_argument("--link-rendered-iteration", type=int, help="Link already rendered frames from a checkpoint evaluation")
     args = parser.parse_args()
     if args.width < 1 or args.iterations < 1 or args.expected_frames < 0 or args.keyframe_stride < 2:
         parser.error("width and iterations must be positive, expected-frames nonnegative, and keyframe-stride at least 2")
     if args.evaluate_iteration is not None and args.evaluate_iteration < 1:
         parser.error("--evaluate-iteration must be positive")
+    cohort = "keyframes" if args.keyframes else f"stride{args.keyframe_stride}"
+    run = (args.run or OUTPUT / f"triangle_splatting_stock_full_{cohort}_w{args.width}_{args.iterations}").resolve()
+    if args.link_rendered_iteration is not None:
+        if args.link_rendered_iteration < 1:
+            parser.error("--link-rendered-iteration must be positive")
+        evaluation = run / f"evaluation_{args.link_rendered_iteration}"
+        if not (run / "split_manifest.json").is_file() or not evaluation.is_dir():
+            parser.error(f"Missing existing evaluation at {evaluation}. Set --run to the training run directory.")
+        link_saved_frames(run, evaluation)
+        return
     upstream, source = args.upstream.expanduser().resolve(), args.source.expanduser().resolve()
     revision = subprocess.check_output(["git", "-C", upstream, "rev-parse", "HEAD"], text=True).strip()
     changes = subprocess.check_output(["git", "-C", upstream, "status", "--porcelain", "--untracked-files=no"], text=True).strip()
@@ -488,8 +559,6 @@ def main():
                                     "assert torch.cuda.is_available(), 'CUDA GPU is unavailable'"], cwd=upstream)
         if preflight.returncode:
             raise SystemExit(preflight.returncode)
-    cohort = "keyframes" if args.keyframes else f"stride{args.keyframe_stride}"
-    run = (args.run or OUTPUT / f"triangle_splatting_stock_full_{cohort}_w{args.width}_{args.iterations}").resolve()
     if run.is_relative_to(source) or run.is_relative_to(upstream):
         parser.error("Run directory must be outside the input dataset and upstream checkout")
     if args.evaluate_iteration is not None:

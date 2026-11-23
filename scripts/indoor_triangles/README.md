@@ -163,6 +163,19 @@ The `evaluation_7000/` directory within that run contains renders, galleries,
 and train, test, and all-view PSNR in `results.json`. Pass `--run` for a custom
 training directory.
 
+Open `frames/` in the run or inside `evaluation_7000/` to browse rendered PNGs
+in one folder by capture filename. Render batches are internal and keep memory
+use bounded. To create the same flat view for an existing 7k evaluation,
+including batches that have already finished during an ongoing evaluation:
+
+```bash
+conda activate 3dgs
+cd ~/gaussian-splatting-orange4f
+python -m scripts.orange4f_stock_triangle --link-rendered-iteration 7000
+```
+
+The link command uses the saved split and creates symlinks to existing PNGs.
+
 `original_trajectory.mp4` shows GT and renders side by side at their staged
 resolution for all registered frames in natural filename order at 30 fps.
 At the default resolution each side is up to 1,600 pixels wide.
