@@ -2,6 +2,7 @@
 
 import argparse
 import fcntl
+from importlib.util import find_spec
 import json
 import math
 from pathlib import Path
@@ -374,11 +375,21 @@ def main():
     if revision != UPSTREAM_SHA or changes:
         parser.error(f"Use a clean upstream checkout at {UPSTREAM_SHA}: {upstream}")
     if not args.prepare_only:
+        if find_spec("diff_triangle_rasterization") is None:
+            rasterizer = "submodules/diff-triangle-rasterization"
+            parser.error(
+                f"Missing diff_triangle_rasterization in {sys.executable}. Install it in the active environment:\n"
+                f"  cd {shlex.quote(str(upstream))}\n"
+                f"  git submodule update --init --recursive -- {rasterizer}\n"
+                f"  python -m pip install --no-build-isolation --no-deps ./{rasterizer}"
+            )
         if shutil.which("ffmpeg") is None:
             parser.error("ffmpeg with libx264 is required to encode the videos")
-        subprocess.run([sys.executable, "-c", "import torch, lpips, plyfile; "
-                        "from simple_knn._C import distCUDA2; from triangle_renderer import render; "
-                        "assert torch.cuda.is_available(), 'CUDA GPU is unavailable'"], cwd=upstream, check=True)
+        preflight = subprocess.run([sys.executable, "-c", "import torch, lpips, plyfile; "
+                                    "from simple_knn._C import distCUDA2; from triangle_renderer import render; "
+                                    "assert torch.cuda.is_available(), 'CUDA GPU is unavailable'"], cwd=upstream)
+        if preflight.returncode:
+            raise SystemExit(preflight.returncode)
     cohort = "keyframes" if args.keyframes else f"stride{args.keyframe_stride}"
     run = (args.run or OUTPUT / f"triangle_splatting_stock_full_{cohort}_w{args.width}_{args.iterations}").resolve()
     if run.is_relative_to(source) or run.is_relative_to(upstream):

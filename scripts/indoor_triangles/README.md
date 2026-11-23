@@ -91,14 +91,26 @@ The optional evaluator mask NPZ uses `kinds` of shape (final views, height, widt
 ## Orange4F full capture with stock Triangle Splatting
 
 Use the original [Triangle Splatting repository](https://github.com/trianglesplatting/triangle-splatting)
-at `685ff270a8273afc3a2b094ae3148dd0b98e31e9`. With its CUDA rasterizer and
-dependencies already installed, run from this fork. Activate the environment
-where the stock rasterizer is installed (`triangle_splatting` in the upstream
-setup, or `3dgs` if the rasterizer was installed there). Video export requires
+at `685ff270a8273afc3a2b094ae3148dd0b98e31e9`. To add its CUDA rasterizer to
+the existing `3dgs` environment, initialize the pinned submodule and its GLM
+dependency, then build against the installed PyTorch and CUDA toolkit:
+
+```bash
+conda activate 3dgs
+cd ~/triangle-splatting-upstream
+git submodule update --init --recursive -- submodules/diff-triangle-rasterization
+MAX_JOBS=4 python -m pip install --no-build-isolation --no-deps ./submodules/diff-triangle-rasterization
+python -c 'import torch; from simple_knn._C import distCUDA2; from diff_triangle_rasterization import TriangleRasterizer'
+```
+
+This uses the existing `simple_knn` in `3dgs`. Run the launcher from this fork
+in the same environment. If the rasterizer is already installed in the upstream
+`triangle_splatting` environment, use that environment. Video export requires
 `ffmpeg` with `libx264`.
 
 ```bash
-conda activate triangle_splatting
+conda activate 3dgs
+cd ~/gaussian-splatting-orange4f
 python -u -m scripts.orange4f_stock_triangle
 ```
 
