@@ -183,11 +183,21 @@ def render(model, camera, pixels, tau=.8, near=.05, color_basis=False):
     owns = (model.neighbors < 0) | (np.arange(len(faces))[:, None] < model.neighbors)
     inside_edge = (distance > 1e-8) | (tied & owns)
     inside = inside_edge.all(axis=-1)
+    soft_gate = np.all(inside_edge | ~shared, axis=-1)
+    if (~regular).any():
+        # After clipping, screen distances describe the full clipped polygon.
+        # The original shared-edge ownership is still encoded by barycentrics.
+        clipped_beta = beta[:, ~regular][:, :, [2, 0, 1]]
+        original_edge = ((clipped_beta > 1e-8) |
+                         ((np.abs(clipped_beta) <= 1e-8) & owns[~regular]))
+        clipped_gate = (original_edge | (model.neighbors[~regular] < 0)).all(axis=-1)
+        inside[:, ~regular] = (distance[:, ~regular, 0] >= -1e-8) & clipped_gate
+        soft_gate[:, ~regular] = clipped_gate
     front = (depth * (directions @ camera.rotation[2])[:, None] >= near)
     exterior = np.min(np.where(shared, np.inf, distance), axis=-1)
     smooth = np.clip((exterior + tau) / (2 * tau), 0, 1)
     smooth = smooth**2 * (3 - 2 * smooth)
-    soft = model.opacity * smooth * np.all(inside_edge | ~shared, axis=-1)
+    soft = model.opacity * smooth * soft_gate
     alpha = np.where(model.hard, inside, soft) * front
     order = np.argsort(np.where(alpha > 0, depth, np.inf), axis=1, kind="stable")
     rank = np.take_along_axis(alpha, order, axis=1)

@@ -133,6 +133,16 @@ def run_checks():
     p=render(near,cam,coords,near=.05)
     ref=[scalar_hit(cam.center,u,near.vertices,near=.05/u[2]) is not None for u in cam.rays(coords)]
     assert np.count_nonzero(ref)>0 and np.array_equal(ref,p["hit"]>=0)
+    two_faces = np.array([[0, 1, 2], [2, 1, 3]])
+    clipped_neighbors = near.clone(
+        vertices=np.vstack((near.vertices, [1.1, .85, -.05])),
+        faces=two_faces, opacity=np.array([.8, .8]), hard=np.array([True, True]),
+        transmitting=np.array([False, False]), neighbors=edge_neighbors(two_faces),
+        colors=np.ones((4, 3)), uv=np.zeros((2, 3, 2)))
+    shared_point = clipped_neighbors.vertices[[1, 2]].mean(0)
+    at_seam = cam.project(shared_point[None])
+    exact = render(clipped_neighbors,cam,at_seam,near=.05)
+    assert exact["hit"][0] == 0 and np.count_nonzero(exact["weight"]) == 1
     return dict(scalar_reference_hits=len(d),max_range_error_m=max(d),max_barycentric_error=max(b),
                 near_far_adjacent_range_m=observed.tolist(),offaxis_range_m=float(offaxis),
                 offaxis_camera_z_m=3.,seam_contributing_foreground_faces=1,
@@ -141,4 +151,4 @@ def run_checks():
                 four_sample_unresolved_silhouette_rgb_per_m=unresolved,
                 subdivision_max_rgb_delta=subdivision,subdivision_rgb_gradient_delta=gradient_error,
                 subdivided_silhouette_rgb_per_m=moved_subdivided,
-                clipped_hits=int(np.count_nonzero(ref)),passed=True)
+                clipped_hits=int(np.count_nonzero(ref)),clipped_shared_edge_owner=0,passed=True)
