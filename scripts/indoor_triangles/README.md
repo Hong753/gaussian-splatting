@@ -88,6 +88,63 @@ python -m scripts.indoor_triangles lpips --eval "$ROOM_EVAL"
 
 The optional evaluator mask NPZ uses `kinds` of shape (final views, height, width), with 0 for floor, 1 for wall, 2 for doorway rear targets and −1 for unspecified. Without it only whole-scene metrics and RGB scores are defined. Set mask labels from evaluator geometry and view definitions independent of any candidate. Use repeating locked scene manifests. Classical stereo has a measured synthetic arm only.
 
+## Orange4F full capture with stock Triangle Splatting
+
+Use the original [Triangle Splatting repository](https://github.com/trianglesplatting/triangle-splatting)
+at `685ff270a8273afc3a2b094ae3148dd0b98e31e9`. With its CUDA rasterizer and
+dependencies already installed, run from this fork. Activate the environment
+where the stock rasterizer is installed (`triangle_splatting` in the upstream
+setup, or `3dgs` if the rasterizer was installed there). Video export requires
+`ffmpeg` with `libx264`.
+
+```bash
+conda activate triangle_splatting
+python -u -m scripts.orange4f_stock_triangle
+```
+
+The default uses 1,670 sharp stride-3 fitting keyframes and the other 3,339
+views as test. It reuses a matching baseline manifest if available, or selects
+the sharpest image per consecutive group of three. Set `--keyframe-stride` to
+change the group size or supply any registered keyframe subset using
+`--keyframes /path/to/keyframes.json` with a `selected_images` list. All 5,009
+views are rendered and scored. The launcher checks the frame count and RGB
+files before starting.
+
+The default run uses 30,000 iterations and stages images up to 640 pixels
+wide. `--width` changes that cap and increases host RAM use. RGB camera tensors
+live on the CPU. Larger groups of render cameras run in batches. The source is
+the existing COLMAP BA export at
+`/data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full`. The trainer uses its
+fixed poses and sparse point cloud. The stock projection uses centered
+principal points. The supplied SfM may include observations from held-out
+frames, so this is an Orange4F stress test with supplied initialization. For a
+fitting-only initialization, pass `--point-cloud` in the same coordinates.
+
+Outputs are under `/data/3dgs_outputs/orange4f/3dgs_finetuning/`. The run saves
+`split_manifest.json`, raw commands and logs, stock checkpoints, and the
+direct `direct.off` mesh. `results.json` contains the per-image-average PSNR
+for train, test, and all views. `comparisons/` contains one labeled side-by-side
+GT and render per image. The `train/`, `test/`, and `all/` folders each contain
+an RGB and error gallery and per-frame scores.
+
+`original_trajectory.mp4` shows GT and renders side by side for all registered
+frames in natural filename order at 30 fps. `random_trajectory.mp4` is a
+40-second render along a seeded smooth path derived from a continuous capture
+segment, with no matching GT. Its actual poses and seed are recorded in
+`random_trajectory.json`. `--prepare-only` stages the data without starting
+training. Rerun with the same settings to use the saved final checkpoint.
+To also generate a fused TSDF mesh using stock code:
+
+```bash
+conda activate triangle_splatting
+RUN=/data/3dgs_outputs/orange4f/3dgs_finetuning/triangle_splatting_stock_full_stride3_w640_30000
+cd ~/triangle-splatting-upstream
+time python mesh.py -s "$RUN/fit_input" -m "$RUN/model" -r 1 --data_device cpu \
+  --iteration 30000 --skip_train --skip_test
+```
+
+The fused and postprocessed meshes are written to `model/train/ours_30000/`.
+
 ## Orange4F local-chart pilot
 
 Run directly on the Orange4F COLMAP BA export at

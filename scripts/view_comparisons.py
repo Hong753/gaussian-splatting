@@ -223,16 +223,18 @@ Base appearance, with no per-image exposure correction. Click an image for full 
 <select id="frame"></select><input id="filter" placeholder="Filter image name">
 <select id="sort"><option value="name">Image order</option><option value="worst">Lowest PSNR first</option></select>
 <label><input style="width:auto" type="checkbox" id="errors"> Show absolute error ×4</label>
-<span id="count"></span></nav></header><p id="name"></p><main id="panels"></main><div id="empty"></div>
+<span id="count"></span><a id="comparison" target="_blank" hidden>GT and render pair</a></nav></header><p id="name"></p><main id="panels"></main><div id="empty"></div>
 <script id="data" type="application/json">__DATA__</script><script>
 const data=JSON.parse(document.getElementById('data').textContent);
 let rows=data.rows.slice(),index=0;
 const el=id=>document.getElementById(id);
 function display(){
  el('panels').replaceChildren();el('empty').textContent=rows.length?'':'No matching images.';
+ el('comparison').hidden=true;
  if(!rows.length)return;
  index=(index+rows.length)%rows.length;el('frame').value=String(index);
  const row=rows[index];el('name').textContent=row.name;
+ if(row.comparison){el('comparison').href=row.comparison;el('comparison').hidden=false;}
  el('count').textContent=(index+1)+' / '+rows.length;
  const entries=[{title:'Actual image',path:row.gt},...row.renders.map((r,i)=>({
  title:data.models[i].label+' · '+(typeof r.psnr_db==='number'?r.psnr_db.toFixed(2):r.psnr_db)+' dB',path:el('errors').checked?r.error:r.image}))];

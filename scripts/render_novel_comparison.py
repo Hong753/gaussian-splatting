@@ -16,7 +16,10 @@ import subprocess
 from types import SimpleNamespace
 
 import numpy as np
-import render_model_comparison as core
+if __package__:
+    from . import render_model_comparison as core
+else:
+    import render_model_comparison as core
 
 
 def rot_to_quat(r):
