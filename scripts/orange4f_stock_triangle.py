@@ -40,6 +40,8 @@ NOVEL_SECONDS = 40
 NOVEL_SEED = 42
 BATCH_SIZE = 256
 DENSIFICATION_PATCH = Path(__file__).resolve().parent / "indoor_triangles/stock_triangle_densification.patch"
+PRIOR_PATCH = DENSIFICATION_PATCH.with_name("stock_triangle_geometry_priors.patch")
+PRIOR_LOSS = DENSIFICATION_PATCH.with_name("triangle_prior_loss.py")
 
 
 def choose_keyframes(source, run, names, explicit, stride):
@@ -142,9 +144,11 @@ def write_scene(path, rows, images, seed, *, fit=False):
             cloud.symlink_to(seed)
 
 
-def prepare_training_source(upstream, run):
+def prepare_training_source(upstream, run, geometry_priors=False):
     """Apply the coverage fix to a reproducible copy of the pinned training code."""
-    patch_hash = hashlib.sha256(DENSIFICATION_PATCH.read_bytes()).hexdigest()
+    patches = [DENSIFICATION_PATCH, PRIOR_PATCH] if geometry_priors else [DENSIFICATION_PATCH]
+    inputs = patches + [PRIOR_LOSS] if geometry_priors else patches
+    patch_hash = hashlib.sha256(b"".join(path.read_bytes() for path in inputs)).hexdigest()
     source_dir = run / f"triangle_source_{UPSTREAM_SHA[:12]}_{patch_hash[:12]}"
     if not source_dir.is_dir():
         with TemporaryDirectory(prefix=".triangle_source_", dir=run) as temporary:
@@ -154,10 +158,13 @@ def prepare_training_source(upstream, run):
             source.mkdir()
             subprocess.run(["git", "archive", "-o", archive, UPSTREAM_SHA], cwd=upstream, check=True)
             subprocess.run(["tar", "-xf", archive, "-C", source], check=True)
-            subprocess.run(["git", "apply", "--unidiff-zero", DENSIFICATION_PATCH], cwd=source, check=True)
+            for patch in patches:
+                subprocess.run(["git", "apply", "--unidiff-zero", patch], cwd=source, check=True)
+            if geometry_priors:
+                shutil.copyfile(PRIOR_LOSS, source / "geometry_priors.py")
             source.rename(source_dir)
     atomic_json(run / "training_source.json", dict(path=str(source_dir), revision=UPSTREAM_SHA,
-                                                  patch=str(DENSIFICATION_PATCH), patch_sha256=patch_hash))
+                                                  patches=[str(p) for p in patches], patch_sha256=patch_hash))
     return source_dir
 
 
@@ -181,7 +188,7 @@ def invoke(upstream, run, label, options):
     return perf_counter() - start
 
 
-def report_shard(directory, rows):
+def report_shard(directory, rows, label="Triangle Splatting"):
     names = {f"{i:05d}.png" for i in range(len(rows))}
     if any({p.name for p in (directory / folder).glob("*.png")} != names for folder in ("gt", "renders")):
         raise ValueError(f"Expected {len(rows)} matched RGB renders in {directory}")
@@ -203,7 +210,7 @@ def report_shard(directory, rows):
                     current_size = comparison.size
             if current_size != (2 * actual.width, actual.height + 36):
                 temporary = pair.with_suffix(".tmp.jpg")
-                save_panel(actual, prediction, temporary, "Triangle Splatting", score, max_width=None)
+                save_panel(actual, prediction, temporary, label, score, max_width=None)
                 temporary.replace(pair)
         error_path = directory / "error" / name
         error_path.parent.mkdir(exist_ok=True)
@@ -340,7 +347,8 @@ def read_colmap_scene(sparse):
     return colmap.read_cameras_text(sparse / "cameras.txt"), colmap.read_images_text(sparse / "images.txt")
 
 
-def evaluate_frames(upstream, run, model, iteration, staged, images, render_seed, common):
+def evaluate_frames(upstream, run, model, iteration, staged, images, render_seed, common,
+                    label="Stock Triangle Splatting"):
     (run / "comparisons").mkdir(exist_ok=True)
     names = frame_output_names([row for row, _, _ in staged])
     scores = {}
@@ -353,7 +361,7 @@ def evaluate_frames(upstream, run, model, iteration, staged, images, render_seed
                                        images, render_seed, common)
             rows = [row for row, _, _ in batch]
             link_batch_frames(run, destination, rows, names)
-            scores.update((row["name"], row) for row in report_shard(destination, rows))
+            scores.update((row["name"], row) for row in report_shard(destination, rows, label))
     all_rows = [scores[row["name"]] for row, _, _ in staged]
     totals = {}
     for split in ("train", "test", "all"):
@@ -361,8 +369,7 @@ def evaluate_frames(upstream, run, model, iteration, staged, images, render_seed
         totals[split] = dict(count=len(scored), mean_psnr_db=mean(row["renders"][0]["psnr_db"] for row in scored))
         gallery = run / split
         gallery.mkdir(exist_ok=True)
-        write_gallery(gallery, f"Orange4F stock Triangle Splatting · {split}", scored,
-                      [dict(label="Stock Triangle Splatting")], totals[split])
+        write_gallery(gallery, f"Orange4F {label} · {split}", scored, [dict(label=label)], totals[split])
     return totals, all_rows
 
 
@@ -393,30 +400,43 @@ def evaluation_snapshot(training_model, evaluation, iteration):
     return model
 
 
-def evaluate_checkpoint(upstream, training_run, evaluation, iteration):
-    manifest = json.loads((training_run / "split_manifest.json").read_text())
-    images = training_run / "images"
-    seed = training_run / "fit_input" / "sparse/0/points3D.ply"
+def read_staged_views(run, manifest):
     _, extrinsics = read_colmap_scene(Path(manifest["settings"]["colmap_model"]))
     by_name = {frame.name: frame for frame in extrinsics.values()}
     staged = []
     for row in manifest["frames"]:
         frame = by_name[row["name"]]
-        if not (images / row["staged_name"]).is_file():
-            raise FileNotFoundError(images / row["staged_name"])
+        if not (run / "images" / row["staged_name"]).is_file():
+            raise FileNotFoundError(run / "images" / row["staged_name"])
         staged.append((row, frame.qvec / np.linalg.norm(frame.qvec), frame.tvec))
+    return staged
+
+
+def experiment_label(priors):
+    if priors is None:
+        return "Stock Triangle Splatting"
+    return "Triangle Splatting + DA3 + planes" if priors["plane_weight"] else "Triangle Splatting + DA3"
+
+
+def evaluate_checkpoint(upstream, training_run, evaluation, iteration):
+    manifest = json.loads((training_run / "split_manifest.json").read_text())
+    images = training_run / "images"
+    seed = training_run / "fit_input" / "sparse/0/points3D.ply"
+    staged = read_staged_views(training_run, manifest)
 
     training_model = training_run / "model"
     model = evaluation_snapshot(training_model, evaluation, iteration)
     common = ["-m", model, "-r", "1", "--data_device", "cpu"]
     print(f"Rendering checkpoint {iteration:,} on {len(staged):,} views. Output: {evaluation}", flush=True)
-    totals, _ = evaluate_frames(upstream, evaluation, model, iteration, staged, images, seed, common)
+    priors = manifest["settings"].get("geometry_priors")
+    totals, _ = evaluate_frames(upstream, evaluation, model, iteration, staged, images, seed, common,
+                                label=experiment_label(priors))
     checkpoint = training_model / "point_cloud" / f"iteration_{iteration}" / "point_cloud_state_dict.pt"
     atomic_json(evaluation / "results.json", dict(iteration=iteration, checkpoint=str(checkpoint), splits=totals))
     print(json.dumps(totals, indent=2), flush=True)
 
 
-def run_scene(args, upstream, source, run):
+def stage_rgb_run(args, upstream, source, run):
     sparse = colmap_model_dir(source)
     cameras, extrinsics = read_colmap_scene(sparse)
     names = sorted((frame.name for frame in extrinsics.values()), key=natural_key)
@@ -450,13 +470,60 @@ def run_scene(args, upstream, source, run):
     fit_scene = run / "fit_input"
     write_scene(fit_scene, fitting, images, seed, fit=True)
     atomic_json(manifest_file, dict(settings=settings, frames=[row for row, _, _ in staged]))
+    return staged
+
+
+def stage_prior_run(args, upstream, run):
+    baseline = args.match_run.resolve()
+    if run == baseline:
+        raise ValueError("The geometry-prior arm needs a separate run directory")
+    split = (baseline / "split_manifest.json").read_bytes()
+    manifest = json.loads(split)
+    settings = manifest["settings"]
+    if settings["upstream_revision"] != UPSTREAM_SHA or settings["width"] != args.width:
+        raise ValueError("Match the stock baseline revision and --width for this experiment")
+    if not (baseline / "fit_input/sparse/0/points3D.ply").is_file():
+        raise FileNotFoundError("Expected the trained baseline's staged points3D.ply in fit_input")
+    cache = args.da3_priors.resolve()
+    prior_bytes = (cache / "manifest.json").read_bytes()
+    priors = json.loads(prior_bytes)
+    fitting = [r for r in manifest["frames"] if r["split"] == "train"]
+    if priors["split_sha256"] != hashlib.sha256(split).hexdigest() or set(priors["frames"]) != {r["name"] for r in fitting}:
+        raise ValueError("DA3 priors must come from the matching baseline's training views")
+    if args.plane_weight and not any(report["planes"] for report in priors["frames"].values()):
+        raise ValueError("The DA3 cache has no accepted plane patches")
+    for row in fitting:
+        prior = cache / "frames" / (Path(row["staged_name"]).stem + ".npz")
+        if not prior.is_file():
+            raise FileNotFoundError(prior)
+    settings.update(upstream=str(upstream), iterations=args.iterations,
+                    geometry_priors=dict(baseline=str(baseline), cache=str(cache),
+                                         cache_sha256=hashlib.sha256(prior_bytes).hexdigest(),
+                                         depth_weight=args.da3_depth_weight, plane_weight=args.plane_weight))
+    manifest_file = run / "split_manifest.json"
+    if manifest_file.is_file() and json.loads(manifest_file.read_text()) != manifest:
+        raise ValueError(f"Inputs differ from {manifest_file}; specify a fresh --run directory")
+    for name in ("images", "fit_input"):
+        link = run / name
+        target = baseline / name
+        if not link.exists():
+            link.symlink_to(target, target_is_directory=True)
+        elif not link.is_symlink() or link.resolve() != target.resolve():
+            raise ValueError(f"Expected {link} to link to {target}")
+    atomic_json(manifest_file, manifest)
+    return read_staged_views(run, manifest)
+
+
+def run_scene(args, upstream, source, run):
+    guided = args.da3_priors is not None
+    staged = stage_prior_run(args, upstream, run) if guided else stage_rgb_run(args, upstream, source, run)
     if args.prepare_only:
         return
 
     # Upstream opens all fitting images with PIL before loading the tensors.
     # Raise the soft limit for the trainer and retain RGB tensors in host memory.
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    required = len(fitting) + 128
+    required = sum(row["split"] == "train" for row, _, _ in staged) + 128
     if hard != resource.RLIM_INFINITY and hard < required:
         raise OSError(f"The hard open-file limit is {hard}; stock loading requires at least {required}")
     if soft != resource.RLIM_INFINITY and soft < required:
@@ -465,11 +532,15 @@ def run_scene(args, upstream, source, run):
     iteration = args.iterations
     checkpoint = model / "point_cloud" / f"iteration_{iteration}" / "point_cloud_state_dict.pt"
     common = ["-m", model, "-r", "1", "--data_device", "cpu"]
+    images = run / "images"
+    fit_scene = run / "fit_input"
     train_seconds_file = run / "training_seconds.json"
     if not checkpoint.is_file() or not checkpoint.with_name("hyperparameters.pt").is_file():
-        training_source = prepare_training_source(upstream, run)
+        training_source = prepare_training_source(upstream, run, geometry_priors=guided)
+        prior_flags = ["--geometry-priors", args.da3_priors.resolve(), "--da3-depth-weight", args.da3_depth_weight,
+                       "--plane-weight", args.plane_weight] if guided else []
         train_seconds = invoke(training_source, run, "train",
-                               ["train.py", "-s", fit_scene, *common, "--iterations", iteration])
+                               ["train.py", "-s", fit_scene, *common, "--iterations", iteration, *prior_flags])
         if not checkpoint.is_file() or not checkpoint.with_name("hyperparameters.pt").is_file():
             raise FileNotFoundError(f"Incomplete checkpoint at {checkpoint.parent}")
         atomic_json(train_seconds_file, train_seconds)
@@ -483,9 +554,13 @@ def run_scene(args, upstream, source, run):
         temporary.replace(mesh)
 
     render_seed = fit_scene / "sparse/0/points3D.ply"
-    totals, all_rows = evaluate_frames(upstream, run, model, iteration, staged, images, render_seed, common)
+    priors = json.loads((run / "split_manifest.json").read_text())["settings"].get("geometry_priors")
+    totals, all_rows = evaluate_frames(upstream, run, model, iteration, staged, images, render_seed, common,
+                                       label=experiment_label(priors))
     train_seconds = json.loads(train_seconds_file.read_text()) if train_seconds_file.is_file() else None
     results = dict(splits=totals, checkpoint=str(checkpoint), direct_mesh=str(mesh), training_seconds=train_seconds)
+    if priors is not None:
+        results["geometry_priors"] = priors
     atomic_json(run / "results.json", results)
     print(json.dumps(totals, indent=2), flush=True)
 
@@ -516,6 +591,10 @@ def main():
     split.add_argument("--keyframes", type=Path, help="Existing keyframes.json containing selected_images")
     split.add_argument("--keyframe-stride", type=int, default=3, help="Select the sharpest RGB in each group (default: 3)")
     parser.add_argument("--point-cloud", type=Path, help="Explicit initialization cloud in the supplied COLMAP coordinates")
+    parser.add_argument("--match-run", type=Path, help="Existing RGB run supplying the fixed split, poses, images and seed")
+    parser.add_argument("--da3-priors", type=Path, help="Training-view cache prepared from --match-run")
+    parser.add_argument("--da3-depth-weight", type=float, default=.15)
+    parser.add_argument("--plane-weight", type=float, default=0.)
     parser.add_argument("--width", type=int, default=1600, help="Maximum image width for training and rendering (default: 1600)")
     parser.add_argument("--iterations", type=int, default=30_000)
     parser.add_argument("--expected-frames", type=int, default=5009, help="Fail before training on an incomplete capture; 0 disables the check")
@@ -528,8 +607,17 @@ def main():
         parser.error("width and iterations must be positive, expected-frames nonnegative, and keyframe-stride at least 2")
     if args.evaluate_iteration is not None and args.evaluate_iteration < 1:
         parser.error("--evaluate-iteration must be positive")
+    if (args.match_run is None) != (args.da3_priors is None):
+        parser.error("Provide --match-run together with --da3-priors")
+    if any(not math.isfinite(w) or w < 0 for w in (args.da3_depth_weight, args.plane_weight)):
+        parser.error("Prior weights must be finite and nonnegative")
+    if args.plane_weight and args.da3_priors is None:
+        parser.error("--plane-weight requires --da3-priors")
     cohort = "keyframes" if args.keyframes else f"stride{args.keyframe_stride}"
-    run = (args.run or OUTPUT / f"triangle_splatting_stock_full_{cohort}_w{args.width}_{args.iterations}").resolve()
+    run_name = f"triangle_splatting_stock_full_{cohort}_w{args.width}_{args.iterations}"
+    if args.da3_priors:
+        run_name += "_da3_planes" if args.plane_weight else "_da3_depth"
+    run = (args.run or OUTPUT / run_name).resolve()
     if args.link_rendered_iteration is not None:
         if args.link_rendered_iteration < 1:
             parser.error("--link-rendered-iteration must be positive")

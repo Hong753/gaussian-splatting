@@ -176,6 +176,41 @@ python -m scripts.orange4f_stock_triangle --link-rendered-iteration 7000
 
 The link command uses the saved split and creates symlinks to existing PNGs.
 
+### Orange4F DA3 and plane ablation
+
+Compare the existing RGB run with two matched Triangle Splatting arms. All
+three use the same 1,670 training views, sparse initialization, camera poses,
+resolution, and 30k schedule. Prior preparation reads only the training RGBs.
+It uses the AmbiSuR DA3 model in overlapping fixed-pose windows, aligns scale
+to the supplied cameras, checks it against observed SfM tracks when available,
+and keeps confident depth interiors with agreement in two other views. The
+cache manifest reports which windows could validate scale against SfM.
+
+```bash
+cd ~/gaussian-splatting-orange4f
+BASE=/data/3dgs_outputs/orange4f/3dgs_finetuning/triangle_splatting_stock_full_stride3_w1600_30000
+CACHE="$BASE/priors_da3"
+
+conda activate gsstudio  # existing DA3-enabled environment
+CUDA_VISIBLE_DEVICES=1 python -u -m scripts.orange4f_triangle_priors --run "$BASE" --out "$CACHE"
+
+conda activate 3dgs
+CUDA_VISIBLE_DEVICES=1 python -u -m scripts.orange4f_stock_triangle \
+  --match-run "$BASE" --da3-priors "$CACHE"
+
+CUDA_VISIBLE_DEVICES=2 python -u -m scripts.orange4f_stock_triangle \
+  --match-run "$BASE" --da3-priors "$CACHE" --plane-weight 0.08
+```
+
+The first arm adds a robust log camera-z loss on stock rendered median depth.
+The renderer's median depth uses triangle centroids. The second arm adds a
+PlanarGS-style point-to-plane loss directly on contributing triangle vertices.
+Its planar patches are fitted to multiview-validated DA3 pixels. Training logs
+show valid depth pixel and plane face counts every 500 steps. The guided runs
+have `_da3_depth` and `_da3_planes` suffixes. The existing train and test
+evaluation produces comparable PSNR, renders, and mesh exports. Independent
+registered LiDAR can be used to measure geometric error on the same views.
+
 `original_trajectory.mp4` shows GT and renders side by side at their staged
 resolution for all registered frames in natural filename order at 30 fps.
 At the default resolution each side is up to 1,600 pixels wide.

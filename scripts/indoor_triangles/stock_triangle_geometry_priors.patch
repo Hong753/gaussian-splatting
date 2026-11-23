@@ -1,0 +1,13 @@
+diff --git a/train.py b/train.py
+--- a/train.py
++++ b/train.py
+@@ -41,0 +42 @@
++from geometry_priors import GeometryPriors
+@@ -55,0 +57 @@
++    geometry_priors = GeometryPriors(args.geometry_priors, args.da3_depth_weight, args.plane_weight)
+@@ -170,0 +173 @@
++        loss = loss + geometry_priors(iteration, viewpoint_cam, triangles, render_pkg)
+@@ -347,0 +351,3 @@
++    parser.add_argument("--geometry-priors", required=True)
++    parser.add_argument("--da3-depth-weight", type=float, required=True)
++    parser.add_argument("--plane-weight", type=float, default=0.)
