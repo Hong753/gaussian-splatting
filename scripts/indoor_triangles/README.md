@@ -123,8 +123,10 @@ views are rendered and scored. The launcher checks the frame count and RGB
 files before starting.
 
 The default run uses 30,000 iterations and stages images up to 1,600 pixels
-wide. Use `--width 640` for a lower-resolution debugging run. RGB camera tensors
-live on the CPU. Larger groups of render cameras run in batches. The source is
+wide. Staging links existing RGB images that already fit the width cap and
+caches PNGs for images that require resizing or RGB conversion. Use `--width 640`
+for a lower-resolution debugging run. RGB camera tensors live on the CPU.
+Larger groups of render cameras run in batches. The source is
 the existing COLMAP BA export at
 `/data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full`. The trainer uses its
 fixed poses and sparse point cloud. The stock projection uses centered

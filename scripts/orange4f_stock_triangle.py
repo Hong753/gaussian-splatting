@@ -94,9 +94,15 @@ def stage_images(source, target, frames, cameras, width):
             sx, sy = w / cam.width, h / cam.height
             dst = target / row["staged_name"]
             if not dst.is_file():
-                tmp = dst.with_suffix(".tmp")
-                image.convert("RGB").resize((w, h), Image.Resampling.LANCZOS).save(tmp, "PNG", compress_level=1)
-                tmp.replace(dst)
+                if image.size == (w, h) and image.mode == "RGB":
+                    dst = dst.with_suffix(original.suffix or ".png")
+                    if not dst.is_file():
+                        dst.symlink_to(original.resolve())
+                    row["staged_name"] = dst.name
+                else:
+                    tmp = dst.with_suffix(".tmp")
+                    image.convert("RGB").resize((w, h), Image.Resampling.LANCZOS).save(tmp, "PNG", compress_level=1)
+                    tmp.replace(dst)
         qnorm = np.linalg.norm(frame.qvec)
         if not np.isfinite(qnorm) or qnorm == 0 or not np.isfinite(frame.tvec).all():
             raise ValueError(f"Invalid pose for {frame.name}")
