@@ -30,6 +30,7 @@ from scripts.render_novel_comparison import choose_source_segment, synthesize_ra
 from scripts.view_comparisons import atomic_json, save_panel, write_gallery
 from utils.colmap_paths import colmap_model_dir
 from utils import read_write_model as colmap
+from utils.training_previews import DEFAULTS as PREVIEW_DEFAULTS, select_names
 
 
 SOURCE = Path("/data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full")
@@ -42,6 +43,14 @@ BATCH_SIZE = 256
 DENSIFICATION_PATCH = Path(__file__).resolve().parent / "indoor_triangles/stock_triangle_densification.patch"
 PRIOR_PATCH = DENSIFICATION_PATCH.with_name("stock_triangle_geometry_priors.patch")
 PRIOR_LOSS = DENSIFICATION_PATCH.with_name("triangle_prior_loss.py")
+PREVIEW_PATCH = DENSIFICATION_PATCH.with_name("stock_triangle_previews.patch")
+REPO = Path(__file__).resolve().parents[1]
+PREVIEW_FILES = {
+    "utils/triangle_preview.py": DENSIFICATION_PATCH.with_name("triangle_preview.py"),
+    **{f"utils/{name}.py": REPO / "utils" / f"{name}.py"
+       for name in ("checkpoint_snapshots", "training_previews", "region_loss")},
+}
+FLOOR_PREVIEW_NAMES = ("09882.jpg", "09884.jpg")
 
 
 def choose_keyframes(source, run, names, explicit, stride):
@@ -122,7 +131,7 @@ def stage_images(source, target, frames, cameras, width):
         yield row, frame.qvec / qnorm, frame.tvec
 
 
-def write_scene(path, rows, images, seed, *, fit=False):
+def write_scene(path, rows, images, seed=None, *, fit=False):
     model = path / "sparse/0"
     model.mkdir(parents=True, exist_ok=True)
     image_dir = path / "images"
@@ -134,6 +143,8 @@ def write_scene(path, rows, images, seed, *, fit=False):
             cameras.write(f"{index} PINHOLE {row['width']} {row['height']} {intrinsics}\n")
             pose = " ".join(map(str, (*qvec, *tvec)))
             poses.write(f"{index} {pose} {index} {row['staged_name']}\n\n")
+    if seed is None:
+        return
     cloud = model / ("points3D" + seed.suffix)
     if not cloud.is_symlink() and not cloud.exists():
         if fit and seed.suffix == ".ply":
@@ -144,10 +155,43 @@ def write_scene(path, rows, images, seed, *, fit=False):
             cloud.symlink_to(seed)
 
 
-def prepare_training_source(upstream, run, geometry_priors=False):
-    """Apply the coverage fix to a reproducible copy of the pinned training code."""
+def write_preview_input(run, staged, images, every, requested):
+    by_name = {row["name"]: (row, qvec, tvec) for row, qvec, tvec in staged}
+    if set(requested) - by_name.keys():
+        unknown = sorted(set(requested) - by_name.keys())
+        raise ValueError(f"Preview frames are not registered: {', '.join(unknown)}")
+    chosen = {name: [] for name in ("train", "held-out")}
+    for name in dict.fromkeys(requested or FLOOR_PREVIEW_NAMES):
+        if name in by_name:
+            split = "train" if by_name[name][0]["split"] == "train" else "held-out"
+            chosen[split].append(name)
+    config = dict(PREVIEW_DEFAULTS, every=every)
+    if not requested:
+        already = set(chosen["train"] + chosen["held-out"])
+        candidates = {split: [row["name"] for row, _, _ in staged
+                              if row["split"] == split and row["name"] not in already]
+                      for split in ("train", "test")}
+        sample = select_names(candidates["train"], candidates["test"],
+                              dict(config, train=config["train"] - len(chosen["train"]),
+                                   test=config["test"] - len(chosen["held-out"])))
+        for split, names in sample.items():
+            chosen[split].extend(names)
+    rows = [dict(name=name, split=split, staged_name=by_name[name][0]["staged_name"])
+            for split, names in chosen.items() for name in names]
+    path = run / "debug_preview_input"
+    write_scene(path, [by_name[name] for name in chosen["held-out"]], images)
+    atomic_json(path / "selection.json", dict(frames=rows, config=config))
+    return path
+
+
+def prepare_training_source(upstream, run, geometry_priors=False, debug_previews=False):
+    """Apply local training patches to a reproducible copy of pinned upstream code."""
     patches = [DENSIFICATION_PATCH, PRIOR_PATCH] if geometry_priors else [DENSIFICATION_PATCH]
-    inputs = patches + [PRIOR_LOSS] if geometry_priors else patches
+    copies = {"geometry_priors.py": PRIOR_LOSS} if geometry_priors else {}
+    if debug_previews:
+        patches.append(PREVIEW_PATCH)
+        copies.update(PREVIEW_FILES)
+    inputs = patches + list(copies.values())
     patch_hash = hashlib.sha256(b"".join(path.read_bytes() for path in inputs)).hexdigest()
     source_dir = run / f"triangle_source_{UPSTREAM_SHA[:12]}_{patch_hash[:12]}"
     if not source_dir.is_dir():
@@ -160,8 +204,8 @@ def prepare_training_source(upstream, run, geometry_priors=False):
             subprocess.run(["tar", "-xf", archive, "-C", source], check=True)
             for patch in patches:
                 subprocess.run(["git", "apply", "--unidiff-zero", patch], cwd=source, check=True)
-            if geometry_priors:
-                shutil.copyfile(PRIOR_LOSS, source / "geometry_priors.py")
+            for destination, path in copies.items():
+                shutil.copyfile(path, source / destination)
             source.rename(source_dir)
     atomic_json(run / "training_source.json", dict(path=str(source_dir), revision=UPSTREAM_SHA,
                                                   patches=[str(p) for p in patches], patch_sha256=patch_hash))
@@ -536,11 +580,16 @@ def run_scene(args, upstream, source, run):
     fit_scene = run / "fit_input"
     train_seconds_file = run / "training_seconds.json"
     if not checkpoint.is_file() or not checkpoint.with_name("hyperparameters.pt").is_file():
-        training_source = prepare_training_source(upstream, run, geometry_priors=guided)
+        preview_input = None
+        if args.debug_preview_every:
+            preview_input = write_preview_input(run, staged, images, args.debug_preview_every, args.debug_preview_image)
+        training_source = prepare_training_source(upstream, run, geometry_priors=guided,
+                                                  debug_previews=preview_input is not None)
+        preview_flags = ["--debug-preview-input", preview_input] if preview_input is not None else []
         prior_flags = ["--geometry-priors", args.da3_priors.resolve(), "--da3-depth-weight", args.da3_depth_weight,
                        "--plane-weight", args.plane_weight] if guided else []
         train_seconds = invoke(training_source, run, "train",
-                               ["train.py", "-s", fit_scene, *common, "--iterations", iteration, *prior_flags])
+                               ["train.py", "-s", fit_scene, *common, "--iterations", iteration, *prior_flags, *preview_flags])
         if not checkpoint.is_file() or not checkpoint.with_name("hyperparameters.pt").is_file():
             raise FileNotFoundError(f"Incomplete checkpoint at {checkpoint.parent}")
         atomic_json(train_seconds_file, train_seconds)
@@ -595,6 +644,10 @@ def main():
     parser.add_argument("--da3-priors", type=Path, help="Training-view cache prepared from --match-run")
     parser.add_argument("--da3-depth-weight", type=float, default=.15)
     parser.add_argument("--plane-weight", type=float, default=0.)
+    parser.add_argument("--debug-preview-every", type=int, default=PREVIEW_DEFAULTS["every"],
+                        help="Preview interval, also preview at step 1 and the final step. Use 0 to disable.")
+    parser.add_argument("--debug-preview-image", action="append", default=[], metavar="NAME",
+                        help="Original capture filename to preview. Repeat for multiple frames.")
     parser.add_argument("--width", type=int, default=1600, help="Maximum image width for training and rendering (default: 1600)")
     parser.add_argument("--iterations", type=int, default=30_000)
     parser.add_argument("--expected-frames", type=int, default=5009, help="Fail before training on an incomplete capture; 0 disables the check")
@@ -607,6 +660,8 @@ def main():
         parser.error("width and iterations must be positive, expected-frames nonnegative, and keyframe-stride at least 2")
     if args.evaluate_iteration is not None and args.evaluate_iteration < 1:
         parser.error("--evaluate-iteration must be positive")
+    if args.debug_preview_every < 0:
+        parser.error("--debug-preview-every must be nonnegative")
     if (args.match_run is None) != (args.da3_priors is None):
         parser.error("Provide --match-run together with --da3-priors")
     if any(not math.isfinite(w) or w < 0 for w in (args.da3_depth_weight, args.plane_weight)):

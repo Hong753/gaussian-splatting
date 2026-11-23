@@ -1,0 +1,30 @@
+diff --git a/train.py b/train.py
+--- a/train.py
++++ b/train.py
+@@ -26,4 +26,5 @@
+ from utils.loss_utils import l1_loss, ssim, equilateral_regularizer, l2_loss
+ from triangle_renderer import render
++from utils.triangle_preview import create_triangle_previewer, capture_triangle_preview
+ import sys
+ from scene import Scene, TriangleModel
+@@ -65,4 +66,6 @@
+         (model_params, first_iter) = torch.load(checkpoint)
+         triangles.restore(model_params, opt)
++
++    preview = create_triangle_previewer(args.debug_preview_input, scene, dataset, first_iter)
+
+     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+@@ -184,4 +187,7 @@
+             if iteration == opt.iterations:
+                 progress_bar.close()
++
++            if preview and preview.due(iteration, opt.iterations):
++                capture_triangle_preview(preview, iteration, triangles, render, pipe, background, tb_writer)
+
+             # Log and save
+@@ -340,4 +346,5 @@
+     parser.add_argument('--debug_from', type=int, default=-1)
+     parser.add_argument('--detect_anomaly', action='store_true', default=False)
++    parser.add_argument("--debug-preview-input")
+     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
+     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])

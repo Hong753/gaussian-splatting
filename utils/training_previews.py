@@ -58,6 +58,15 @@ def select_names(train_names, test_names, config):
                 ('held-out', test_names, config['test'], 1))}
 
 
+def archive_later_previews(root, start_iteration):
+    # Resuming an earlier checkpoint can rewind past existing previews.
+    history = root / 'history.json'
+    if history.exists() and any(s['iteration'] > start_iteration for s in json.loads(history.read_text())['snapshots']):
+        archive = root.with_name(f'{root.name}_before_restart_{time.time_ns()}')
+        root.rename(archive)
+        print(f'Debug previews: archived the later trajectory to {archive}', flush=True)
+
+
 def load_heldout_camera(record, dataset):
     import numpy as np
     from utils.camera_utils import loadCam
@@ -104,14 +113,7 @@ def create_previewer(scene, dataset, config, *, start_iteration=0, subdirectory=
         print('Debug previews: no requested frames available.', flush=True)
         return None
     root = Path(scene.model_path) / subdirectory
-    history = root / 'history.json'
-    if history.exists() and any(s['iteration'] > start_iteration for s in json.loads(history.read_text())['snapshots']):
-        # A normal checkpoint resume can rewind past previews saved after that
-        # checkpoint. Preserve that old trajectory, rather than reusing its
-        # images or crashing training at the first duplicated preview step.
-        archive = root.with_name(f'{subdirectory}_before_restart_{time.time_ns()}')
-        root.rename(archive)
-        print(f'Debug previews: archived the later trajectory to {archive}', flush=True)
+    archive_later_previews(root, start_iteration)
     metadata=dict(source=str(Path(dataset.source_path).resolve()), heldout_protocol=protocol,
                   eligible_train=len(train), eligible_heldout=len(test_names))
     from scripts.pose_options import dataset_pose_labels
@@ -252,7 +254,7 @@ img{display:block;width:100%;height:auto;cursor:zoom-in}a{color:#8abcfb}.badge{c
 .images.paired{grid-template-columns:repeat(4,minmax(0,1fr))}
 @media(max-width:700px){header,main{padding:16px}.images,.images.paired{grid-template-columns:1fr}}
 </style></head><body><header><h1>Training previews</h1>
-<p>Fixed random frames · GT / render / absolute error ×4. Click an image for full resolution.</p>
+<p>Fixed frames · GT / render / absolute error ×4. Click an image for full resolution.</p>
 <p>These few-frame PSNR values are diagnostics; the separate all-frame evaluation remains unchanged.</p>
 <nav><label>Step <select id="step"></select></label>
 <label>Frames <select id="split"><option value="both">Train + held-out</option><option value="train">Train</option><option value="held-out">Held-out</option></select></label>

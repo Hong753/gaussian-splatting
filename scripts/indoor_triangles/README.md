@@ -163,6 +163,30 @@ The `evaluation_7000/` directory within that run contains renders, galleries,
 and train, test, and all-view PSNR in `results.json`. Pass `--run` for a custom
 training directory.
 
+### Live training previews
+
+New RGB and DA3-guided training jobs save GT, rendered images, error maps and
+per-frame PSNR at step 1, every 500 steps, and the final step. The same two
+training and two held-out views are used across runs with the same split. The
+default selection includes the established floor frames `09882.jpg` and
+`09884.jpg` when available. Set `--debug-preview-every 250` for a shorter
+interval, or repeat `--debug-preview-image NAME` to use specific original
+capture filenames. Previews show the live model and use the existing trainer
+GPU. Held-out images are only read for the previews.
+
+Once training prints the live preview path, use a second terminal after
+setting `RUN` to that experiment's output directory:
+
+```bash
+conda activate 3dgs
+cd ~/gaussian-splatting-orange4f
+python scripts/serve_training_previews.py --model "$RUN/model" --host 127.0.0.1 --port 8082
+```
+
+Open `http://localhost:8082/` locally or forward port `8082` from the server
+through your SSH session. The dashboard follows the latest step and lets you
+inspect earlier steps. Images and `latest.json` are in `model/debug_previews/`.
+
 Open `frames/` in the run or inside `evaluation_7000/` to browse rendered PNGs
 in one folder by capture filename. Render batches are internal and keep memory
 use bounded. To create the same flat view for an existing 7k evaluation,
