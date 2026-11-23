@@ -30,6 +30,16 @@ def model_cameras(model):
 HOLDOUT_GAP_M = {"edit": .08, "final": .15}
 
 
+def fixed_pose(col, frame):
+    """Use the same unit COLMAP quaternion for camera selection, rendering and SfM."""
+    qvec_norm = np.linalg.norm(frame.qvec)
+    if not np.isfinite(qvec_norm) or qvec_norm == 0:
+        raise ValueError(f"Invalid COLMAP rotation quaternion: {frame.name}")
+    # COLMAP normalizes rotations while building BA residuals, even for constant poses.
+    qvec = frame.qvec / qvec_norm
+    return qvec, col.qvec2rotmat(qvec)
+
+
 def write_pinhole(path, records, points=()):
     path.mkdir(parents=True,exist_ok=True)
     with (path/"cameras.txt").open("w") as cams,(path/"images.txt").open("w") as images:
@@ -86,8 +96,12 @@ def fit_only_colmap(fit_dir,fit,staging,use_gpu):
     for item in fit:
         image=result.images[item["db_id"]]
         input_pose=np.column_stack((item["rotation"],item["tvec"]))
-        if not np.allclose(image.cam_from_world.matrix(),input_pose,atol=1e-8,rtol=0):
-            raise ValueError(f"Fixed poses changed after triangulation: {item['name']}")
+        actual_pose=image.cam_from_world.matrix()
+        if not np.allclose(actual_pose,input_pose,atol=1e-8,rtol=0):
+            delta=np.abs(actual_pose-input_pose)
+            raise ValueError(f"Fixed poses changed after triangulation: {item['name']} "
+                             f"(max rotation-matrix difference {delta[:,:3].max():.3g}, "
+                             f"max translation difference {delta[:,3].max():.3g} m)")
         expected=item["intrinsics"]+[0.,0.,.5,.5]
         if not np.allclose(result.cameras[image.camera_id].params,expected,atol=1e-8,rtol=0):
             raise ValueError(f"Fixed intrinsics changed after triangulation: {item['name']}")
@@ -157,8 +171,8 @@ def prepare(args, calibration_data=None):
         dims=(args.width,round(args.width*intr.height/intr.width))
         sx,sy=np.array(dims)/raw.size
         k=np.array([fx*sx,fy*sy,cx*sx-.5,cy*sy-.5])
-        R=col.qvec2rotmat(frame.qvec)
-        loaded[name]=dict(name=name,local=f"{idx:06}.png",qvec=frame.qvec,tvec=frame.tvec,
+        qvec,R=fixed_pose(col,frame)
+        loaded[name]=dict(name=name,local=f"{idx:06}.png",qvec=qvec,tvec=frame.tvec,
                           center=-R.T@frame.tvec,rotation=R,intrinsics=k,
                           rgb=np.array(raw.resize(dims,Image.Resampling.LANCZOS)))
     hws={x["rgb"].shape for x in loaded.values()}
@@ -198,6 +212,8 @@ def prepare(args, calibration_data=None):
     np.savez_compressed(out/"fitting_tracks.npz",**track_pack)
     manifest={"split":split,"poses":args.pose_provenance,"reference_view":args.reference_view,
               "nearest_fit_distance_m":distances,"pycolmap":version,"width":args.width,"height":h,
+              "max_source_quaternion_norm_error":max(
+                  abs(float(np.linalg.norm(by_name[name].qvec))-1.) for name in all_names),
               "stock_centered_camera_compatible":stock_ok,"fit_track_count":len(xyz),
               "wall_s":perf_counter()-start,"fitting_match_images":[item["local"] for item in fit],
               "images":[{"source":n,"copy":loaded[n]["local"],"center_m":loaded[n]["center"].tolist()}

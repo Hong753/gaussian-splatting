@@ -95,6 +95,8 @@ Run directly on the Orange4F COLMAP BA export at
 reference is `12569.jpg`, the floor diagnostic frame. The command selects
 nearby, same-facing cameras using the fixed COLMAP poses, reserves translated
 edit and final views, and rebuilds triangulated tracks from fitting RGB only.
+The loader normalizes stored quaternions before camera selection and triangulation
+and checks that the resulting rotations and translations stay fixed.
 This is a CPU pilot on one local chart. It starts at 384 pixels wide and uses
 up to 18 fitting views, three edit views and four held-out views.
 

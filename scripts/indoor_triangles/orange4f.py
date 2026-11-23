@@ -12,7 +12,7 @@ from scipy.spatial.distance import cdist
 from utils.colmap_paths import colmap_model_dir
 
 from .experiment import save_json
-from .room import HOLDOUT_GAP_M, model_cameras, prepare
+from .room import HOLDOUT_GAP_M, fixed_pose, model_cameras, prepare
 
 SOURCE = Path("/data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full")
 REFERENCE_VIEW = "12569.jpg"
@@ -84,7 +84,7 @@ def prepare_orange4f(args):
     center_index = names.index(reference)
     window = names[max(0,center_index-args.window):center_index+args.window+1]
     ref_frame = by_name[reference]
-    ref_rotation = col.qvec2rotmat(ref_frame.qvec)
+    _, ref_rotation = fixed_pose(col, ref_frame)
     ref_center = -ref_rotation.T @ ref_frame.tvec
     ref_camera = calibration[ref_frame.camera_id]
     if ref_camera.model not in {"PINHOLE", "SIMPLE_PINHOLE"}:
@@ -96,7 +96,7 @@ def prepare_orange4f(args):
         if (camera.model not in {"PINHOLE", "SIMPLE_PINHOLE"} or
                 camera.height*ref_camera.width != ref_camera.height*camera.width):
             continue
-        rotation = col.qvec2rotmat(frame.qvec)
+        _, rotation = fixed_pose(col, frame)
         center = -rotation.T @ frame.tvec
         if (rotation[2] @ ref_rotation[2] >= np.cos(np.deg2rad(30)) and
                 np.linalg.norm(center-ref_center) <= args.radius and (images/name).is_file()):
