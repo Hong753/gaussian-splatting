@@ -48,6 +48,23 @@ To continue after interruption, run the same launcher with `--resume`. It restor
 | `final/original.mp4`, `final/random.mp4`, `final/random_mesh.mp4` | Recorded trajectory, displaced trajectory and mesh normals on the displaced trajectory |
 | `evaluation_STEP/` | Independently rendered checkpoint with the same split and cameras |
 
+## Denser mesh from the 20k checkpoint
+
+```bash
+conda activate 3dgs &&
+cd ~/gaussian-splatting-orange4f &&
+git fetch origin experiment/orange4f-joint-mesh &&
+git switch --detach FETCH_HEAD &&
+CUDA_VISIBLE_DEVICES=1 python -u -m scripts.orange4f_joint_mesh \
+  --densify-checkpoint 20000 --mesh-gaussians 128000 --port 8113
+```
+
+Use a free GPU on the training host. The command opens a sibling run named `ambisur_joint_mesh_w1600_sites128000_from020000` under the original output root. An absolute `--densify-checkpoint /path/to/checkpoints/step_020000.pt` selects a different parent. The sibling uses the parent's poses, keyframes, cached DA3 data, optimization settings and remaining iterations. Repeating the command continues from the newest published sibling checkpoint.
+
+Moving the base budget from 32,000 to 128,000 adds up to 96,000 previously unused Gaussian sites. Each supplies nine trainable signed values. Previously learned sites retain their positions, signed values and Adam moments, including sites added by adaptive growth. The new sites use the same fitting-view depth fusion as the initial surface. Their placement depends on Gaussian availability and opacity. A global Delaunay rebuild changes connectivity and can increase host RAM, GPU memory and training time. The face count depends on observed zero crossings and the existing geometric filters.
+
+Open `density/index.html` for a comparison from the same checkpoint before any further fitting. Both meshes use the same fixed preview cameras and Gaussian depth maps. The report gives site, pivot and face counts, mesh-hit coverage and the fraction of confident Gaussian rays whose first mesh hit agrees within 5% in camera-z. Each run also saves per-frame counts in `density/{before,after}.json`. These measure agreement with the Gaussians. Inspect the new direct mesh at `checkpoints/mesh_020000.ply` and the jointly trained result at `final/mesh.ply`.
+
 ## Revisions and verification
 
 AmbiSuR is pinned to `88d64054f53e0eba9ce49198282edf4a67fc8ca8`. MILo is pinned to `0c38aa65f8b768513964f13246ef1ae54f001c70`. The launcher snapshots the trainer, applies `ambisur.patch`, and loads MILo's standalone marching tetrahedra module from that revision. The Gaussian rasterizer and the mesh rasterizer keep separate visibility computations. The exported triangle surface is the one used by the joint objective.

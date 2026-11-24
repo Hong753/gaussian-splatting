@@ -216,10 +216,56 @@ def serve(run, port):
         server.server_close()
 
 
+def density_parent(checkpoint):
+    path = Path(checkpoint).expanduser()
+    if str(checkpoint).isdigit():
+        path = OUTPUT / "checkpoints" / f"step_{int(checkpoint):06d}.pt"
+    path = path.resolve(strict=True)
+    if path.parent.name != "checkpoints" or not path.stem.startswith("step_") or path.suffix != ".pt":
+        raise ValueError(f"Expected a published step checkpoint, got {path}")
+    step = int(path.stem.removeprefix("step_"))
+    parent = path.parent.parent
+    cfg = json.loads((parent / "config.json").read_text())
+    if not cfg["mesh_from"] <= step < cfg["iterations"]:
+        raise ValueError("Select a joint checkpoint before the final step, e.g. step_020000.pt")
+    return path, parent, cfg
+
+
+def prepare_density_run(run, checkpoint, parent, original, budget, runtime):
+    if budget <= original["mesh_gaussians"]:
+        raise ValueError(f"Mesh-site budget must exceed {original['mesh_gaussians']:,}")
+    cfg = dict(
+        original,
+        mesh_gaussians=budget,
+        runtime=runtime.name,
+        density_checkpoint=str(checkpoint),
+        parent_mesh_gaussians=original["mesh_gaussians"],
+        runner_revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+    )
+    dest = run / "config.json"
+    if dest.exists() and json.loads(dest.read_text()) != cfg:
+        raise ValueError(f"Different experiment already configured in {run}")
+    for name in ("cameras.json", "da3"):
+        src = (parent / name).resolve(strict=True)
+        link = run / name
+        if link.exists() or link.is_symlink():
+            if link.resolve() != src:
+                raise ValueError(f"Conflicting input in {link}")
+        else:
+            link.symlink_to(src, target_is_directory=src.is_dir())
+    write_json(dest, cfg)
+    return cfg
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=SOURCE)
-    parser.add_argument("--run", type=Path, default=OUTPUT)
+    parser.add_argument("--run", type=Path, help="Output directory (default is derived from the experiment)")
+    parser.add_argument(
+        "--densify-checkpoint",
+        metavar="STEP_OR_PATH",
+        help="Continue a saved joint model in a sibling run with more mesh sites; inherits input data and training settings",
+    )
     parser.add_argument("--cache", type=Path, default=Path.home() / ".cache/orange4f_joint")
     parser.add_argument(
         "--install-missing",
@@ -246,7 +292,11 @@ def main(argv=None):
     parser.add_argument("--mesh-from", type=int, default=15000)
     parser.add_argument("--mesh-every", type=int, default=4)
     parser.add_argument("--retet-every", type=int, default=1000)
-    parser.add_argument("--mesh-gaussians", type=int, default=32000)
+    parser.add_argument(
+        "--mesh-gaussians",
+        type=int,
+        help="Initial site budget (32,000 fresh or 128,000 for a density continuation)",
+    )
     parser.add_argument(
         "--extra-sites",
         type=int,
@@ -261,7 +311,17 @@ def main(argv=None):
         "--port", type=int, default=8112, help="Loopback live preview server (0 for files only)"
     )
     a = parser.parse_args(argv)
-    run = a.run.expanduser().resolve()
+    if a.densify_checkpoint and (a.evaluate is not None or a.stage != "all"):
+        parser.error("--densify-checkpoint is a training continuation")
+    if a.mesh_gaussians is None:
+        a.mesh_gaussians = 128000 if a.densify_checkpoint else 32000
+    default_run = OUTPUT
+    if a.densify_checkpoint:
+        checkpoint, parent, original = density_parent(a.densify_checkpoint)
+        default_run = parent.with_name(f"{parent.name}_sites{a.mesh_gaussians}_from{checkpoint.stem[5:]}")
+    run = (a.run or default_run).expanduser().resolve()
+    if a.densify_checkpoint and (run.is_relative_to(parent) or parent.is_relative_to(run)):
+        parser.error("Use a separate sibling output directory for the denser mesh")
     run.mkdir(parents=True, exist_ok=True)
     cfg_file = run / "config.json"
     if a.stage == "da3-worker":
@@ -314,7 +374,7 @@ def main(argv=None):
     run_args = [sys.executable, "-u", "-m", "scripts.orange4f_joint_mesh"]
     run.mkdir(parents=True, exist_ok=True)
     with lock(run / "training.lock"):
-        if cfg_file.is_file() and a.resume:
+        if cfg_file.is_file() and a.resume and not a.densify_checkpoint:
             cfg = json.loads(cfg_file.read_text())
             source = run / cfg["runtime"]
         else:
@@ -326,51 +386,55 @@ def main(argv=None):
             if a.stage == "check":
                 invoke(run, source, "gpu_check", [sys.executable, "-u", "joint_gpu_check.py"])
                 return
-            cfg = {
-                key: getattr(a, key)
-                for key in (
-                    "width",
-                    "stride",
-                    "da3_model",
-                    "da3_resolution",
-                    "seed_points",
-                    "iterations",
-                    "mesh_from",
-                    "mesh_every",
-                    "retet_every",
-                    "mesh_gaussians",
-                    "extra_sites",
-                    "init_views",
-                    "preview_every",
-                    "novel_frames",
+            if a.densify_checkpoint:
+                cfg = prepare_density_run(run, checkpoint, parent, original, a.mesh_gaussians, source)
+            else:
+                cfg = {
+                    key: getattr(a, key)
+                    for key in (
+                        "width",
+                        "stride",
+                        "da3_model",
+                        "da3_resolution",
+                        "seed_points",
+                        "iterations",
+                        "mesh_from",
+                        "mesh_every",
+                        "retet_every",
+                        "mesh_gaussians",
+                        "extra_sites",
+                        "init_views",
+                        "preview_every",
+                        "novel_frames",
+                    )
+                }
+                cfg.update(
+                    runtime=source.name,
+                    ambi_revision=AMBI,
+                    milo_revision=MILO,
+                    source=str(a.source.resolve()),
+                    keyframes=str(a.keyframes.resolve()) if a.keyframes else None,
+                    checkpoints=sorted(
+                        {i for i in a.checkpoints if 0 < i <= a.iterations} | {a.mesh_from, a.iterations}
+                    ),
+                    runner_revision=subprocess.check_output(
+                        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+                    ).strip(),
                 )
-            }
-            cfg.update(
-                runtime=source.name,
-                ambi_revision=AMBI,
-                milo_revision=MILO,
-                source=str(a.source.resolve()),
-                keyframes=str(a.keyframes.resolve()) if a.keyframes else None,
-                checkpoints=sorted(
-                    {i for i in a.checkpoints if 0 < i <= a.iterations} | {a.mesh_from, a.iterations}
-                ),
-                runner_revision=subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
-                ).strip(),
-            )
-            if cfg_file.exists() and json.loads(cfg_file.read_text()) != cfg:
-                raise SystemExit(
-                    f"Different experiment already configured in {run}. Use --resume or a fresh --run."
-                )
-            write_json(cfg_file, cfg)
+                if cfg_file.exists() and json.loads(cfg_file.read_text()) != cfg:
+                    raise SystemExit(
+                        f"Different experiment already configured in {run}. Use --resume or a fresh --run."
+                    )
+                write_json(cfg_file, cfg)
         saved = sorted((run / "checkpoints").glob("step_*.pt"))
-        if saved and not a.resume and a.stage == "all":
+        continuing = a.resume or bool(a.densify_checkpoint)
+        if saved and not continuing and a.stage == "all":
             raise SystemExit(f"Checkpoint exists at {saved[-1]}. Pass --resume to continue.")
-        if a.resume and not saved:
+        if a.resume and not saved and "density_checkpoint" not in cfg:
             raise SystemExit(
                 f"No published checkpoint to resume in {run}. Rerun without --resume to reuse the DA3 cache."
             )
-        if a.resume and int(saved[-1].stem.split("_")[1]) == cfg["iterations"]:
+        if continuing and saved and int(saved[-1].stem.split("_")[1]) == cfg["iterations"]:
             invoke(
                 run,
                 source,
@@ -379,9 +443,14 @@ def main(argv=None):
             )
             return
         with serve(run, a.port):
-            dashboard(run, "Checking CUDA renderers and preparing fitting-view DA3 priors.")
+            dashboard(
+                run,
+                "Checking CUDA renderers and restoring the saved state."
+                if continuing
+                else "Checking CUDA renderers and preparing fitting-view DA3 priors.",
+            )
             invoke(run, source, "gpu_check", [sys.executable, "-u", "joint_gpu_check.py"])
-            if not a.resume:
+            if not continuing:
                 from scripts.joint_ambisur.data import inputs
 
                 inputs(a.source.resolve(), run, cfg["width"], cfg["stride"], a.keyframes, cfg["novel_frames"])
@@ -408,8 +477,8 @@ def main(argv=None):
                 "--multi_view_sample_num",
                 "8192",
             ]
-            if a.resume:
-                cmd.extend(["--start_checkpoint", str(saved[-1])])
+            if continuing:
+                cmd.extend(["--start_checkpoint", str(saved[-1]) if saved else cfg["density_checkpoint"]])
             invoke(run, source, "train", cmd)
 
 

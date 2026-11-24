@@ -20,6 +20,8 @@ from utils.graphics_utils import BasicPointCloud
 from joint_report import (
     dashboard,
     depth_images,
+    density_report,
+    publish,
     export_mesh,
     gallery,
     panel,
@@ -142,6 +144,15 @@ class JointScene:
         return []  # Held-out images are accessed exclusively by the evaluator.
 
 
+def first_hit_counts(gs_z, alpha, mesh_z):
+    reference = gs_z.isfinite() & (gs_z > 0) & (alpha > 0.7)
+    paired = reference & mesh_z.isfinite() & (mesh_z > 0)
+    agree = paired & ((gs_z - mesh_z).abs() <= 0.05 * gs_z)
+    return dict(
+        reference_rays=int(reference.sum()), mesh_hits=int(paired.sum()), agreeing_hits=int(agree.sum())
+    )
+
+
 class Evaluator:
     def __init__(self, run, manifest, surface, renderer):
         self.run, self.data, self.surface, self.render = run, manifest, surface, renderer
@@ -152,7 +163,8 @@ class Evaluator:
             self.preview_rows.extend(rng.sample(choices, min(4, len(choices))))
 
     @torch.no_grad()
-    def preview(self, step):
+    def preview(self, step, density_stage=None):
+        folder = "density/before" if density_stage == "before" else f"previews/{step:06d}"
         surf = self.surface
         mesh = surf.mesh()[:2] if surf.ids is not None else None
         rows = []
@@ -165,26 +177,33 @@ class Evaluator:
             imgs = [to_image(t.permute(1, 2, 0)) for t in (gt, pred, 4 * (gt - pred).abs())]
             labels = ["Ground truth", "Gaussian RGB", "RGB error x4"]
             gd = pkg["plane_depth"][0]
+            geometry = {}
             if mesh is not None:
                 md, n, _ = surf.render(cam, *mesh)
+                if density_stage:
+                    geometry = first_hit_counts(gd, pkg["rendered_alpha"][0], md)
                 imgs.extend(depth_images(gd, md) + [to_image((n * 0.5 + 0.5) * (md > 0)[..., None])])
                 labels.extend(["Gaussian z", "Mesh first-hit z", "Mesh normals"])
             else:
                 imgs.append(depth_images(gd, gd)[0])
                 labels.append("Gaussian z")
-            rel = f"previews/{step:06d}/{r['id']:08d}.jpg"
+            rel = f"{folder}/{r['id']:08d}.jpg"
             save_image(self.run / rel, panel(imgs, labels, 440))
-            rows.append(dict(name=r["name"], split=r["split"], panel=rel, psnr_db=psnr))
+            rows.append(dict(name=r["name"], split=r["split"], panel=rel, psnr_db=psnr, **geometry))
         metrics = summary(rows)
         item = dict(step=step, scope="fixed preview views", metrics=metrics, frames=rows)
-        write_json(self.run / f"previews/{step:06d}/metrics.json", item)
+        if density_stage:
+            item.update(sites=len(surf.ids), pivots=surf.sdf.numel(), faces=len(mesh[1]))
+            write_json(self.run / "density" / f"{density_stage}.json", item)
+            if density_stage == "before":
+                return rows, metrics
+            density_report(self.run)
+        write_json(self.run / folder / "metrics.json", item)
         msg = f"Step {step:,} · " + (
             "joint Gaussian and mesh training" if mesh is not None else "Gaussian warm-up"
         )
         dashboard(self.run, msg, rows, metrics)
         html_path = self.run / f"previews/{step:06d}/index.html"
-        from joint_report import publish
-
         publish(
             html_path,
             (self.run / "index.html")
@@ -312,33 +331,37 @@ class JointTraining:
         if step == 1 or step % self.config["preview_every"] == 0 or step in self.config["checkpoints"] or end:
             rows, metrics = self.eval.preview(step)
         if step in self.config["checkpoints"] or end:
-            out = self.run / "checkpoints" / f"step_{step:06d}.pt"
-            out.parent.mkdir(exist_ok=True)
-            tmp = out.with_suffix(".partial")
-            state = dict(
-                step=step,
-                gaussians=self.gs.capture(),
-                surface=self.surface.state(),
-                opt=vars(self.opt),
-                scene_config=self.config,
-                stack=[c.uid for c in (stack or [])],
-                torch_rng=torch.get_rng_state(),
-                cuda_rng=torch.cuda.get_rng_state(),
-                python_rng=random.getstate(),
-                numpy_rng=np.random.get_state(),
-            )
-            torch.save(state, tmp)
-            tmp.replace(out)
-            if self.surface.ids is not None:
-                self.eval.save_surface(out.with_name(f"mesh_{step:06d}.ply"))
-                dashboard(self.run, f"Step {step:,} · joint checkpoint published.", rows, metrics)
-            print(f"Saved joint checkpoint {out}", flush=True)
+            self.save_checkpoint(step, stack, rows, metrics)
         if end:
             self.gs.save_ply(str(self.run / "model" / "gaussians.ply"))
             self.eval.evaluate(self.run / "final", step)
             dashboard(
                 self.run, f"Completed step {step:,}. Full evaluation and videos are ready.", rows, metrics
             )
+
+    def save_checkpoint(self, step, stack, rows, metrics):
+        out = self.run / "checkpoints" / f"step_{step:06d}.pt"
+        out.parent.mkdir(exist_ok=True)
+        tmp = out.with_suffix(".partial")
+        state = dict(
+            step=step,
+            gaussians=self.gs.capture(),
+            surface=self.surface.state(),
+            opt=vars(self.opt),
+            scene_config=self.config,
+            stack=[c.uid for c in (stack or [])],
+            torch_rng=torch.get_rng_state(),
+            cuda_rng=torch.cuda.get_rng_state(),
+            python_rng=random.getstate(),
+            numpy_rng=np.random.get_state(),
+        )
+        torch.save(state, tmp)
+        if self.surface.ids is not None:
+            self.eval.save_surface(out.with_name(f"mesh_{step:06d}.ply"))
+        tmp.replace(out)
+        if self.surface.ids is not None:
+            dashboard(self.run, f"Step {step:,} · joint checkpoint published.", rows, metrics)
+        print(f"Saved joint checkpoint {out}", flush=True)
 
     def resume(self, path):
         state = torch.load(path, weights_only=False)
@@ -349,7 +372,18 @@ class JointTraining:
         random.setstate(state["python_rng"])
         np.random.set_state(state["numpy_rng"])
         cams = {c.uid: c for c in self.scene.fit}
-        return state["step"], [cams[i] for i in state["stack"]]
+        step, stack = state["step"], [cams[i] for i in state["stack"]]
+        source = self.config.get("density_checkpoint")
+        if source and Path(path).resolve() == Path(source):
+            base = self.config["parent_mesh_gaussians"]
+            if self.surface.ids is None or state["scene_config"]["mesh_gaussians"] != base:
+                raise ValueError("Density continuation requires the declared parent surface")
+            del state
+            self.eval.preview(step, density_stage="before")
+            self.surface.expand_checkpoint(self.config["mesh_gaussians"] - base, self.scene.fit, self.render)
+            rows, metrics = self.eval.preview(step, density_stage="after")
+            self.save_checkpoint(step, stack, rows, metrics)
+        return step, stack
 
 
 def evaluate_checkpoint(step):

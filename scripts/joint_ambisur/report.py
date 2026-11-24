@@ -95,6 +95,8 @@ def dashboard(run, message, rows=(), metrics=None):
                 f" · held-out {m['test']['psnr_db']:.2f} dB</li>"
             )
         body += "</ul></details>"
+    if (run / "density/index.html").is_file():
+        body += '<p><a href="density/index.html">Mesh density before and after expansion</a></p>'
     meshes = sorted((run / "checkpoints").glob("mesh_*.ply"))
     if meshes:
         link = meshes[-1].relative_to(run).as_posix()
@@ -107,6 +109,32 @@ def dashboard(run, message, rows=(), metrics=None):
     if (run / "final/index.html").is_file():
         body += '<p><a href="final/index.html">All frames, mesh and trajectories</a></p>'
     publish(run / "index.html", page("Orange4F joint training", body, live=True))
+
+
+def density_report(run):
+    body = "<p>The same checkpoint Gaussians supply camera-z on rays with alpha above 0.7. Agreement is within 5% of Gaussian z. Both percentages include missing mesh hits in the denominator.</p>"
+    for stage in ("before", "after"):
+        item = json.loads((run / "density" / f"{stage}.json").read_text())
+        rows = item["frames"]
+        body += f"<h2>{stage.title()} at step {item['step']:,}</h2><p>{item['sites']:,} sites · {item['pivots']:,} pivots · {item['faces']:,} faces</p>"
+        for split in ("train", "test"):
+            split_rows = [r for r in rows if r["split"] == split]
+            rays = sum(r["reference_rays"] for r in split_rows)
+            body += f"<p>{split} · {rays:,} reference rays"
+            if rays:
+                hit = sum(r["mesh_hits"] for r in split_rows) / rays
+                agree = sum(r["agreeing_hits"] for r in split_rows) / rays
+                body += f" · mesh hit {hit:.2%} · depth agreement {agree:.2%}"
+            body += "</p>"
+        body += (
+            "<p>"
+            + " · ".join(
+                f'<a href="../{html.escape(r["panel"], quote=True)}">{html.escape(r["name"])}</a>'
+                for r in rows
+            )
+            + "</p>"
+        )
+    publish(run / "density/index.html", page("Mesh density comparison", body))
 
 
 def depth_images(gs, mesh):

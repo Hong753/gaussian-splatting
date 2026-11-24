@@ -151,6 +151,7 @@ class Surface:
 
     def retriangulate(self, points):
         start = time.monotonic()
+        print(f"Tetrahedralizing {len(points):,} pivots on CPU", flush=True)
         self.tets = tetrahedra(points)
         self.tet_seconds += time.monotonic() - start
         print(
@@ -173,6 +174,14 @@ class Surface:
         )
         p, r = self.positions()
         self.retriangulate(p)
+        values, self.observed = self.fuse_pivots(p, r, cams, render)
+        self.sdf = torch.nn.Parameter(values)
+        self.optimizer = torch.optim.Adam([self.sdf], lr=0.01)
+        if not (self.sdf[self.observed] < 0).any():
+            raise RuntimeError("No supported surface crossings. Inspect DA3 and Gaussian depth previews.")
+
+    @torch.no_grad()
+    def fuse_pivots(self, p, r, cams, render):
         total, count = torch.zeros_like(r), torch.zeros_like(r)
         ordered = sorted(cams, key=lambda c: c.uid)
         indices = np.linspace(0, len(ordered) - 1, min(len(ordered), self.cfg["init_views"]), dtype=int)
@@ -193,13 +202,32 @@ class Surface:
             count += ok
             if seq % 32 == 0:
                 print(f"Signed field initialization {seq}/{len(indices)} fitting cameras", flush=True)
-        self.observed = count >= 2
-        self.sdf = torch.nn.Parameter(
-            torch.where(self.observed, total / count.clamp_min(1), torch.ones_like(r))
-        )
-        self.optimizer = torch.optim.Adam([self.sdf], lr=0.01)
-        if not (self.sdf[self.observed] < 0).any():
-            raise RuntimeError("No supported surface crossings. Inspect DA3 and Gaussian depth previews.")
+        observed = count >= 2
+        return torch.where(observed, total / count.clamp_min(1), torch.ones_like(r)), observed
+
+    @torch.no_grad()
+    def expand_checkpoint(self, count, cams, render):
+        weights = self.gs.get_opacity.detach().flatten()
+        eligible = weights > 0.05
+        eligible[self.ids] = False
+        candidates = eligible.nonzero().flatten()
+        n = min(count, len(candidates))
+        if n <= 0:
+            raise ValueError("No eligible additional Gaussian sites for this checkpoint")
+        print(f"Expanding mesh from {len(self.ids):,} sites by {n:,} of {count:,} requested", flush=True)
+        generator = torch.Generator(device=weights.device).manual_seed(42)
+        selected = candidates[
+            torch.multinomial(weights[candidates], n, replacement=False, generator=generator)
+        ]
+        # Retain all original pivot positions, learned values and Adam moments.
+        # Only the added sites use the finer spacing of the expanded point set.
+        self.append_sites(selected)
+        p, r = self.positions()
+        new_values, new_support = self.fuse_pivots(p[-9 * n :], r[-9 * n :], cams, render)
+        if not new_support.any():
+            raise RuntimeError("No multiview-supported samples at the additional sites")
+        self.append_field(new_values, new_support)
+        self.retriangulate(p)
 
     def mesh(self):
         p, r = self.positions()
@@ -245,11 +273,7 @@ class Surface:
             return
         selected, cam = self.pending
         self.pending = None
-        self.ids = torch.cat((self.ids, selected))
-        centers = self.gs.get_xyz[self.ids].detach().cpu().numpy()
-        distances = cKDTree(centers).query(centers[-len(selected) :], k=4)[0][:, -1]
-        extra = self.spacing.new_tensor(np.maximum(distances, 1e-5))
-        self.spacing = torch.cat((self.spacing, extra))
+        self.append_sites(selected)
         p, r = self.positions()
         count = 9 * len(selected)
         xyz = camera_xyz(cam, p[-count:])
@@ -257,20 +281,32 @@ class Surface:
         delta = (z - xyz[:, 2]) / r[-count:].clamp_min(1e-5)
         valid &= (delta >= -2) & (delta <= 3)
         added = torch.where(valid, delta.clamp(-1, 1), 1.0)
-        self.observed = torch.cat((self.observed, valid))
-        old = self.sdf
-        self.sdf = torch.nn.Parameter(torch.cat((old.detach(), added)))
-        group = self.optimizer.param_groups[0]
-        state = self.optimizer.state.pop(old)
-        for key in ("exp_avg", "exp_avg_sq"):
-            state[key] = torch.cat((state[key], torch.zeros_like(added)))
-        group["params"] = [self.sdf]
-        self.optimizer.state[self.sdf] = state
+        self.append_field(added, valid)
         self.retriangulate(p)
         print(
             f"Added {len(selected)} supported mesh sites at missing first hits; {len(self.ids)} sites",
             flush=True,
         )
+
+    def append_sites(self, selected):
+        self.ids = torch.cat((self.ids, selected))
+        centers = self.gs.get_xyz[self.ids].detach().cpu().numpy()
+        distances = cKDTree(centers).query(centers[-len(selected) :], k=4)[0][:, -1]
+        extra = self.spacing.new_tensor(np.maximum(distances, 1e-5))
+        self.spacing = torch.cat((self.spacing, extra))
+
+    def append_field(self, added, valid):
+        self.observed = torch.cat((self.observed, valid))
+        old = self.sdf
+        self.sdf = torch.nn.Parameter(torch.cat((old.detach(), added)))
+        group = self.optimizer.param_groups[0]
+        state = self.optimizer.state.pop(old, {})
+        for key in ("exp_avg", "exp_avg_sq"):
+            if key not in state:
+                continue
+            state[key] = torch.cat((state[key], torch.zeros_like(added)))
+        group["params"] = [self.sdf]
+        self.optimizer.state[self.sdf] = state
 
     def loss(self, cam, other, pkg, gt, iteration):
         p, r = self.positions()

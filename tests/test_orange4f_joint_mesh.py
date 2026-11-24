@@ -192,6 +192,7 @@ def test_previews_complete_eval_and_videos(tmp_path, monkeypatch):
 
     class CpuSurface:
         ids = torch.tensor([0, 1, 2])
+        sdf = torch.zeros(27)
         gs = SimpleNamespace(_features_dc=torch.zeros(3, 1, 3))
 
         def mesh(self):
@@ -208,11 +209,25 @@ def test_previews_complete_eval_and_videos(tmp_path, monkeypatch):
 
     def renderer(cam, geometry=True):
         shape = (cam.r["height"], cam.r["width"])
-        return {"render": torch.full((3, *shape), 0.2), "plane_depth": torch.ones(1, *shape)}
+        return {
+            "render": torch.full((3, *shape), 0.2),
+            "plane_depth": torch.ones(1, *shape),
+            "rendered_alpha": torch.ones(1, *shape),
+        }
 
     m.View = CpuCamera
     ev = m.Evaluator(run, json.loads((run / "cameras.json").read_text()), CpuSurface(), renderer)
-    rows, metric = ev.preview(7)
+    z = torch.tensor([2.0, 2.0, 2.0, 2.0, float("nan")])
+    counts = m.first_hit_counts(
+        z, torch.tensor([1.0, 1.0, 1.0, 0.0, 1.0]), torch.tensor([2.0, 3.0, 0.0, 2.0, 2.0])
+    )
+    assert counts == dict(reference_rays=3, mesh_hits=2, agreeing_hits=1)
+    ev.preview(7, density_stage="before")
+    rows, metric = ev.preview(7, density_stage="after")
+    assert (run / "density/index.html").is_file()
+    for stage in ("before", "after"):
+        result = json.loads((run / "density" / f"{stage}.json").read_text())
+        assert result["faces"] == 1 and all((run / r["panel"]).is_file() for r in result["frames"])
     assert metric["test"]["frames"] == 4
     assert all((run / r["panel"]).exists() for r in rows)
     import socket
@@ -315,3 +330,222 @@ def test_missing_surface_growth_and_resume(tmp_path, monkeypatch):
     copied = restored.mesh()
     for i in (0, 1):
         torch.testing.assert_close(original[i], copied[i])
+
+
+def test_checkpoint_density_and_first_hits(tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    from scripts.joint_ambisur.surface import Surface
+
+    src = reference_runtime(tmp_path)
+    marching = load_module("tetmesh", src / "joint_tetmesh.py").marching_tetrahedra
+    monkeypatch.setitem(
+        sys.modules,
+        "utils.general_utils",
+        SimpleNamespace(build_rotation=lambda q: torch.eye(3).repeat(len(q), 1, 1)),
+    )
+
+    def wall(x, y):
+        return 2 + 0.10 * torch.sin(7 * x) * torch.cos(5 * y)
+
+    rng = torch.Generator().manual_seed(127)
+    xy = 1.8 * (torch.rand(160, 2, generator=rng) - 0.5)
+    xyz = torch.cat((xy, wall(*xy.T)[:, None]), 1)
+    gs = SimpleNamespace(
+        get_xyz=xyz,
+        get_opacity=torch.ones(160, 1),
+        _scaling=torch.full_like(xyz, -3.5),
+        _rotation=torch.zeros(160, 4),
+        scaling_activation=torch.exp,
+    )
+    y, x = torch.meshgrid(torch.arange(96), torch.arange(96), indexing="ij")
+
+    def camera(i, offset):
+        nx, ny = (x - 47.5) / 86, (y - 47.5) / 86
+        z = torch.full_like(nx, 2.0)
+        for _ in range(18):
+            z = wall(offset + nx * z, ny * z)
+        transform = torch.eye(4)
+        transform[3, 0] = -offset
+        return SimpleNamespace(
+            uid=i,
+            world_view_transform=transform,
+            Fx=86,
+            Fy=86,
+            Cx=47.5,
+            Cy=47.5,
+            image_width=96,
+            image_height=96,
+            znear=0.01,
+            prior=lambda: (z, torch.ones_like(z, dtype=torch.bool)),
+        )
+
+    cams = [camera(i, tx) for i, tx in enumerate((-0.18, 0.0, 0.18))]
+
+    def render(cam):
+        z, mask = cam.prior()
+        return {"plane_depth": z[None], "rendered_alpha": mask[None].float()}
+
+    # Independent pinhole-ray first intersections on a translated camera.
+    held = camera(3, 0.09)
+    py, px = y[24:73:3, 24:73:3].flatten(), x[24:73:3, 24:73:3].flatten()
+    rays = torch.stack(((px - 47.5) / 86, (py - 47.5) / 86, torch.ones_like(px)), 1).float()
+    truth = held.prior()[0][py, px]
+
+    def measure(surface):
+        verts, faces, _, _ = surface.mesh()
+        a, b, c = verts.detach()[faces].unbind(1)
+        ab, ac = b - a, c - a
+        origin = verts.new_tensor([0.09, 0, 0])
+        t = origin - a
+        q = torch.linalg.cross(t, ab)
+        results = []
+        for d in rays.split(32):
+            h = torch.linalg.cross(d[:, None, :], ac[None, :, :])
+            det = (h * ab).sum(-1)
+            u = (t * h).sum(-1) / det
+            v = (q * d[:, None, :]).sum(-1) / det
+            z = (ac * q).sum(-1) / det
+            hits = (det.abs() > 1e-8) & (u >= 0) & (v >= 0) & (u + v <= 1) & (z > 0)
+            results.append(torch.where(hits, z, torch.inf).amin(1))
+        return len(faces), torch.cat(results)
+
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(26)
+        surface = Surface(gs, dict(mesh_gaussians=32, init_views=3), marching)
+        surface.initialize(cams, render)
+    surface.sdf.square().mean().backward()
+    surface.finish_step()
+    parents = [
+        t.detach().clone()
+        for t in (
+            surface.ids,
+            surface.spacing,
+            surface.sdf,
+            surface.observed,
+            surface.optimizer.state[surface.sdf]["exp_avg"],
+        )
+    ]
+    coarse, old = measure(surface)
+    rng_state = torch.get_rng_state().clone()
+    surface.expand_checkpoint(96, cams, render)
+    dense, new = measure(surface)
+    torch.testing.assert_close(torch.get_rng_state(), rng_state)
+    moments = surface.optimizer.state[surface.sdf]["exp_avg"]
+    for prev, cur in zip(
+        parents, (surface.ids, surface.spacing, surface.sdf, surface.observed, moments), strict=True
+    ):
+        torch.testing.assert_close(prev, cur[: len(prev)])
+    assert moments[len(parents[-1]) :].count_nonzero() == 0
+    assert len(surface.ids.unique()) == 128
+    assert dense > coarse
+    common = old.isfinite() & new.isfinite()
+    old_error = (old[common] - truth[common]).square().mean().sqrt().item()
+    new_error = (new[common] - truth[common]).square().mean().sqrt().item()
+    print(
+        f"Corrugated wall: {coarse} -> {dense} faces; held-out hits {int(old.isfinite().sum())} -> "
+        f"{int(new.isfinite().sum())}/{len(rays)}; common-ray z RMSE {old_error:.5f} -> {new_error:.5f} ({int(common.sum())} rays)"
+    )
+    assert common.sum() > 200 and new_error < old_error
+
+
+def test_checkpoint_density_launcher(tmp_path, monkeypatch):
+    from scripts import orange4f_joint_mesh as launcher
+
+    parent = tmp_path / "original"
+    (parent / "checkpoints").mkdir(parents=True)
+    checkpoint = parent / "checkpoints/step_020000.pt"
+    checkpoint.touch()
+    (parent / "da3").mkdir()
+    (parent / "cameras.json").write_text("{}")
+    config = dict(
+        mesh_gaussians=32000,
+        mesh_from=15000,
+        iterations=30000,
+        source="/images",
+        width=1600,
+        preview_every=500,
+        init_views=256,
+    )
+    (parent / "config.json").write_text(json.dumps(config))
+    monkeypatch.setattr(launcher, "OUTPUT", parent)
+    monkeypatch.setattr(launcher, "pinned", lambda *args: tmp_path)
+    monkeypatch.setattr(launcher, "build_runtime", lambda run, *args: run / "runtime")
+    calls = []
+    monkeypatch.setattr(launcher, "invoke", lambda run, cwd, label, cmd: calls.append((label, cmd)))
+    args = ["--densify-checkpoint", "20000", "--port", "0"]
+    with pytest.raises(SystemExit):
+        launcher.main([*args, "--run", str(parent)])
+    launcher.main(args)
+    out = parent.with_name("original_sites128000_from020000")
+    assert [label for label, _ in calls] == ["gpu_check", "train"]
+    assert calls[-1][1][-2:] == ["--start_checkpoint", str(checkpoint)]
+    assert json.loads((out / "config.json").read_text())["mesh_gaussians"] == 128000
+    assert (out / "da3").resolve() == parent / "da3" and (out / "cameras.json").samefile(
+        parent / "cameras.json"
+    )
+    assert json.loads((parent / "config.json").read_text()) == config
+    (out / "checkpoints").mkdir()
+    local = out / "checkpoints" / checkpoint.name
+    local.touch()
+    launcher.main(args)
+    assert calls[-1][1][-2:] == ["--start_checkpoint", str(local)]
+
+
+def test_resume_expands_only_parent_checkpoint(tmp_path, monkeypatch):
+    import random
+
+    torch = pytest.importorskip("torch")
+    src = reference_runtime(tmp_path)
+    monkeypatch.syspath_prepend(str(src))
+    monkeypatch.setitem(sys.modules, "scene.cameras", SimpleNamespace(Camera=object))
+    monkeypatch.setitem(sys.modules, "scene.gaussian_model", SimpleNamespace(GaussianModel=object))
+    monkeypatch.setitem(sys.modules, "utils.graphics_utils", SimpleNamespace(BasicPointCloud=object))
+    runtime = load_module("density_resume_fixture", src / "joint_runtime.py")
+    monkeypatch.setattr(torch.cuda, "set_rng_state", lambda state: None)
+    monkeypatch.setattr(torch.cuda, "get_rng_state", lambda: torch.tensor([0]))
+    monkeypatch.setattr(runtime, "dashboard", lambda *args: None)
+    path = tmp_path / "parent.pt"
+    torch.save(
+        dict(
+            step=20000,
+            gaussians=12,
+            surface=32,
+            scene_config=dict(mesh_gaussians=32),
+            stack=[18, 13],
+            torch_rng=torch.get_rng_state(),
+            cuda_rng=torch.tensor([0]),
+            numpy_rng=np.random.get_state(),
+            python_rng=random.getstate(),
+        ),
+        path,
+    )
+    calls = []
+    trainer = runtime.JointTraining.__new__(runtime.JointTraining)
+    trainer.run = tmp_path
+    trainer.gs = SimpleNamespace(restore=lambda value, opt: calls.append(("gs", value)), capture=lambda: 12)
+    trainer.opt = SimpleNamespace(iterations=30000)
+    trainer.config = dict(density_checkpoint=str(path), parent_mesh_gaussians=32, mesh_gaussians=128)
+    trainer.scene = SimpleNamespace(fit=[SimpleNamespace(uid=i) for i in [13, 18]])
+    trainer.render = object()
+    surface = SimpleNamespace(ids=None)
+    surface.restore = lambda n: setattr(surface, "ids", list(range(n)))
+
+    def expand(count, cams, renderer):
+        assert cams == trainer.scene.fit and renderer is trainer.render
+        calls.append(("expand", count))
+        surface.ids.extend(range(len(surface.ids), len(surface.ids) + count))
+
+    surface.expand_checkpoint = expand
+    surface.state = lambda: len(surface.ids)
+    trainer.surface = surface
+
+    def preview(step, density_stage):
+        calls.append((density_stage, len(surface.ids)))
+        return [], {}
+
+    trainer.eval = SimpleNamespace(preview=preview, save_surface=lambda p: p.touch())
+    for source in (path, tmp_path / "checkpoints/step_020000.pt"):
+        step, stack = trainer.resume(source)
+        assert step == 20000 and [c.uid for c in stack] == [18, 13]
+    assert calls == [("gs", 12), ("before", 32), ("expand", 96), ("after", 128), ("gs", 12)]
+    assert (tmp_path / "checkpoints/mesh_020000.ply").exists()
