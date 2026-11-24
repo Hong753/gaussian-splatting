@@ -187,6 +187,30 @@ Open `http://localhost:8082/` locally or forward port `8082` from the server
 through your SSH session. The dashboard follows the latest step and lets you
 inspect earlier steps. Images and `latest.json` are in `model/debug_previews/`.
 
+For a fixed-pose comparison on the latest held-out previews of the DA3 + planes
+run, run the following from the fork in the `3dgs` environment. This CPU pass
+reads the existing RGB renders and training-view DA3 cache.
+
+```bash
+python -u -m scripts.orange4f_photo_detail
+```
+
+The pass selects up to four nearby training cameras with similar viewing
+directions. It reprojects their photographs at staged resolution with the
+cached camera-space depths and checks visibility. Where two sources agree
+on depth, color and local detail, it combines fine detail from one source
+with low-frequency color from the baseline. Elsewhere it uses the original
+render. The target photograph enters only during scoring. The fixed Orange4F
+calibration and supplied SfM provenance are inherited from the baseline.
+
+Open the `*_gt_baseline_photo.jpg` comparisons in the printed output directory.
+The support PNG identifies eligible pixels. The JSON records full-frame PSNR,
+high-frequency RGB RMSE on the 0–255 scale, and support fraction per view.
+Use `--run` for another DA3-guided run and `--all-held-out` for a completed
+run with its flat `frames/` renders. These are view-dependent RGB results
+using additional stored source images and depths. Mesh quality requires
+separate evaluation.
+
 To continue training an earlier run from its 7k snapshot, set `RUN` to the
 original run directory and launch the updated trainer:
 
