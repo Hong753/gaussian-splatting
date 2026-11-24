@@ -45,6 +45,7 @@ fi
 
 cmd=("$bin" sfm auto "$out/images" -o "$out" --data-type video --quality high
      --features sift --camera-model pinhole --max-image-size 1600 --no-masks
+     --metric-gps none --exif-attitude none --sensor-gauge none --no-sensor-verify --no-sensor-map
      --device "${SPIRULA_DEVICE:-auto}")
 {
     "$bin" sfm --version
