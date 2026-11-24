@@ -43,12 +43,50 @@ if [[ -z "$bin" ]]; then
     fi
 fi
 
-cmd=("$bin" sfm auto "$out/images" -o "$out" --data-type video --quality high
+# A working CUDA environment may lack the system Vulkan loader. Probe the same
+# executable that will run SfM, and keep any fallback local to its processes.
+spirula=("$bin")
+if ! version_info=$("$bin" sfm --version 2>&1); then
+    if [[ "$version_info" != *"libvulkan.so.1: cannot open shared object file"* ]]; then
+        printf '%s\n' "$version_info" | tee -a "$out/sfm.log" >&2
+        exit 1
+    fi
+    conda_lib="${CONDA_PREFIX:-}/lib/libvulkan.so.1"
+    if [[ -n "${CONDA_PREFIX:-}" && -r "$conda_lib" ]] &&
+       version_info=$(env "LD_PRELOAD=$conda_lib${LD_PRELOAD:+:$LD_PRELOAD}" "$bin" sfm --version 2>&1); then
+        spirula=(env "LD_PRELOAD=$conda_lib${LD_PRELOAD:+:$LD_PRELOAD}" "$bin")
+    else
+        loader_dir="${XDG_CACHE_HOME:-$HOME/.cache}/orange4f/vulkan-loader-1.3.204.1"
+        if [[ ! -s "$loader_dir/libvulkan.so.1" ]]; then
+            echo "Fetching the Ubuntu Vulkan loader into $loader_dir" | tee -a "$out/sfm.log"
+            mkdir -p -- "$loader_dir"
+            (
+                stage=$(mktemp -d "$loader_dir/install.XXXXXXXX")
+                trap 'rm -rf -- "$stage"' EXIT
+                cd "$stage"
+                curl -fL --retry 3 https://archive.ubuntu.com/ubuntu/pool/main/v/vulkan-loader/libvulkan1_1.3.204.1-2_amd64.deb -o loader.deb
+                sha256sum -c <<<"192adcff489996b3398e7e7c0012b98e9586b46fe9a9eb13fb02c0feba88548b  loader.deb"
+                dpkg-deb -x loader.deb extracted
+                cp -L -- extracted/usr/lib/x86_64-linux-gnu/libvulkan.so.1 libvulkan.so.1
+                mv -fT -- libvulkan.so.1 "$loader_dir/libvulkan.so.1"
+            )
+        fi
+        spirula=(env "LD_LIBRARY_PATH=$loader_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$bin")
+        version_info=$("${spirula[@]}" sfm --version)
+    fi
+fi
+
+cmd=("${spirula[@]}" sfm auto "$out/images" -o "$out" --data-type video --quality high
      --features sift --camera-model pinhole --max-image-size 1600 --no-masks
      --metric-gps none --exif-attitude none --sensor-gauge none --no-sensor-verify --no-sensor-map
      --device "${SPIRULA_DEVICE:-auto}")
 {
-    "$bin" sfm --version
+    printf '%s\n' "$version_info"
+    if devices=$("${spirula[@]}" sam devices 2>&1); then
+        printf '%s\n' "$devices"
+    elif [[ "$devices" == *"no Vulkan devices"* || "$devices" == *"VK_ERROR_INCOMPATIBLE_DRIVER"* ]]; then
+        printf '%s\n' "$devices" 'Vulkan loaded, but device enumeration failed. Check NVIDIA Vulkan ICD visibility on this host. In an NVIDIA container, expose the graphics driver capability for Vulkan.'
+    fi
     printf '%q ' "${cmd[@]}"; printf '\n'
 } | tee -a "$out/sfm.log"
 status=0
