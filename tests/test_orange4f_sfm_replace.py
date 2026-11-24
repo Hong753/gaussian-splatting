@@ -70,7 +70,8 @@ def test_scan_bundle_recovers_perturbed_extrinsics(tmp_path):
     for i in rec.reg_image_ids():
         image = rec.image(i)
         image.cam_from_world = c.Rigid3d(
-            image.cam_from_world.rotation, image.cam_from_world.translation + rng.normal(0, 0.008, 3)
+            image.cam_from_world.rotation,
+            image.cam_from_world.translation + rng.normal(0, 0.008, 3),
         )
     perturbed = tmp_path / "perturbed"
     perturbed.mkdir()
@@ -83,3 +84,58 @@ def test_scan_bundle_recovers_perturbed_extrinsics(tmp_path):
     print(f"Injected pose drift: mean center error {before:.6f} -> {after:.6f} m")
     assert result["scan_anchors"] > 30 and result["median_camera_update_m"] > 0
     assert after < before
+
+
+@pytest.mark.parametrize("ext", ["bin", "txt"])
+def test_registered_scan_pixels_recover_pose_and_preserve_export(tmp_path, ext):
+    c = pytest.importorskip("pycolmap")
+    if c.__version__ != "3.11.1":
+        pytest.skip("Requires the adapter's pinned pycolmap")
+    from scripts.orange4f_lidar_tracks import collect, scan_inputs
+    from scripts.orange4f_scan_bundle import refine
+    from scripts.view_comparisons import read_colmap_records
+
+    opts = c.SyntheticDatasetOptions()
+    opts.camera_model_id = c.CameraModelId.PINHOLE
+    opts.camera_params = [1024, 1024, 512, 384]
+    opts.num_cameras, opts.num_images, opts.num_points3D = 1, 10, 300
+    c.set_random_seed(42)
+    rec = c.synthesize_dataset(opts)
+    source = tmp_path / "original"
+    original = source / "sparse/0"
+    original.mkdir(parents=True)
+    (rec.write_binary if ext == "bin" else rec.write_text)(str(original))
+    ref = read_colmap_records(source)
+    cloud, points = scan_inputs(source)
+    assert cloud == points == original / f"points3D.{ext}"
+    obs, stats = collect(source, cloud, points, ref)
+    truth = {i: im.projection_center() for i, im in rec.images.items()}
+    obs_counts = {i: im.num_points2D() for i, im in rec.images.items()}
+    n_points = rec.num_points3D()
+    rng = np.random.default_rng(9)
+    for im in rec.images.values():
+        im.cam_from_world = c.Rigid3d(
+            im.cam_from_world.rotation,
+            im.cam_from_world.translation + rng.normal(0, 0.028, 3),
+        )
+    learned = tmp_path / "learned"
+    learned.mkdir()
+    rec.write_binary(str(learned))
+    before = np.mean([np.linalg.norm(rec.image(i).projection_center() - t) for i, t in truth.items()])
+    # Deliberately permute the source image-name index to make row-as-ID joins fail.
+    obs["names"] = obs["names"][::-1]
+    obs["image"] = len(obs["names"]) - 1 - obs["image"]
+    out = tmp_path / "refined"
+    report = refine(learned, cloud, ref, out, obs)
+    result = c.Reconstruction(str(out))
+    result.check()
+    after = np.mean([np.linalg.norm(result.image(i).projection_center() - t) for i, t in truth.items()])
+    print(
+        f"{ext} | stored measurements {stats['usable_pixel_links']} | selected {stats['sampled_pixel_links']} | mean center error {before:.6f} -> {after:.6f} m"
+    )
+    assert stats["images_with_links"] == report["cameras_with_scan_anchors"] == len(truth)
+    assert report["scan_observations"] + report["withheld_observations"] == stats["sampled_pixel_links"]
+    assert after < 0.4 * before
+    assert report["withheld_median_reprojection_after_px"] < report["withheld_median_reprojection_before_px"]
+    assert result.num_points3D() == n_points
+    assert {i: im.num_points2D() for i, im in result.images.items()} == obs_counts

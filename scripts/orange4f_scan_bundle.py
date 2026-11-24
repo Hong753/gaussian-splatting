@@ -3,19 +3,16 @@
 import math
 import numpy as np
 import pycolmap
-from plyfile import PlyData
+from scripts.orange4f_lidar_tracks import scan_xyz
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
 
 def scan_tree(path):
-    vertices = PlyData.read(path, mmap="r")["vertex"].data
-    if not {"x", "y", "z"}.issubset(vertices.dtype.names) or "f_dc_0" in vertices.dtype.names:
-        raise ValueError(f"Expected a registered XYZ scan PLY: {path}")
-    # Keep storage bounded for a raw, high-density scan, with deterministic sampling.
+    vertices = scan_xyz(path)
     rng = np.random.default_rng(7)
     subset = vertices[np.sort(rng.choice(len(vertices), min(4_000_000, len(vertices)), replace=False))]
-    xyz = np.column_stack([subset[k] for k in "xyz"])
+    xyz = np.column_stack([subset[k] for k in "xyz"]) if subset.dtype.names else subset
     xyz = xyz[np.isfinite(xyz).all(1)]
     if len(xyz) < 16:
         raise ValueError("Scan contains too few usable samples")
@@ -42,7 +39,9 @@ def register(rec, reference):
     wide = d > max(1e-8, np.median(d))
     if not wide.any():
         raise ValueError("Camera centers do not span a trajectory")
-    scale = np.median(np.linalg.norm(reference_xyz[left[wide]] - reference_xyz[right[wide]], axis=1) / d[wide])
+    scale = np.median(
+        np.linalg.norm(reference_xyz[left[wide]] - reference_xyz[right[wide]], axis=1) / d[wide]
+    )
     shift = np.median(reference_xyz - scale * moved, axis=0)
     if not np.isfinite(scale) or scale <= 0:
         raise ValueError("Invalid metric scale")
@@ -75,17 +74,72 @@ def local_surfaces(tree, xyz):
     return xyz - offset[:, None] * normal, normal, usable
 
 
-def refine(model, cloud, reference, output):
-    rec = pycolmap.Reconstruction(str(model))
-    rec.check()
-    report = register(rec, reference)
+def stored_anchors(rec, conf, z, reference):
+    # Image IDs and point2D indices in the new SuperGlue model are unrelated
+    # to those in the source. Append temporary observations by image name.
+    image_by_name = {im.name: im for im in rec.images.values()}
+    names, indices, pids, coords, pixels = (z[k] for k in ("names", "image", "pid", "xyz", "xy"))
+    coverage = {im.image_id: 0 for im in image_by_name.values()}
+    lengths, scan_ids, fixed_xyz = {}, {}, []
+    held = []
+    order = np.argsort(indices, kind="stable")
+    sorted_indices = indices[order]
+    for j, group in zip(*np.unique(sorted_indices, return_index=True)):
+        # The samples are grouped by source image, irrespective of its mapper ID.
+        name = str(names[j])
+        image = image_by_name[name]
+        source = reference[name]
+        cam = rec.camera(image.camera_id)
+        scale = np.array([cam.width / source["width"], cam.height / source["height"]])
+        if not np.isclose(scale[0], scale[1], rtol=0.005):
+            raise ValueError(f"Mapped camera and stored pixels have different aspect ratios: {name}")
+        end = np.searchsorted(sorted_indices, j, side="right")
+        which = order[group:end]
+        xy = pixels[which] * scale
+        xyz = coords[which]
+        withheld = pids[which] % 10 == 0
+        if withheld.any():
+            held.append((image, cam, xyz[withheld], xy[withheld]))
+        lengths[image.image_id] = image.num_points2D()
+        for source_id, world, pixel in zip(pids[which][~withheld], xyz[~withheld], xy[~withheld]):
+            feature = image.num_points2D()
+            image.points2D.append(pycolmap.Point2D(pixel))
+            element = pycolmap.TrackElement(image.image_id, feature)
+            if source_id in scan_ids:
+                rec.add_observation(scan_ids[source_id], element)
+            else:
+                pid = rec.add_point3D(world, pycolmap.Track([element]))
+                conf.add_constant_point(pid)
+                scan_ids[source_id] = pid
+        fixed_xyz.append(xyz[~withheld])
+        coverage[image.image_id] = int((~withheld).sum())
+    fixed = np.concatenate(fixed_xyz)
+    if len(fixed) < 3 or np.linalg.matrix_rank(fixed - fixed.mean(0), tol=0.001) < 2:
+        raise ValueError("Insufficient non-collinear registered scan measurements")
+
+    def held_error():
+        errors = []
+        for im, cam, xyz, xy in held:
+            local = im.cam_from_world * xyz
+            front = local[:, 2] > 0
+            if front.any():
+                uv = cam.img_from_cam(local[front, :2] / local[front, 2:])
+                errors.extend(np.linalg.norm(uv - xy[front], axis=1))
+        return float(np.median(errors)) if errors else None
+
+    report = dict(
+        mode="stored scan XYZ and image pixels",
+        scan_anchors=len(scan_ids),
+        scan_observations=sum(coverage.values()),
+        withheld_observations=sum(len(h[2]) for h in held),
+        withheld_median_reprojection_before_px=held_error(),
+        cameras_with_scan_anchors=sum(n > 0 for n in coverage.values()),
+    )
+    return report, coverage, held_error, scan_ids.values(), lengths
+
+
+def plane_anchors(rec, conf, cloud, images):
     tree = scan_tree(cloud)
-    images = list(rec.reg_image_ids())
-    old = {i: rec.image(i).projection_center().copy() for i in images}
-    report["rgb_reprojection_pre_ba_px"] = rec.compute_mean_reprojection_error()
-    conf = pycolmap.BundleAdjustmentConfig()
-    for i in images:
-        conf.add_image(i)
     pids = np.asarray(sorted(rec.point3D_ids()), dtype=np.int64)
     held_ids, held_targets, held_normals, anchor_xyz = [], [], [], []
     coverage = {i: 0 for i in images}
@@ -123,14 +177,33 @@ def refine(model, cloud, reference, output):
         xyz = np.stack([rec.point3D(i).xyz for i in held_ids])
         return float(np.median(np.abs(np.einsum("ij,ij->i", xyz - held_targets, held_normals))))
 
-    report.update(
-        scan=str(cloud),
+    report = dict(
+        mode="local scan planes",
         scan_anchors=len(anchor_xyz),
         unused_scan_tracks=len(held_ids),
         unused_median_plane_distance_before_m=unused_error(),
-        registered_cameras=len(images),
         cameras_with_scan_anchors=sum(x > 0 for x in coverage.values()),
     )
+    return report, coverage, unused_error
+
+
+def refine(model, cloud, reference, output, observations=None):
+    rec = pycolmap.Reconstruction(str(model))
+    rec.check()
+    report = register(rec, reference)
+    images = list(rec.reg_image_ids())
+    old = {i: rec.image(i).projection_center().copy() for i in images}
+    rec.update_point_3d_errors()
+    report["rgb_reprojection_pre_ba_px"] = rec.compute_mean_reprojection_error()
+    conf = pycolmap.BundleAdjustmentConfig()
+    for i in images:
+        conf.add_image(i)
+    direct = observations is not None and len(observations["pid"]) > 0
+    if direct:
+        metrics, coverage, held_error, temp_ids, lengths = stored_anchors(rec, conf, observations, reference)
+    else:
+        metrics, coverage, held_error = plane_anchors(rec, conf, cloud, images)
+    report.update(metrics, registered_cameras=len(images), scan=str(cloud))
     opts = pycolmap.BundleAdjustmentOptions()
     opts.refine_focal_length = opts.refine_principal_point = opts.refine_extra_params = False
     opts.loss_function_type = pycolmap.LossFunctionType.SOFT_L1
@@ -139,13 +212,22 @@ def refine(model, cloud, reference, output):
     opts.solver_options.num_threads = 8
     print(
         f"LiDAR-anchored bundle adjustment: {conf.num_constant_points():,} scan anchors, "
-        f"{len(images):,} variable poses, {len(pids):,} total landmarks",
+        f"{len(images):,} variable poses, {rec.num_points3D():,} total landmarks",
         flush=True,
     )
     solver = pycolmap.create_default_bundle_adjuster(opts, conf, rec)
     result = solver.solve()
     if not result.IsSolutionUsable() or not math.isfinite(result.final_cost):
         raise RuntimeError(result.BriefReport())
+    del solver
+    if direct:
+        report["withheld_median_reprojection_after_px"] = held_error()
+        for pid in temp_ids:
+            rec.delete_point3D(pid)
+        for iid, length in lengths.items():
+            del rec.image(iid).points2D[length:]
+    else:
+        report["unused_median_plane_distance_after_m"] = held_error()
     rec.update_point_3d_errors()
     rec.check()
     movement = np.array([np.linalg.norm(rec.image(i).projection_center() - old[i]) for i in images])
@@ -153,7 +235,6 @@ def refine(model, cloud, reference, output):
         raise ValueError("Non-finite refined cameras")
     report.update(
         solver=result.BriefReport(),
-        unused_median_plane_distance_after_m=unused_error(),
         rgb_reprojection_post_ba_px=rec.compute_mean_reprojection_error(),
         median_camera_update_m=float(np.median(movement)),
         max_camera_update_m=float(movement.max()),

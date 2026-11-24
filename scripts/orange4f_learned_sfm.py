@@ -72,7 +72,7 @@ def exchange_sparse(scene, candidate):
     print(f"New model: {live / '0'}\nSIFT backup: {backup / '0'}", flush=True)
 
 
-def configuration(args, records, cloud):
+def configuration(args, records, cloud, points):
     from hashlib import sha256
 
     h = sha256()
@@ -80,8 +80,9 @@ def configuration(args, records, cloud):
         st = Path(records[name]["image_path"]).stat()
         h.update(repr((name, st.st_size, st.st_mtime_ns)).encode())
     cal = colmap_model_dir(args.original)
+    scan_hash = digest(cloud)
     return dict(
-        schema=1,
+        schema=2,
         registered=len(records),
         image_fingerprint=h.hexdigest(),
         original=str(args.original),
@@ -91,12 +92,14 @@ def configuration(args, records, cloud):
             for p in [next(q for q in [cal / (prefix + ".bin"), cal / (prefix + ".txt")] if q.exists())]
         },
         scan=str(cloud),
-        scan_sha256=digest(cloud),
+        scan_sha256=scan_hash,
+        tracks=str(points) if points else None,
+        tracks_sha256=(scan_hash if points == cloud else digest(points)) if points else None,
         max_size=1600,
         max_keypoints=2048,
         frontend="SuperPoint + indoor SuperGlue ddcf11f",
         mapper="Spirula v2026.11.12",
-        metric_refinement="fixed scan-projected landmarks, variable image poses and remaining landmarks",
+        metric_refinement="stored registered scan pixels when available, otherwise local scan planes",
     )
 
 
@@ -116,18 +119,9 @@ def main():
         != (args.original / "images").resolve()
     ):
         p.error("Expected a separate Spirula scene linked to the original capture")
-    cloud = (args.lidar or args.original / "input.ply").expanduser().resolve()
-    if not cloud.is_file():
-        p.error(
-            f"Missing registered metric LiDAR cloud at {cloud}. Set ORANGE4F_LIDAR_PLY to the scan in the original camera frame."
-        )
-    if not args.lidar and any(
-        q.is_file() and q.samefile(cloud)
-        for q in [colmap_model_dir(args.original) / "points3D.ply", scene / "sparse/0/points3D.ply"]
-    ):
-        p.error(
-            "The default cloud aliases a sparse reconstruction. Set ORANGE4F_LIDAR_PLY to the verified LiDAR PLY."
-        )
+    from scripts.orange4f_lidar_tracks import scan_inputs
+
+    cloud, points = scan_inputs(args.original, args.lidar)
     records = read_colmap_records(args.original)
     expected = set(registered_names(scene))
     if set(records) != expected:
@@ -136,19 +130,59 @@ def main():
     path = work / "inputs.json"
     if args.stage == "check":
         import torch
-        from plyfile import PlyData
+        import numpy as np
+        from scripts.orange4f_lidar_tracks import collect
 
         if not torch.cuda.is_available():
             raise RuntimeError("The selected GPU is unavailable to PyTorch in 3dgs")
-        vertices = PlyData.read(cloud, mmap="r")["vertex"]
-        if not set("xyz") <= set(vertices.data.dtype.names) or "f_dc_0" in vertices.data.dtype.names:
-            raise ValueError("Expected a registered LiDAR scan, not Gaussian coefficients")
-        config = configuration(args, records, cloud)
-        if path.exists() and json.loads(path.read_text()) != config:
-            raise ValueError(f"Inputs changed since preparation: {path}. Use a fresh cache directory.")
-        atomic_json(path, config)
+        config = configuration(args, records, cloud, points)
+        cache = work / "scan_pixels.npz"
+        previous = json.loads(path.read_text()) if path.exists() else {}
+        # The learned matches and mapped RGB geometry only depend on the image
+        # inputs. A previous scan configuration can reuse both of these caches.
+        image_keys = (
+            "registered",
+            "image_fingerprint",
+            "original",
+            "calibrated_inputs",
+            "max_size",
+            "max_keypoints",
+            "frontend",
+            "mapper",
+        )
+        if previous and any(previous.get(k) != config[k] for k in image_keys):
+            raise ValueError(f"RGB inputs changed since preparation: {path}")
+        if previous != config or not cache.is_file():
+            data, stats = collect(args.original, cloud, points, records)
+
+            def write_cache(tmp):
+                with tmp.open("wb") as stream:
+                    np.savez(stream, **data, stats=json.dumps(stats))
+
+            atomic_write(cache, write_cache)
+            atomic_json(path, config)
+        else:
+            with np.load(cache, allow_pickle=False) as data:
+                stats = json.loads(data["stats"].item())
         print(
-            f"Registered scan {cloud} ({len(vertices.data):,} points), {len(records):,} RGBs, "
+            f"Original scan {cloud} ({stats['scan_points']:,} points), "
+            f"{stats.get('usable_pixel_links', 0):,} usable stored scan-to-pixel observations across "
+            f"{stats.get('images_with_links', 0):,}/{len(records):,} cameras. "
+            f"Sampled {stats['sampled_pixel_links']:,} observations.",
+            flush=True,
+        )
+        if points is not None:
+            print(
+                f"Track source {points}: {stats.get('raw_forward_links', 0):,} image-to-point links, "
+                f"{stats.get('raw_reverse_links', 0):,} point-to-image links.",
+                flush=True,
+            )
+        if not stats["sampled_pixel_links"]:
+            print(
+                "No usable stored pixel links. Using the XYZ-only local-plane refinement.",
+                flush=True,
+            )
+        print(
             f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}, {torch.cuda.get_device_name(0)}",
             flush=True,
         )
@@ -165,7 +199,10 @@ def main():
 
             m = pycolmap.Reconstruction(str(folder))
             if {m.image(i).name for i in m.reg_image_ids()} == expected and m.num_points3D() >= 4:
-                atomic_write(work / "mapped.ok", lambda tmp: tmp.write_text(str(folder.resolve())))
+                atomic_write(
+                    work / "mapped.ok",
+                    lambda tmp: tmp.write_text(str(folder.resolve())),
+                )
                 return
         raise RuntimeError(
             f"No single learned model registered all {len(expected)} input views: {args.model}. SIFT is still active."
@@ -190,7 +227,17 @@ def main():
         with TemporaryDirectory(dir=work) as tmp:
             candidate = Path(tmp) / "sparse"
             candidate.mkdir()
-            report = refine(Path((work / "mapped.ok").read_text()), cloud, records, candidate / "0")
+            import numpy as np
+
+            with np.load(work / "scan_pixels.npz", allow_pickle=False) as data:
+                report = refine(
+                    Path((work / "mapped.ok").read_text()),
+                    cloud,
+                    records,
+                    candidate / "0",
+                    data,
+                )
+                report["source_observations"] = json.loads(data["stats"].item())
             final = pycolmap.Reconstruction(str(candidate / "0"))
             final.check()
             if {final.image(i).name for i in final.reg_image_ids()} != expected:

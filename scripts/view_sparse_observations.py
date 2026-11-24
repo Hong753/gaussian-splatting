@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from utils.checkpoint_snapshots import digest
 from utils.colmap_paths import colmap_model_dir
-from utils.read_write_model import qvec2rotmat, read_cameras_binary
+from utils.read_write_model import qvec2rotmat, read_cameras_binary, read_points3D_text
 
 CLOUD_CHUNK = 262144
 FEATURE = np.dtype([("xy", "<f8", 2), ("id", "<i8")])
@@ -93,6 +93,20 @@ class PointIndex:
         self.reverse = np.empty(0, REVERSE)
         self.order = None
         if not self.present:
+            return
+        if path.suffix == ".txt":
+            points = read_points3D_text(path)
+            self.ids = np.asarray(sorted(points), dtype=np.uint64)
+            self.xyz = np.asarray([points[i].xyz for i in self.ids]).reshape(-1, 3)
+            self.reverse = np.empty(sum(len(p.image_ids) for p in points.values()), REVERSE)
+            offset = 0
+            for row, pid in enumerate(self.ids):
+                p = points[pid]
+                end = offset + len(p.image_ids)
+                part = self.reverse[offset:end]
+                part["image"], part["feature"], part["row"] = p.image_ids, p.point2D_idxs, row
+                offset = end
+            self.reverse.sort(order="image")
             return
         buf = mapped(path)
         (n,) = struct.unpack_from("<Q", buf)

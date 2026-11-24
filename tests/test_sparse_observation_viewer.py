@@ -182,3 +182,27 @@ def test_stored_lidar_rows_override_track_matches(tmp_path):
     path.write_text(json.dumps(source))
     with pytest.raises(ValueError, match="different PLY"):
         Inspector(tmp_path)
+
+
+def test_sfm_uses_saved_scan_pixels_across_reordered_ply(tmp_path):
+    from scripts.orange4f_lidar_tracks import collect, scan_inputs
+    from scripts.view_comparisons import read_colmap_records
+
+    model = fixture(tmp_path)
+    scan, points = scan_inputs(tmp_path)
+    assert scan == model / "points3D.ply"
+    assert points == model / "points3D.bin"
+    reference = read_colmap_records(tmp_path)
+    data, stats = collect(tmp_path, scan, points, reference)
+    assert stats["scan_points"] == 5
+    assert stats["usable_pixel_links"] == 2
+    assert stats["images_with_links"] == 1
+    links = dict(zip(data["pid"], data["xy"].tolist()))
+    # ID 2 has only a reverse link. Its saved pixel differs from its projection.
+    # The forward-only ID 7 has ambiguous duplicate coordinates in the PLY.
+    assert links == {2: [0., 0.], 2**53 + 7: [31., 23.]}
+    scan.unlink()
+    scan, points = scan_inputs(tmp_path)
+    data, stats = collect(tmp_path, scan, points, reference)
+    assert set(data["pid"].tolist()) == {2, 7, 2**53 + 7}
+    assert stats["usable_pixel_links"] == 3
