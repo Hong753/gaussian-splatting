@@ -2,6 +2,20 @@
 
 Use the [Spirula v2026.11.12 Linux Vulkan build](https://github.com/harry7557558/spirula-studio/releases/tag/v2026.11.12). Start with the native-resolution images from the existing stride-3 AA run. The new SfM estimates poses and intrinsics from the images, including views held out of splat training, as in the original reconstruction protocol.
 
+## SfM only on all Orange4F images
+
+```bash
+conda activate 3dgs &&
+cd ~/gaussian-splatting-orange4f &&
+git fetch origin experiment/orange4f-joint-mesh &&
+git switch --detach FETCH_HEAD &&
+bash scripts/orange4f_spirula_sfm.sh
+```
+
+This estimates fresh extrinsics and pinhole intrinsics from the full image sequence at `/data/gh_workspace/data/COLMAP_BA_export/orange_4F/1_full/images`, including future rendering holdouts. The feature extractor uses a maximum long edge of 1,600 pixels and exports keypoints in the original image coordinates. The scene directory links to the original RGB files. Spirula writes the principal reconstruction to `/data/3dgs_outputs/orange4f/3dgs_finetuning/spirula_sfm_rgb_w1600/sparse/0`. Further numbered components have independent coordinate frames. The native summary in `sfm.log` records registration coverage, point count and reprojection error. An RGB-only solve has its own similarity gauge.
+
+Set `SPIRULA_DEVICE` to a Vulkan device selector on a shared host. The default is `auto`. The launcher uses `SPIRULA_BIN`, then searches PATH, then installs the checksum-verified official Linux x86-64 binary in the user cache. Rerun the same command to reuse native SfM caches after an interruption. Optional positional arguments are the source and output scene roots.
+
 ## 1. Prepare the comparison and run SfM
 
 In a Bash session on the GPU server, set the baseline directory and the Spirula executable. Use the full-scene RGB-only AA baseline with its 30k checkpoint and saved keyframe manifest.
