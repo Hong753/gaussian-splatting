@@ -387,3 +387,60 @@ python -m scripts.indoor_triangles score-external --data "$ROOM_INPUT" \
 ```
 
 The experimental 3DGS adapter conditions the rasterizer's accumulated inverse depth by alpha before TSDF at 2.5 cm voxels, 7.5 cm truncation, 12 m maximum z and alpha at least 0.55. Its time and memory are tracked separately. These stock and real-room commands were inspected but not executed on CUDA or ScanNet++ in this workspace.
+
+### Inspecting the Orange4F mesh and rendering new poses
+
+The 30k triangle trainer exports `direct.off` at the root of each run. Open
+it in MeshLab to inspect the individual colored splat triangles. The separate
+DA3-assisted textured reconstruction below produces `world_texture_v1/surface.obj`,
+`surface.mtl` and `textures/`. Keep these three together when opening the OBJ
+in MeshLab or Blender. Blender's Material Preview shows the textures.
+
+```bash
+conda activate 3dgs
+cd ~/gaussian-splatting-orange4f
+OPENBLAS_NUM_THREADS=1 python -u -m scripts.orange4f_textured_scene
+```
+
+This reads trusted depths and full-resolution RGB only from fitting cameras
+for model construction. It integrates a narrow-band projective TSDF in pose
+units (default grid spacing 0.04, maximum fitting depth 12), extracts a mesh
+with shared indices where at least two views observed each cell corner, and
+assigns fixed UVs to its faces. A training camera qualifies when the three
+vertices and centroid have depth support and agree with the mesh visibility
+test. Nearby faces of similar orientation prefer a common image, ranked by
+visible projected area. Each chosen image is cropped to its used texture
+rectangle and saved losslessly. View-dependent reflections, seams, and areas
+with inadequate observation can limit this diffuse representation.
+
+The command builds the mesh on CPU, compares it with available baseline
+renders on up to 16 held-out cameras spread over nearest-training-camera
+distances, and renders the capture's random trajectory to
+`world_texture_v1/path_<hash>/render.mp4`. It uses the saved random trajectory
+when available and otherwise generates one from the capture poses. This path
+has no collision guarantee. Each frame's nearest fitting-camera distance and
+geometry/texture coverage are in `coverage.json`. Missing geometry is black,
+and faces without a valid texture are gray. Full-frame PSNR includes both.
+The 16-view distance-stratified result is a diagnostic. Use the following
+for scores on all held-out views:
+
+```bash
+OPENBLAS_NUM_THREADS=1 python -u -m scripts.orange4f_textured_scene evaluate --all-held-out
+```
+
+To inspect only the mesh, append `build` to the first Python command. The
+standalone renderer uses a C++17 compiler and ffmpeg. After moving the
+complete model directory to another machine, supply any camera path in the
+same world coordinates. Only the model package and pose JSON are read:
+
+```bash
+python -u -m scripts.orange4f_textured_scene render --scene /path/to/world_texture_v1 --trajectory /path/to/cameras.json
+```
+
+The JSON has `fps` and a `cameras` array. Each camera supplies integer `width`
+and `height`, a camera-to-world rotation matrix `R`, and world-to-camera
+translation `T` as used by the existing Orange4F trajectory generator.
+The center is `-R @ T`. Supply `fov_x` and `fov_y` in radians, or
+`intrinsics: [fx, fy, cx, cy]` on an integer pixel-center grid. A single-pose
+path also produces a lossless PNG. Texture coordinates, pages, and geometry
+are identical across poses. No source-photo lookup runs during rendering.
