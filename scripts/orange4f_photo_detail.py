@@ -96,6 +96,14 @@ def warp_source(src, dst, rgb, depth, valid, depth_k):
     return front, visible, color, detail
 
 
+def full_color_render(base, warps):
+    """Take full RGB from the nearest eligible source on its own visibility mask."""
+    if not warps:
+        return base.copy(), np.zeros(base.shape[:2], bool)
+    _, visible, rgb, _ = warps[0]
+    return np.where(visible[..., None], rgb, base), visible
+
+
 def transfer(base, warps):
     if len(warps) < 2:
         return base.copy(), np.zeros(base.shape[:2], bool)
@@ -193,7 +201,12 @@ def run(args):
     cameras = {f.name: camera(rows[f.name], f) for f in poses.values() if f.name in rows}
     train = [name for name, row in rows.items() if row["split"] == "train"]
     inspect = getattr(args, "inspect_warps", False)
-    method = "photo_warps" if inspect else "photo_detail"
+    full_color = getattr(args, "full_color", False)
+    method = "photo_detail"
+    if inspect:
+        method = "photo_warps"
+    elif full_color:
+        method = "photo_full_color"
     output = run_dir / f"{method}_{cohort}_{iteration}"
     if (output / "results.json").is_file():
         print(f"Existing comparison: {output / 'results.json'}")
@@ -205,7 +218,8 @@ def run(args):
         for name, baseline_path in inputs.items():
             target = cameras[name]
             qualified = [s for s in train if target.rotation[2] @ cameras[s].rotation[2] > .85]
-            sources = sorted(qualified, key=lambda s: np.linalg.norm(cameras[s].center-target.center))[:4]
+            limit = 1 if full_color else 4
+            sources = sorted(qualified, key=lambda s: np.linalg.norm(cameras[s].center-target.center))[:limit]
             warps = []
             for source in sources:
                 staged = rows[source]["staged_name"]
@@ -216,7 +230,9 @@ def run(args):
             base = read_rgb(baseline_path)
             if base.shape != (target.height, target.width, 3):
                 raise ValueError(f"Baseline RGB size differs from target camera for {name}")
-            if not inspect:
+            if full_color:
+                photo, supported = full_color_render(base, warps)
+            elif not inspect:
                 photo, supported = transfer(base, warps)
             # The target photograph first enters here, after reprojection and synthesis.
             actual = read_rgb(run_dir / "images" / rows[name]["staged_name"])
@@ -240,7 +256,7 @@ def run(args):
                        photo_psnr=score(actual, photo), coverage=float(supported.mean()), comparison=panel)
             results.append(row)
             print(json.dumps(row), flush=True)
-        report = dict(iteration=iteration, cohort=cohort, frames=results)
+        report = dict(iteration=iteration, cohort=cohort, method=method, frames=results)
         if not inspect:
             report.update(baseline_psnr=float(np.mean([r["baseline_psnr"] for r in results])),
                           photo_psnr=float(np.mean([r["photo_psnr"] for r in results])))
@@ -259,4 +275,9 @@ if __name__ == "__main__":
                       help="Show each training-photo warp on the latest held-out previews before detail transfer")
     mode.add_argument("--all-held-out", action="store_true",
                         help="Compare all held-out frames after the run finishes rendering")
-    run(parser.parse_args())
+    parser.add_argument("--full-color", action="store_true",
+                        help="Use full RGB from the nearest eligible training photo on its valid warp pixels")
+    args = parser.parse_args()
+    if args.inspect_warps and args.full_color:
+        parser.error("--inspect-warps and --full-color produce separate comparisons")
+    run(args)

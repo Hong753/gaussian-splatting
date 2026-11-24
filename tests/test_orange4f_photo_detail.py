@@ -91,6 +91,17 @@ def test_fixed_pose_two_held_out_targets(tmp_path):
             assert warp["valid_edge_pixels"] == 0 and warp["valid_edge_warp_psnr"] is None
             mask = np.asarray(Image.open(diagnostics/warp["validity_mask"]))
             assert mask.sum() == warp["valid_pixels"]
+    photo.run(SimpleNamespace(run=tmp_path, all_held_out=False, full_color=True))
+    composite = tmp_path/"photo_full_color_preview_7000"
+    combined_rows = json.loads((composite/"results.json").read_text())["frames"]
+    for target, combined in zip(audited["frames"], combined_rows, strict=True):
+        first = target["warps"][0]
+        assert combined["frame"] == target["frame"] and combined["sources"] == [first["source"]]
+        assert combined["coverage"] == first["valid_fraction"]
+        scale = first["valid_fraction"]
+        expected_mse = 10**(-combined["baseline_psnr"]/10) + scale * (
+            10**(-first["valid_warp_psnr"]/10) - 10**(-first["valid_baseline_psnr"]/10))
+        assert abs(combined["photo_psnr"] + 10*np.log10(expected_mse)) < 1e-4
     result.rename(tmp_path/"first")
     photo.run(args)
     frames = tmp_path/"frames"

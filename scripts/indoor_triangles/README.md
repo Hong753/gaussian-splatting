@@ -211,6 +211,13 @@ run with its flat `frames/` renders. These are view-dependent RGB results
 using additional stored source images and depths. Mesh quality requires
 separate evaluation.
 
+For a full-color rendering from the same poses, use
+`python -u -m scripts.orange4f_photo_detail --full-color`. The nearest eligible
+training camera supplies RGB anywhere its warp is valid. The triangle render
+fills the rest. Source selection uses camera centers and orientations only.
+The output includes the full-frame comparison, lossless RGB, mask, and PSNR.
+Add `--all-held-out` to apply the same rule to the completed test renders.
+
 To inspect a failed transfer, run `python -u -m scripts.orange4f_photo_detail --inspect-warps`.
 For each held-out preview, this writes a full-resolution GT / baseline / single
 reprojected training photo comparison for each candidate source. Gray marks
