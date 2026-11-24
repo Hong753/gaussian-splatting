@@ -30,6 +30,16 @@ This uses the fork's native 3DGS trainer with SH degree 3, Adam, standard densif
 
 The output root is `/data/3dgs_outputs/orange4f/3dgs_finetuning/spirula_3dgs_stride3_w1600`. Open `model/debug_previews/index.html` for fixed train and held-out views at step 1, every 500 steps and step 30,000. Direct file viewing and HTTP viewing are supported. `protocol.json` records the split, source fingerprints and seed count. `model/point_cloud/iteration_7000` and `iteration_30000` contain the Gaussian PLYs. The final `evaluation/iteration_30000/` contains `psnr.json`, a gallery at `index.html`, per-frame GT/render comparisons, and `videos/recorded.mp4`, `videos/gt_render.mp4` and `videos/random/render.mp4`. PSNR is per-channel, averaged over channels and then images. The random path uses a centered virtual camera, seed 42 and smooth offsets from the recovered trajectory. It has no reference RGB.
 
+To train from SuperGlue mapper model 0 before LiDAR bundle adjustment finishes, run:
+
+```bash
+conda activate 3dgs &&
+cd ~/gaussian-splatting-orange4f &&
+CUDA_VISIBLE_DEVICES=0 python -u -m scripts.orange4f_spirula_3dgs --mapper-model 0
+```
+
+This reads the numbered component under `superpoint_superglue_lidar/map.*/0`. The launcher prints its path and records it in `superglue_mapper_0_3dgs_stride3_w1600/protocol.json`. When several attempts have written model 0, a new training run selects the newest directory containing the three binaries. Resuming reuses the recorded component. A partial component uses the original capture’s keyframe split restricted to its registered images. The protocol lists missing image names and the terminal reports coverage. Evaluation uses the same registered subset. For mid-training evaluation of this model, include `--mapper-model 0` with `--evaluate-iteration 7000`.
+
 To score the immutable step-7,000 PLY during training, use another available GPU once the PLY appears. For example:
 
 ```bash

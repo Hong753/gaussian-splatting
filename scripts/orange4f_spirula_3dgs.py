@@ -12,7 +12,7 @@ import subprocess
 from tempfile import TemporaryDirectory
 
 from PIL import Image
-from scripts.keyframes import natural_key, select_keyframes
+from scripts.keyframes import natural_key, registered_names, select_keyframes
 from scripts.orange4f_stock_triangle import OUTPUT, REPO, encode_video, invoke
 from scripts.view_comparisons import atomic_json, model_info, read_colmap_records, write_all_frame_metrics
 from utils.checkpoint_snapshots import digest
@@ -44,17 +44,59 @@ def link(source, target):
     target.symlink_to(source, target_is_directory=source.is_dir())
 
 
+def mapper_component(source, index, old):
+    work = source / "superpoint_superglue_lidar"
+    if old:
+        pinned = old.get("mapper_model")
+        if not pinned or Path(pinned).name != str(index):
+            raise ValueError("This run uses different poses. Choose a fresh --run.")
+        return Path(pinned)
+    candidates = sorted(work.glob(f"map.*/{index}"), key=lambda p: (p.stat().st_mtime_ns, p), reverse=True)
+    for folder in candidates:
+        if all((folder / f).is_file() and (folder / f).stat().st_size > 8
+               for f in ("cameras.bin", "images.bin", "points3D.bin")):
+            return folder
+    raise SystemExit(f"No SuperGlue mapper model {index} with camera, image and point binaries yet in "
+                     f"{work}/map.*/. See {work}/mapper.log for mapping progress.")
+
+
 def prepare(args):
     source, run = args.source, args.run
     stage, model = run / "scene", run / "model"
     sparse = source / "sparse/0"
     protocol_path = run / "protocol.json"
     old = json.loads(protocol_path.read_text()) if protocol_path.exists() else None
+    raw = args.mapper_model is not None
     method_file = source / "sparse/superglue_lidar.json"
-    learned = json.loads(method_file.read_text()) if method_file.is_file() else None
-    if learned and old and old["sfm_sha256"] != learned["binary_sha256"]:
+    learned = not raw and method_file.is_file()
+    if raw:
+        sparse = mapper_component(source, args.mapper_model, old)
+        print(f"Using SuperGlue mapper model before LiDAR BA: {sparse}", flush=True)
+    elif old and old.get("mapper_model"):
+        raise ValueError("This run uses mapper poses. Specify its --mapper-model to resume.")
+    elif learned and old and old["sfm_sha256"] != json.loads(method_file.read_text())["binary_sha256"]:
         sparse = source / "sparse_sift_backup/0"
         learned = None
+    points_file = sparse / "points3D.bin"
+    with points_file.open("rb") as stream:
+        points, = struct.unpack("<Q", stream.read(8))
+        if raw and not old:
+            # The mapper can still be flushing its final track array. Only stage
+            # a new run once the last declared point and observation exist.
+            size = os.fstat(stream.fileno()).st_size
+            for _ in range(points):
+                stream.seek(43, os.SEEK_CUR)
+                track_size = stream.read(8)
+                if len(track_size) != 8:
+                    raise ValueError(f"Mapper point records are incomplete: {points_file}")
+                count, = struct.unpack("<Q", track_size)
+                if count > (size - stream.tell()) // 8:
+                    raise ValueError(f"Mapper point observations are incomplete: {points_file}")
+                stream.seek(8 * count, os.SEEK_CUR)
+            if stream.tell() != size:
+                raise ValueError(f"Unexpected length for {points_file}")
+    if points < 4:
+        raise ValueError(f"Spirula exported only {points} seed points")
     staged_sparse = stage / "sparse/0"
     staged_sparse.mkdir(parents=True, exist_ok=True)
     link(source / "images", stage / "images")
@@ -62,14 +104,13 @@ def prepare(args):
     for name in ("cameras.bin", "images.bin", "points3D.bin"):
         link(sparse / name, staged_sparse / name)
         hashes[name] = digest(sparse / name)
-    with (sparse / "points3D.bin").open("rb") as stream:
-        points, = struct.unpack("<Q", stream.read(8))
-    if points < 4:
-        raise ValueError(f"Spirula exported only {points} seed points")
     records = read_colmap_records(stage)
     names = sorted(records, key=natural_key)
-    if len(names) != args.expected_frames:
-        raise ValueError(f"Expected {args.expected_frames} registered images, got {len(names)} from {sparse}")
+    capture_names = sorted(registered_names(source), key=natural_key) if raw else names
+    if raw and not set(names).issubset(capture_names):
+        raise ValueError(f"Unexpected registered image names in {sparse}")
+    if len(capture_names) != args.expected_frames:
+        raise ValueError(f"Expected {args.expected_frames} registered images, got {len(capture_names)} from {source}")
     for row in records.values():
         with Image.open(row["image_path"]) as image:
             if image.size != (row["width"], row["height"]):
@@ -77,7 +118,7 @@ def prepare(args):
         if not all(math.isfinite(row[k]) for k in ("fx", "fy", "cx", "cy")) or min(row["fx"], row["fy"]) <= 0:
             raise ValueError(f"Invalid pinhole calibration for {row['name']}")
 
-    fingerprint = hashlib.sha256(json.dumps(sorted(names), ensure_ascii=False).encode()).hexdigest()
+    fingerprint = hashlib.sha256(json.dumps(sorted(capture_names), ensure_ascii=False).encode()).hexdigest()
     saved_path = model / "keyframes.json"
     if old and (old["sfm_sha256"] != hashes or old["source"] != str(source) or old["iterations"] != args.iterations):
         raise ValueError("SfM source or training schedule differs from this run; use a fresh --run")
@@ -86,25 +127,37 @@ def prepare(args):
     if args.keyframes:
         selection = args.keyframes.resolve(strict=True)
     elif old:
-        selection = saved_path
+        selection = run / "capture_split/keyframes.json" if old.get("unregistered") else saved_path
     else:
         selection = next((p for p in PRIOR_SPLITS if p.is_file() and
                           json.loads(p.read_text()).get("registered_names_sha256") == fingerprint), None)
     if selection is None:
-        selection = select_keyframes(stage, "images", model, 3, False)
+        selection = (select_keyframes(source, "images", run / "capture_split", 3, False)
+                     if len(names) < len(capture_names) else select_keyframes(stage, "images", model, 3, False))
     manifest = json.loads(selection.read_text())
     chosen = manifest["selected_images"]
     if (manifest.get("registered_names_sha256") != fingerprint or manifest.get("group_size") != 3
-            or manifest.get("eval") is not False or len(chosen) != math.ceil(len(names)/3)
-            or any(n not in names[i*3:i*3+3] for i, n in enumerate(chosen))):
+            or manifest.get("eval") is not False or len(chosen) != math.ceil(len(capture_names)/3)
+            or any(n not in capture_names[i*3:i*3+3] for i, n in enumerate(chosen))):
         raise ValueError(f"Keyframes do not match this capture's sharp stride-3 protocol: {selection}")
+    unregistered = sorted(set(capture_names).difference(names), key=natural_key)
+    if unregistered:
+        available = set(names)
+        chosen = [n for n in chosen if n in available]
+        if not chosen or len(chosen) == len(names):
+            raise ValueError("Model has no registered train/test overlap with the capture split")
+        print(f"Model covers {len(names):,}/{len(capture_names):,} cameras. "
+              f"PSNR will cover registered views only ({len(unregistered):,} missing).", flush=True)
     if old and chosen != old["train"]:
         raise ValueError("Training split differs from the existing run")
     selected = set(chosen)
+    provenance = "Spirula RGB SfM on all registered views; poses fixed"
+    if raw:
+        provenance = "SuperPoint + indoor SuperGlue, Spirula mapper poses before LiDAR BA; poses fixed in GS"
+    elif learned:
+        provenance = "SuperPoint + indoor SuperGlue, Spirula mapping, LiDAR-anchored bundle adjustment on all registered views; poses fixed in GS"
     report = dict(source=str(source), images=str((stage/"images").resolve()), sfm_sha256=hashes,
-                  seed_points=points, pose_provenance=("SuperPoint + indoor SuperGlue, Spirula mapping, "
-                    "LiDAR-anchored bundle adjustment on all registered views; poses fixed in GS"
-                    if learned else "Spirula RGB SfM on all registered views; poses fixed"),
+                  seed_points=points, pose_provenance=provenance,
                   seed_provenance=str(sparse / "points3D.bin"), iterations=args.iterations, width=1600,
                   antialiasing=False, principal_point="Spirula pinhole", keyframe_selection=
                   old["keyframe_selection"] if old else str(selection), train=chosen,
@@ -113,6 +166,15 @@ def prepare(args):
                       r["cy"]-r["height"]/2)/r["width"] for r in records.values()))
     if not old:
         report["revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
+        if raw:
+            report.update(mapper_model=str(sparse), unregistered=unregistered, capture_frames=len(capture_names))
+        if unregistered:
+            atomic_json(run / "capture_split/keyframes.json", manifest)
+            manifest = {**manifest, "selection_capture": str(selection), "selected_images": chosen,
+                        "selected_count": len(chosen), "registered_count": len(names),
+                        "candidate_count": len(names), "registered_names_sha256":
+                        hashlib.sha256(json.dumps(sorted(names), ensure_ascii=False).encode()).hexdigest()}
+            manifest.pop("groups", None)
         atomic_json(saved_path, {**manifest, "source_path": str(stage)})
         atomic_json(protocol_path, report)
     print(f"Spirula: {len(names):,} cameras; {points:,} XYZ/RGB seeds; {len(chosen):,} train, "
@@ -165,6 +227,7 @@ def evaluate(args, step, videos):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--source", type=Path, default=SOURCE)
+    p.add_argument("--mapper-model", type=int, help="Train from this numbered SuperGlue mapper component before LiDAR BA")
     p.add_argument("--run", type=Path)
     p.add_argument("--keyframes", type=Path)
     p.add_argument("--gpu", default=os.environ.get("CUDA_VISIBLE_DEVICES", "0"))
@@ -174,6 +237,10 @@ def main():
     mode.add_argument("--prepare-only", action="store_true")
     mode.add_argument("--evaluate-iteration", type=int)
     args = p.parse_args()
+    if args.mapper_model is not None and args.mapper_model < 0:
+        p.error("--mapper-model must be a nonnegative component number")
+    if args.run is None and args.mapper_model is not None:
+        args.run = RUN.with_name(f"superglue_mapper_{args.mapper_model}_3dgs_stride3_w1600")
     if args.run is None:
         method_file = args.source.expanduser() / "sparse/superglue_lidar.json"
         args.run = RUN.with_name("superglue_lidar_3dgs_stride3_w1600") if method_file.is_file() else RUN
