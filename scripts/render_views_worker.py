@@ -24,6 +24,8 @@ def load_record_camera(args, record, index):
     info = SimpleNamespace(uid=index, image_path=record["image_path"], image_name=record["name"],
                            R=np.array(record["R"]), T=np.array(record["T"]), FovX=record["fov_x"],
                            FovY=record["fov_y"], depth_path="", depth_params=None, is_test=False)
+    if getattr(args, "colmap_principal_point", False):
+        info.principal_fraction = (record["cx"]/record["width"], record["cy"]/record["height"])
     return loadCam(args, index, info, 1., False, False)
 
 
@@ -56,7 +58,8 @@ def render_views(spec, names, iteration, output, antialiasing=None):
         runtime = {**spec, "ply": spec["path"] / f"point_cloud/iteration_{iteration}" / filename}
         render = load_renderer(runtime, aa)
         camera_args = SimpleNamespace(resolution=cfg.get("resolution", -1), data_device="cpu", train_test_exp=False,
-                                      loss_mask_dir=cfg.get('loss_mask_dir',''))
+                                      loss_mask_dir=cfg.get('loss_mask_dir',''),
+                                      colmap_principal_point=cfg.get('colmap_principal_point', False))
         make_camera = partial(load_record_camera, camera_args)
     save_rendered_views(spec, names, output, render, make_camera, pose_cache)
 

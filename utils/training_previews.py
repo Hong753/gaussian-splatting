@@ -75,7 +75,10 @@ def load_heldout_camera(record, dataset):
         depth_path='', depth_params=None, is_test=True)
     # Preserve native image resolution, but keep the few extra RGB tensors on CPU.
     args = SimpleNamespace(resolution=dataset.resolution, data_device='cpu', train_test_exp=False,
-                           loss_mask_dir=getattr(dataset,'loss_mask_dir',''))
+                           loss_mask_dir=getattr(dataset,'loss_mask_dir',''),
+                           colmap_principal_point=getattr(dataset, 'colmap_principal_point', False))
+    if args.colmap_principal_point:
+        info.principal_fraction = (record['cx']/record['width'], record['cy']/record['height'])
     return loadCam(args, 0, info, 1., False, True)
 
 
@@ -137,7 +140,13 @@ class TrainingPreviewer:
         atomic_json(manifest_path, self.manifest)
         if not (self.root / 'history.json').exists():
             atomic_json(self.root / 'history.json', dict(selection=self.manifest, snapshots=[]))
-        atomic_write(self.root / 'index.html', lambda path: path.write_text(HTML))
+        self.write_index(json.loads((self.root / 'history.json').read_text()))
+
+    def write_index(self, history):
+        # A mounted server directory opened as file:// cannot fetch history.json in Chrome.
+        embedded = json.dumps(history['snapshots'], allow_nan=False).replace('<', '\\u003c')
+        atomic_write(self.root / 'index.html',
+                     lambda path: path.write_text(HTML.replace('/* saved previews */[]', embedded)))
 
     def due(self, iteration, final_iteration):
         return bool(self.config['every'] and
@@ -230,11 +239,17 @@ class TrainingPreviewer:
             history['snapshots'].append(snapshot)
             atomic_json(history_path, history)  # Publish only after all images exist.
             atomic_json(self.root / 'latest.json', snapshot)
+            self.write_index(history)
         finally:
             random.setstate(py_state)
             np.random.set_state(np_state)
             shutil.rmtree(temporary, ignore_errors=True)
-        print(f'[ITER {iteration}] Debug previews: {len(rows)} frames in {snapshot["seconds"]:.1f}s; '
+        scores = []
+        for split in ('train', 'held-out'):
+            values = [float(row['psnr_db']) for row in rows if row['split'] == split]
+            if values:
+                scores.append(f'{split} {sum(values)/len(values):.2f} dB')
+        print(f'[ITER {iteration}] Debug previews: {", ".join(scores)}; {len(rows)} frames in {snapshot["seconds"]:.1f}s; '
               f'{self.root / "index.html"}', flush=True)
         return snapshot
 
@@ -289,8 +304,11 @@ function show(){
 }
 async function refresh(){
   try{
-    const response=await fetch('history.json',{cache:'no-store'});if(!response.ok)throw new Error('HTTP '+response.status);
-    const data=await response.json();snapshots=data.snapshots;
+    if(location.protocol==='file:'){snapshots=/* saved previews */[];}
+    else{
+      const response=await fetch('history.json',{cache:'no-store'});if(!response.ok)throw new Error('HTTP '+response.status);
+      const data=await response.json();snapshots=data.snapshots;
+    }
     if(!snapshots.length){$('status').textContent='Waiting for step 1…';return;}
     const last=snapshots[snapshots.length-1],key=last.iteration+':'+last.created_unix;
     if(key!==latestKey){
@@ -305,5 +323,6 @@ async function refresh(){
 }
 $('step').onchange=()=>{$('follow').checked=false;show();};$('split').onchange=show;
 $('follow').onchange=()=>{if($('follow').checked&&snapshots.length){$('step').value=String(snapshots[snapshots.length-1].iteration);show();}};
-$('refresh').onclick=refresh;refresh();setInterval(refresh,5000);
+function poll(){if(location.protocol==='file:')location.reload();else refresh();}
+$('refresh').onclick=poll;refresh();setInterval(()=>{if(location.protocol!=='file:'||$('follow').checked)poll();},5000);
 </script></body></html>'''

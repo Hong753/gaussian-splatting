@@ -16,6 +16,28 @@ This estimates fresh extrinsics and pinhole intrinsics from the full image seque
 
 Set `SPIRULA_DEVICE` to a Vulkan device selector on a shared host. The default is `auto`. The launcher uses `SPIRULA_BIN`, then searches PATH, then installs the checksum-verified official Linux x86-64 binary in the user cache. The launcher probes the executable and reuses working system or Vulkan-only setups. On older hosts (including glibc 2.35), it downloads checksum-pinned Ubuntu 24.04 libraries and starts Spirula through their matching dynamic linker. This runtime lives in the user cache. The host supplies the Vulkan GPU driver. The Vulkan device listing in `sfm.log` shows which GPU the installed driver exposes. Rerun the same command to reuse native SfM caches after an interruption. Optional positional arguments are the source and output scene roots.
 
+## Train vanilla Graphdeco 3DGS using the completed Spirula poses
+
+```bash
+conda activate 3dgs &&
+cd ~/gaussian-splatting-orange4f &&
+git fetch origin experiment/orange4f-joint-mesh &&
+git switch --detach FETCH_HEAD &&
+CUDA_VISIBLE_DEVICES=0 python -u -m scripts.orange4f_spirula_3dgs
+```
+
+This uses the fork's native 3DGS trainer with SH degree 3, Adam, standard densification, default RGB loss and AA off. The camera adapter passes Spirula's focal lengths and principal points to the rasterizer. The run links the original photos and three new SfM binaries into its own scene directory. It initializes Gaussians from all Spirula XYZ/RGB points in this reconstruction's coordinates. Each of the 5,009 RGBs participated in SfM. Gaussian optimization uses the 1,670 sharp stride-3 keyframes, and the other 3,339 supply the held-out image scores. The previous split is reused when its registered name list matches. Otherwise the sharpest frame in each successive group of three is selected. Training, previews and scoring use 1,600-pixel width.
+
+The output root is `/data/3dgs_outputs/orange4f/3dgs_finetuning/spirula_3dgs_stride3_w1600`. Open `model/debug_previews/index.html` for fixed train and held-out views at step 1, every 500 steps and step 30,000. Direct file viewing and HTTP viewing are supported. `protocol.json` records the split, source fingerprints and seed count. `model/point_cloud/iteration_7000` and `iteration_30000` contain the Gaussian PLYs. The final `evaluation/iteration_30000/` contains `psnr.json`, a gallery at `index.html`, per-frame GT/render comparisons, and `videos/recorded.mp4`, `videos/gt_render.mp4` and `videos/random/render.mp4`. PSNR is per-channel, averaged over channels and then images. The random path uses a centered virtual camera, seed 42 and smooth offsets from the recovered trajectory. It has no reference RGB.
+
+To score the immutable step-7,000 PLY during training, use another available GPU once the PLY appears. For example:
+
+```bash
+conda activate 3dgs &&
+cd ~/gaussian-splatting-orange4f &&
+CUDA_VISIBLE_DEVICES=1 python -u -m scripts.orange4f_spirula_3dgs --evaluate-iteration 7000
+```
+
 ## 1. Prepare the comparison and run SfM
 
 In a Bash session on the GPU server, set the baseline directory and the Spirula executable. Use the full-scene RGB-only AA baseline with its 30k checkpoint and saved keyframe manifest.

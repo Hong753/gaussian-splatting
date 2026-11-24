@@ -57,6 +57,7 @@ class ModelParams(ParamGroup):
         self._images = "images"
         self._depths = ""
         self.keyframe_manifest = ""
+        self.colmap_principal_point = False
         self.initial_point_cloud = ""
         self.loss_mask_dir = ""
         self.training_scene_extent = 0.0

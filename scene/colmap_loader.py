@@ -11,6 +11,7 @@
 
 import numpy as np
 import collections
+import os
 import struct
 
 CameraModel = collections.namedtuple(
@@ -177,7 +178,7 @@ def read_intrinsics_text(path):
                                             params=params)
     return cameras
 
-def read_extrinsics_binary(path_to_model_file):
+def read_extrinsics_binary(path_to_model_file, observations=True):
     """
     see: src/base/reconstruction.cc
         void Reconstruction::ReadImagesBinary(const std::string& path)
@@ -200,6 +201,14 @@ def read_extrinsics_binary(path_to_model_file):
                 current_char = read_next_bytes(fid, 1, "c")[0]
             num_points2D = read_next_bytes(fid, num_bytes=8,
                                            format_char_sequence="Q")[0]
+            if not observations:
+                end = fid.tell() + 24 * num_points2D
+                if end > os.fstat(fid.fileno()).st_size:
+                    raise ValueError("Truncated COLMAP observation data")
+                fid.seek(end)
+                images[image_id] = Image(image_id, qvec, tvec, camera_id, image_name,
+                                         np.empty((0, 2)), np.empty(0, dtype=np.int64))
+                continue
             x_y_id_s = read_next_bytes(fid, num_bytes=24*num_points2D,
                                        format_char_sequence="ddq"*num_points2D)
             xys = np.column_stack([tuple(map(float, x_y_id_s[0::3])),

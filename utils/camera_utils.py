@@ -69,7 +69,8 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, depth_params=depth_params,
                   image=image, invdepthmap=invdepthmap,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device,
-                  train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test)
+                  train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test,
+                  principal_fraction=cam_info.principal_fraction if getattr(args, "colmap_principal_point", False) else None)
     if getattr(args, 'loss_mask_dir', ''):
         from utils.region_loss import load_mask
         camera.loss_mask = load_mask(args.loss_mask_dir, cam_info.image_name, resolution)
@@ -84,7 +85,7 @@ def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_syntheti
 
     return camera_list
 
-def camera_to_JSON(id, camera : Camera):
+def camera_to_JSON(id, camera : Camera, use_principal_point=False):
     Rt = np.zeros((4, 4))
     Rt[:3, :3] = camera.R.transpose()
     Rt[:3, 3] = camera.T
@@ -104,4 +105,7 @@ def camera_to_JSON(id, camera : Camera):
         'fy' : fov2focal(camera.FovY, camera.height),
         'fx' : fov2focal(camera.FovX, camera.width)
     }
+    if use_principal_point and camera.principal_fraction is not None:
+        camera_entry["cx"] = camera.width * camera.principal_fraction[0]
+        camera_entry["cy"] = camera.height * camera.principal_fraction[1]
     return camera_entry

@@ -705,7 +705,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 publish_snapshot(scene, iteration)
             elif iteration in checkpoint_iterations:
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                from utils.checkpoint_snapshots import atomic_write
+                atomic_write(os.path.join(scene.model_path, f"chkpnt{iteration}.pth"),
+                             lambda path: torch.save((gaussians.capture(), iteration), path))
 
             if previewer is not None and previewer.due(iteration, opt.iterations):
                 previewer.capture(iteration, gaussians, render, evaluation_pipe, background,

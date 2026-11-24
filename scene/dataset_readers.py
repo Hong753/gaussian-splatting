@@ -37,6 +37,7 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     is_test: bool
+    principal_fraction: tuple = None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -109,7 +110,8 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
                               image_path=image_path, image_name=image_name, depth_path=depth_path,
-                              width=width, height=height, is_test=image_name in test_cam_names_list)
+                              width=width, height=height, is_test=image_name in test_cam_names_list,
+                              principal_fraction=(float(intr.params[-2])/width, float(intr.params[-1])/height))
         cam_infos.append(cam_info)
 
     sys.stdout.write('\n')
@@ -146,7 +148,7 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8,
     try:
         cameras_extrinsic_file = os.path.join(model_dir, "images.bin")
         cameras_intrinsic_file = os.path.join(model_dir, "cameras.bin")
-        cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
+        cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file, observations=False)
         cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
     except:
         cameras_extrinsic_file = os.path.join(model_dir, "images.txt")
@@ -240,7 +242,8 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8,
                 xyz, rgb, _ = read_points3D_binary(bin_path)
             except:
                 xyz, rgb, _ = read_points3D_text(txt_path)
-            storePly(ply_path, xyz, rgb)
+            from utils.checkpoint_snapshots import atomic_write
+            atomic_write(ply_path, lambda path: storePly(path, xyz, rgb))
         try:
             pcd = fetchPly(ply_path)
         except:

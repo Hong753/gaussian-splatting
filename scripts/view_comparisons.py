@@ -44,7 +44,7 @@ def read_colmap_records(source, images="images"):
     source = Path(source).resolve()
     model = colmap_model_dir(source)
     binary = (model / "images.bin").is_file() and (model / "cameras.bin").is_file()
-    extrinsics = (loader.read_extrinsics_binary(str(model / "images.bin")) if binary
+    extrinsics = (loader.read_extrinsics_binary(str(model / "images.bin"), observations=False) if binary
                   else loader.read_extrinsics_text(str(model / "images.txt")))
     intrinsics = (loader.read_intrinsics_binary(str(model / "cameras.bin")) if binary
                   else loader.read_intrinsics_text(str(model / "cameras.txt")))
