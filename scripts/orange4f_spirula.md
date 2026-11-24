@@ -127,3 +127,21 @@ conda run --no-capture-output -n 3dgs python "$HELPER" \
 ~~~
 
 Open `$OUT/comparison.html` for photos, renders, error maps, and per-view scores. Use `$OUT/raw_per_frame.csv` for the full shared held-out set. The baseline uses its original poses and Spirula uses its fresh poses. Compare `warp_basic` with `warp_off` to measure the warp with poses held fixed. Compare either with `3dgs_aa` to measure the end-to-end change.
+
+## Replace the Orange4F RGB-only SfM model with learned, LiDAR-assisted SfM
+
+```bash
+conda activate 3dgs &&
+cd ~/gaussian-splatting-orange4f &&
+git fetch origin experiment/orange4f-joint-mesh &&
+git switch --detach FETCH_HEAD &&
+bash scripts/run_orange4f_superglue_lidar.sh
+```
+
+This reruns SfM only. The launcher picks one idle CUDA GPU for the neural networks, or honors a single `CUDA_VISIBLE_DEVICES`. Both mapping and scan-anchored bundle adjustment use CPU solvers. Inputs are every original registered image, the original pinhole calibration, and a metric scan registered to the original camera frame. The default scan is the original dataset's `input.ply`. Set `ORANGE4F_LIDAR_PLY=/absolute/path/to/registered_scan.ply` for another scan. Its coordinates must be in metres. The original exported camera poses place the fresh reconstruction in that frame by one similarity transform. They do not seed individual camera poses.
+
+SuperPoint extracts up to 2,048 features at a maximum image side of 1,600 px. The pinned indoor SuperGlue network matches temporal neighbours and nonlocal appearance candidates. OpenCV MAGSAC verifies fundamental matrices and homographies. The resulting correspondences feed the Spirula v2026.11.12 mapper. It starts from the original pinhole intrinsics and can refine focal length. The LiDAR bundle adjustment holds those mapped intrinsics fixed. In the metric frame, RGB tracks with at least three observations and support from a local plane in the scan are projected onto that plane. These projected landmarks are fixed during robust COLMAP bundle adjustment. All camera poses and the other landmarks can move. The tangential coordinates of an anchor come from visual SfM. This is a custom scan-constrained SfM stage. Repeated walls or a misregistered input scan can produce incorrect associations. The report includes per-camera support and the plane residual on tracks excluded from anchoring.
+
+The candidate is reopened and checked for registration of the full input set before exchanging `spirula_sfm_rgb_w1600/sparse/` with the complete new model. The old folder is retained at `spirula_sfm_rgb_w1600/sparse_sift_backup/`. Existing Gaussian training scene links are pinned to the old files before the switch. Interrupted runs reuse the feature and verified match caches in `spirula_sfm_rgb_w1600/superpoint_superglue_lidar/`. Look at `learned.log`, `mapper.log`, and `lidar-ba.log` there. The exact input fingerprints, final statistics, and solver report are in `sparse/superglue_lidar.json`. A new invocation of the vanilla 3DGS launcher picks a separate output directory for the learned/LiDAR model.
+
+The launcher reuses the pinned SuperGlue repository when already cached, otherwise it downloads the models into the SfM workspace. When the required pycolmap 3.11.1 bindings are missing, it places their wheel in an isolated subdirectory of the active Conda environment.

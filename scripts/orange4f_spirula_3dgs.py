@@ -1,6 +1,6 @@
 """Train the native vanilla 3DGS baseline on the completed Orange4F Spirula model."""
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import fcntl
 import hashlib
 import json
@@ -39,7 +39,7 @@ def lock(directory):
 
 def link(source, target):
     source = source.resolve(strict=True)
-    if target.is_symlink() and target.resolve() == source:
+    if target.exists() and target.samefile(source):
         return
     target.symlink_to(source, target_is_directory=source.is_dir())
 
@@ -48,6 +48,13 @@ def prepare(args):
     source, run = args.source, args.run
     stage, model = run / "scene", run / "model"
     sparse = source / "sparse/0"
+    protocol_path = run / "protocol.json"
+    old = json.loads(protocol_path.read_text()) if protocol_path.exists() else None
+    method_file = source / "sparse/superglue_lidar.json"
+    learned = json.loads(method_file.read_text()) if method_file.is_file() else None
+    if learned and old and old["sfm_sha256"] != learned["binary_sha256"]:
+        sparse = source / "sparse_sift_backup/0"
+        learned = None
     staged_sparse = stage / "sparse/0"
     staged_sparse.mkdir(parents=True, exist_ok=True)
     link(source / "images", stage / "images")
@@ -72,8 +79,6 @@ def prepare(args):
 
     fingerprint = hashlib.sha256(json.dumps(sorted(names), ensure_ascii=False).encode()).hexdigest()
     saved_path = model / "keyframes.json"
-    protocol_path = run / "protocol.json"
-    old = json.loads(protocol_path.read_text()) if protocol_path.exists() else None
     if old and (old["sfm_sha256"] != hashes or old["source"] != str(source) or old["iterations"] != args.iterations):
         raise ValueError("SfM source or training schedule differs from this run; use a fresh --run")
     if not old and (model / "cfg_args").exists():
@@ -97,7 +102,9 @@ def prepare(args):
         raise ValueError("Training split differs from the existing run")
     selected = set(chosen)
     report = dict(source=str(source), images=str((stage/"images").resolve()), sfm_sha256=hashes,
-                  seed_points=points, pose_provenance="Spirula RGB SfM on all registered views; poses fixed",
+                  seed_points=points, pose_provenance=("SuperPoint + indoor SuperGlue, Spirula mapping, "
+                    "LiDAR-anchored bundle adjustment on all registered views; poses fixed in GS"
+                    if learned else "Spirula RGB SfM on all registered views; poses fixed"),
                   seed_provenance=str(sparse / "points3D.bin"), iterations=args.iterations, width=1600,
                   antialiasing=False, principal_point="Spirula pinhole", keyframe_selection=
                   old["keyframe_selection"] if old else str(selection), train=chosen,
@@ -158,7 +165,7 @@ def evaluate(args, step, videos):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--source", type=Path, default=SOURCE)
-    p.add_argument("--run", type=Path, default=RUN)
+    p.add_argument("--run", type=Path)
     p.add_argument("--keyframes", type=Path)
     p.add_argument("--gpu", default=os.environ.get("CUDA_VISIBLE_DEVICES", "0"))
     p.add_argument("--iterations", type=int, default=30000)
@@ -167,6 +174,9 @@ def main():
     mode.add_argument("--prepare-only", action="store_true")
     mode.add_argument("--evaluate-iteration", type=int)
     args = p.parse_args()
+    if args.run is None:
+        method_file = args.source.expanduser() / "sparse/superglue_lidar.json"
+        args.run = RUN.with_name("superglue_lidar_3dgs_stride3_w1600") if method_file.is_file() else RUN
     args.source, args.run = args.source.expanduser().resolve(), args.run.expanduser().resolve()
     if not args.gpu or "," in args.gpu or args.iterations < 1 or args.expected_frames < 4:
         p.error("Select a single GPU, a positive training length and at least four cameras")
@@ -177,7 +187,11 @@ def main():
         evaluate(args, args.evaluate_iteration, False)
         return
     with lock(args.run):
-        prepare(args)
+        with ExitStack() as stack:
+            if (args.source/"spirula-input.txt").is_file():
+                guard = stack.enter_context((args.source/".sparse-activation.lock").open("a"))
+                fcntl.flock(guard,fcntl.LOCK_SH)
+            prepare(args)
         if args.prepare_only:
             return
         model = args.run / "model"
