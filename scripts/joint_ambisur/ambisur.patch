@@ -1,0 +1,245 @@
+diff --git a/gaussian_renderer/__init__.py b/gaussian_renderer/__init__.py
+index ce87093..a11b4ec 100644
+--- a/gaussian_renderer/__init__.py
++++ b/gaussian_renderer/__init__.py
+@@ -172,6 +172,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
+     rendered_alpha = out_all_map[3:4, ]
+     rendered_distance = out_all_map[4:5, ]
+ 
++    # Upstream CUDA plane depth assumes a centered principal point. Recompute it
++    # from the differentiable accumulated plane coefficients on calibrated rays.
++    denom = -(rendered_normal.permute(1, 2, 0) * viewpoint_camera.get_rays()).sum(-1)
++    front = denom > 1.e-6
++    plane_depth = torch.where(front[None], rendered_distance / denom.clamp_min(1.e-6)[None], 0.)
++
+     rendered_unc = out_all_map[5:6, ] # / (out_all_map[5:6, ].max() + 1e-5)
+ 
+ 
+diff --git a/scene/gaussian_model.py b/scene/gaussian_model.py
+index db9c898..18b5341 100644
+--- a/scene/gaussian_model.py
++++ b/scene/gaussian_model.py
+@@ -20,7 +20,7 @@ from utils.sh_utils import RGB2SH
+ from simple_knn._C import distCUDA2
+ from utils.graphics_utils import BasicPointCloud
+ from utils.general_utils import strip_symmetric, build_scaling_rotation
+-from pytorch3d.transforms import quaternion_to_matrix
++
+ 
+ def dilate(bin_img, ksize=5):
+     pad = (ksize - 1) // 2
+@@ -158,7 +158,7 @@ class GaussianModel:
+         return normal_global
+     
+     def get_rotation_matrix(self):
+-        return quaternion_to_matrix(self.get_rotation)
++        return build_rotation(self.get_rotation)
+ 
+     def get_covariance(self, scaling_modifier = 1):
+         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
+diff --git a/train.py b/train.py
+index aa2daa4..0c2849c 100644
+--- a/train.py
++++ b/train.py
+@@ -19,7 +19,8 @@ from utils.loss_utils import l1_loss, ssim, lncc, get_img_grad_weight, DepthAnyt
+ from utils.graphics_utils import patch_offsets, patch_warp
+ from gaussian_renderer import render, network_gui, render_normal
+ import sys, time
+-from scene import Scene, GaussianModel
++from scene import GaussianModel
++from joint_runtime import JointScene as Scene, JointTraining
+ from utils.general_utils import safe_state
+ import cv2
+ import uuid
+@@ -107,18 +108,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+ 
+     first_iter = 0
+     
+-    if checkpoint:
+-        (model_params, first_iter) = torch.load(checkpoint)
+-        gaussians.restore(model_params, opt)
+-        app_model.load_weights(scene.model_path)
+-
+     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+ 
+     iter_start = torch.cuda.Event(enable_timing = True)
+     iter_end = torch.cuda.Event(enable_timing = True)
+ 
++    joint = JointTraining(scene, gaussians, pipe, background, opt)
+     viewpoint_stack = None
++    if checkpoint:
++        first_iter, viewpoint_stack = joint.resume(checkpoint)
+     ema_loss_for_log = 0.0
+     ema_single_view_for_log = 0.0
+     ema_multi_view_geo_for_log = 0.0
+@@ -251,47 +250,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+                     weights = torch.ones_like(pixel_noise)
+                     weights[~d_mask] = 0
+                 # d_mask_inv = (~d_mask).reshape(render_pkg['plane_depth'].shape)
+-                if iteration % 200 == 0:
+-                    gt_img_show = ((gt_image).permute(1,2,0).clamp(0,1)[:,:,[2,1,0]]*255).detach().cpu().numpy().astype(np.uint8)
+-                    if 'app_image' in render_pkg:
+-                        img_show = ((render_pkg['app_image']).permute(1,2,0).clamp(0,1)[:,:,[2,1,0]]*255).detach().cpu().numpy().astype(np.uint8)
+-                    else:
+-                        img_show = ((image).permute(1,2,0).clamp(0,1)[:,:,[2,1,0]]*255).detach().cpu().numpy().astype(np.uint8)
+-                    normal_show = (((normal+1.0)*0.5).permute(1,2,0)[:,:,[2,1,0]].clamp(0,1)*255).detach().cpu().numpy().astype(np.uint8)
+-                    depth_normal_show = (((depth_normal+1.0)*0.5).permute(1,2,0)[:,:,[2,1,0]].clamp(0,1)*255).detach().cpu().numpy().astype(np.uint8)
+-                    d_mask_show = (weights.float()*255).detach().cpu().numpy().astype(np.uint8).reshape(H,W)
+-                    d_mask_show_color = cv2.applyColorMap(d_mask_show, cv2.COLORMAP_JET)
+-                    depth = render_pkg['plane_depth'].squeeze().detach().cpu().numpy()
+-                    depth_i = (depth - depth.min()) / (depth.max() - depth.min() + 1e-20)
+-                    depth_i = depth_i + (1 - render_pkg["rendered_alpha"].squeeze().detach().cpu().numpy()) * depth_i.max()
+-                    depth_i = (depth_i * 255).clip(0, 255).astype(np.uint8)
+-                    depth_color = cv2.applyColorMap(depth_i, cv2.COLORMAP_JET)
+-                    distance = render_pkg['rendered_distance'].squeeze().detach().cpu().numpy()
+-                    distance_i = (distance - distance.min()) / (distance.max() - distance.min() + 1e-20)
+-                    distance_i = (distance_i * 255).clip(0, 255).astype(np.uint8)
+-                    distance_color = cv2.applyColorMap(distance_i, cv2.COLORMAP_JET)
+-                    # image_weight = image_weight.detach().cpu().numpy()
+-                    # image_weight = (image_weight * 255).clip(0, 255).astype(np.uint8)
+-                    # image_weight_color = cv2.applyColorMap(image_weight, cv2.COLORMAP_JET)
+-                    rendered_unc = (render_pkg["rendered_unc"] / render_pkg["rendered_unc"].max()).squeeze().detach().cpu().numpy()
+-                    rendered_unc = (rendered_unc * 255).clip(0, 255).astype(np.uint8)
+-                    rendered_unc_color = cv2.applyColorMap(rendered_unc, cv2.COLORMAP_JET)
+-                    row0 = np.concatenate([gt_img_show, img_show, normal_show, distance_color], axis=1)
+-                    row1 = np.concatenate([d_mask_show_color, depth_color, depth_normal_show, rendered_unc_color], axis=1)
+-                    image_to_show = np.concatenate([row0, row1], axis=0)
+-                    cv2.imwrite(os.path.join(debug_path, "%05d"%iteration + "_" + viewpoint_cam.image_name + ".jpg"), image_to_show)
+-
+                 if d_mask.sum() > 0:
+                     geo_loss = geo_weight * ((weights * pixel_noise)[d_mask]).mean()
+                     loss += geo_loss
+                     if use_virtul_cam is False:
+                         with torch.no_grad():
+-                            '''debug'''
+-                            if iteration % 200 == 0:
+-                                sample_num = 1e9
+-                                d_mask_real = d_mask.clone()
+-                                d_mask = torch.ones_like(d_mask)
+-
+                             ## sample mask
+                             d_mask = d_mask.reshape(-1)
+                             valid_indices = torch.arange(d_mask.shape[0], device=d_mask.device)[d_mask]
+@@ -341,21 +304,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+                         sampled_gray_val = sampled_gray_val.reshape(-1, total_patch_size)
+ 
+ 
+-                        '''debug'''
+-                        if iteration % 200 == 0:
+-                            import torchvision
+-                            outdir = os.path.join(scene.model_path, "pg_view")
+-                            os.makedirs(outdir, exist_ok=True)
+-                            
+-                            ref_gray_val[~d_mask_real[..., None].repeat(1, total_patch_size)] = 0
+-                            sampled_gray_val[~d_mask_real[..., None].repeat(1, total_patch_size)] = 0
+-                            
+-                            torchvision.utils.save_image(ref_gray_val.reshape(viewpoint_cam.image_height, viewpoint_cam.image_width, total_patch_size)[..., -1], fp = os.path.join(scene.model_path, "pg_view", f"iter{iteration:06d}_ref.jpg"))
+-                            torchvision.utils.save_image(sampled_gray_val.reshape(viewpoint_cam.image_height, viewpoint_cam.image_width, total_patch_size)[..., -1], fp = os.path.join(scene.model_path, "pg_view", f"iter{iteration:06d}_sample.jpg"))
+-                            # torchvision.utils.save_image(nearest_image_gray, fp = os.path.join(voxel_model.model_path, "pg_view", f"iter{iteration:06d}_image_nearest.jpg"))
+-                            # torchvision.utils.save_image(gt_image_gray, fp = os.path.join(voxel_model.model_path, "pg_view", f"iter{iteration:06d}_image_gt.jpg"))
+-
+-
+                         ## compute loss
+                         ncc, ncc_mask = lncc(ref_gray_val, sampled_gray_val)
+                         mask = ncc_mask.reshape(-1)
+@@ -369,16 +317,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+         # Depth loss
+         if iteration > 1000:
+             if not opt.use_mono:
+-                metric_depth = viewpoint_cam.depth_dict["depth"].detach().squeeze()
+-                metric_depth = torch.nn.functional.interpolate(metric_depth[None, None], size=render_pkg["plane_depth"].shape[-2:], mode='bilinear', align_corners=True).squeeze()
+-                if "conf" in viewpoint_cam.depth_dict:
+-                    metric_depth_conf = torch.nn.functional.interpolate(viewpoint_cam.depth_dict["conf"][None, None].cuda(), size=render_pkg["plane_depth"].shape[-2:], mode='bilinear', align_corners=True).squeeze()
+-                    conf_thresh = torch.quantile(metric_depth_conf.flatten(), opt.unc_conf_thresh_ratio)
+-                else:
+-                    metric_depth_conf = 1
+-                    conf_thresh = -1
+-                d_l1 = (metric_depth - render_pkg["plane_depth"].squeeze()).abs() * (metric_depth_conf >= conf_thresh)
+-                loss += opt.depth_weight * d_l1.mean() / scene.cameras_extent
++                metric_depth, trusted = viewpoint_cam.prior()
++                metric_depth_conf, conf_thresh = trusted, True
++                residual = (metric_depth - render_pkg["plane_depth"].squeeze()).abs()
++                loss += opt.depth_weight * torch.where(trusted, residual, 0.).sum() / trusted.sum().clamp_min(1) / scene.cameras_extent
+             else:
+                 loss += opt.depth_weight * depthanythingv2_loss(viewpoint_cam, render_pkg, iteration)
+                 mono_depth = viewpoint_cam.depthanythingv2.cuda().squeeze()
+@@ -402,22 +344,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+                 unc_diff = 1 - (normal_from_metric_depth * render_pkg["depth_normal"]).sum(0)
+                 loss_unc = opt.unc_weight * mult * (unc_diff * render_pkg["rendered_unc"].detach() * (metric_depth_conf >= conf_thresh)).mean()
+ 
+-                gaussians._xyz[~unc_mask].requires_grad_ = False
+-                gaussians._opacity[~unc_mask].requires_grad_ = False
+-                gaussians._scaling.requires_grad_ = False
+-                gaussians._rotation.requires_grad_ = False
+-
+-                loss_unc.backward(retain_graph=True)
+-                render_pkg["viewspace_points"].grad *= 0
+-                render_pkg["viewspace_points_abs"].grad *= 0
+-                viewspace_point_tensor.grad *= 0
+-
+-                gaussians._xyz[~unc_mask].requires_grad_ = True
+-                gaussians._opacity[~unc_mask].requires_grad_ = True
+-                gaussians._scaling.requires_grad_ = True
+-                gaussians._rotation.requires_grad_ = True
+-
+-
++                # Restrict this auxiliary backward pass to the intended parameters.
++                params = (gaussians._xyz, gaussians._opacity)
++                grads = torch.autograd.grad(loss_unc, params, retain_graph=True)
++                for param, grad in zip(params, grads):
++                    param.grad = grad.detach() * unc_mask.reshape(-1, 1)
++                for key in ("viewspace_points", "viewspace_points_abs"):
++                    point = render_pkg[key]
++                    if point.grad is not None:
++                        point.grad.zero_()
++
++        loss += joint.loss(iteration, viewpoint_cam, render_pkg, gt_image)
+         loss.backward()
+         iter_end.record()
+ 
+@@ -440,12 +377,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+             if iteration == opt.iterations:
+                 progress_bar.close()
+ 
+-            # Log and save
+-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), app_model)
+-            if (iteration in saving_iterations):
+-                print("\n[ITER {}] Saving Gaussians".format(iteration))
+-                scene.save(iteration)
+-                    
+             # Densification
+             if iteration < opt.densify_until_iter:
+                 # Keep track of max radii in image-space for pruning
+@@ -464,7 +395,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+             if opt.use_multi_view_trim and iteration % 1000 == 0 and iteration < opt.densify_until_iter:
+                 observe_the = 2
+                 observe_cnt = torch.zeros_like(gaussians.get_opacity)
+-                for view in scene.getTrainCameras():
++                for view in tqdm(scene.getTrainCameras(), desc="Fitting-view opacity trim", leave=False):
+                     render_pkg_tmp = render(view, gaussians, pipe, bg, app_model=app_model, return_plane=False, return_depth_normal=False)
+                     out_observe = render_pkg_tmp["out_observe"]
+                     observe_cnt[out_observe > 0] += 1
+@@ -477,19 +408,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                     gaussians.reset_opacity()
+ 
+-            # Optimizer step
+-            if iteration < opt.iterations:
+-                gaussians.optimizer.step()
+-                app_model.optimizer.step()
+-                gaussians.optimizer.zero_grad(set_to_none = True)
+-                app_model.optimizer.zero_grad(set_to_none = True)
+-
+-            if (iteration in checkpoint_iterations):
+-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
+-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+-                app_model.save_weights(scene.model_path, iteration)
++            gaussians.optimizer.step()
++            gaussians.optimizer.zero_grad(set_to_none=True)
++            joint.after_step(iteration, viewpoint_stack)
+ 
+-    app_model.save_weights(scene.model_path, opt.iterations)
+     torch.cuda.empty_cache()
+ 
+ def prepare_output_and_logger(args, opt):    
