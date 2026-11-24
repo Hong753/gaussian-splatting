@@ -211,6 +211,15 @@ run with its flat `frames/` renders. These are view-dependent RGB results
 using additional stored source images and depths. Mesh quality requires
 separate evaluation.
 
+To inspect a failed transfer, run `python -u -m scripts.orange4f_photo_detail --inspect-warps`.
+For each held-out preview, this writes a full-resolution GT / baseline / single
+reprojected training photo comparison for each candidate source. Gray marks
+unsupported pixels. The separate PNG records the valid pixels. Each source
+and the baseline are scored on the same valid pixels, also reported for
+reference edges with luminance gradient of at least 16 levels per pixel.
+The GT is used only after the warps are computed. The command uses the CPU
+and the same snapshot inputs as the preview comparison.
+
 To continue training an earlier run from its 7k snapshot, set `RUN` to the
 original run directory and launch the updated trainer:
 

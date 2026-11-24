@@ -79,6 +79,18 @@ def test_fixed_pose_two_held_out_targets(tmp_path):
         predictions[name] = render
         # Replace held-out RGB and rerender with the same sources and baseline.
         Image.fromarray(np.zeros_like(base)).save(images/name)
+    photo.run(SimpleNamespace(run=tmp_path, all_held_out=False, inspect_warps=True))
+    diagnostics = tmp_path/"photo_warps_preview_7000"
+    audited = json.loads((diagnostics/"results.json").read_text())
+    for target in audited["frames"]:
+        assert len(target["warps"]) == 4
+        for warp in target["warps"]:
+            assert warp["source"] in {r["name"] for r in rows[:4]}
+            assert 0 < warp["valid_pixels"] < w*h
+            # The target photograph was made black above. It has zero edges.
+            assert warp["valid_edge_pixels"] == 0 and warp["valid_edge_warp_psnr"] is None
+            mask = np.asarray(Image.open(diagnostics/warp["validity_mask"]))
+            assert mask.sum() == warp["valid_pixels"]
     result.rename(tmp_path/"first")
     photo.run(args)
     frames = tmp_path/"frames"

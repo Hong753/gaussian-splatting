@@ -140,6 +140,29 @@ def detail_rmse(image, target_detail):
     return float(np.sqrt(np.mean(difference**2)))
 
 
+def inspect_sources(directory, stem, actual, base, sources, warps):
+    # The per-source mask tests its own depth/visibility only. Inter-source
+    # agreement and similarity to the baseline would hide misregistered edges.
+    luminance = actual @ np.array([.299, .587, .114], np.float32)
+    gy, gx = np.gradient(luminance)
+    edges = np.hypot(gx, gy) >= 16  # RGB on a 0–255 scale, at staged resolution
+    reports = []
+    for index, (name, (_, visible, color, _)) in enumerate(zip(sources, warps, strict=True), 1):
+        panel = f"{stem}_source_{index}_gt_baseline_warp.jpg"
+        shown = np.where(visible[..., None], color, np.uint8(128))
+        Image.fromarray(np.concatenate([actual, base, shown], axis=1)).save(directory / panel, quality=95)
+        mask_file = f"{stem}_source_{index}_valid.png"
+        Image.fromarray(visible).save(directory / mask_file)
+        report = dict(source=name, comparison=panel, validity_mask=mask_file,
+                      valid_fraction=float(visible.mean()), target_edge_pixels=int(edges.sum()))
+        for label, mask in (("valid", visible), ("valid_edge", edges & visible)):
+            report[label + "_pixels"] = int(mask.sum())
+            for method, rgb in (("baseline", base), ("warp", color)):
+                report[label + "_" + method + "_psnr"] = score(actual[mask], rgb[mask]) if mask.any() else None
+        reports.append(report)
+    return reports
+
+
 def run(args):
     run_dir = args.run.resolve()
     manifest = json.loads((run_dir / "split_manifest.json").read_text())
@@ -169,7 +192,9 @@ def run(args):
     _, poses = read_colmap_scene(Path(splits["colmap_model"]))
     cameras = {f.name: camera(rows[f.name], f) for f in poses.values() if f.name in rows}
     train = [name for name, row in rows.items() if row["split"] == "train"]
-    output = run_dir / f"photo_detail_{cohort}_{iteration}"
+    inspect = getattr(args, "inspect_warps", False)
+    method = "photo_warps" if inspect else "photo_detail"
+    output = run_dir / f"{method}_{cohort}_{iteration}"
     if (output / "results.json").is_file():
         print(f"Existing comparison: {output / 'results.json'}")
         return
@@ -191,12 +216,19 @@ def run(args):
             base = read_rgb(baseline_path)
             if base.shape != (target.height, target.width, 3):
                 raise ValueError(f"Baseline RGB size differs from target camera for {name}")
-            photo, supported = transfer(base, warps)
-            # The target photograph first enters here, after the candidate has been rendered.
+            if not inspect:
+                photo, supported = transfer(base, warps)
+            # The target photograph first enters here, after reprojection and synthesis.
             actual = read_rgb(run_dir / "images" / rows[name]["staged_name"])
             if actual.shape != base.shape:
                 raise ValueError(f"Reference RGB size differs from prediction for {name}")
             stem = Path(names[name]).stem
+            if inspect:
+                measurements = inspect_sources(stage, stem, actual, base, sources, warps)
+                results.append(dict(frame=name, warps=measurements))
+                for measurement in measurements:
+                    print(name, json.dumps(measurement), flush=True)
+                continue
             panel = stem + "_gt_baseline_photo.jpg"
             Image.fromarray(np.concatenate([actual, base, photo], axis=1)).save(stage / panel, quality=95)
             Image.fromarray(photo).save(stage / (stem + "_render.png"))
@@ -208,18 +240,23 @@ def run(args):
                        photo_psnr=score(actual, photo), coverage=float(supported.mean()), comparison=panel)
             results.append(row)
             print(json.dumps(row), flush=True)
-        report = dict(iteration=iteration, cohort=cohort, frames=results,
-                      baseline_psnr=float(np.mean([r["baseline_psnr"] for r in results])),
-                      photo_psnr=float(np.mean([r["photo_psnr"] for r in results])))
+        report = dict(iteration=iteration, cohort=cohort, frames=results)
+        if not inspect:
+            report.update(baseline_psnr=float(np.mean([r["baseline_psnr"] for r in results])),
+                          photo_psnr=float(np.mean([r["photo_psnr"] for r in results])))
         (stage / "results.json").write_text(json.dumps(report, indent=2) + "\n")
         stage.rename(output)
-    print(f"Mean per-view PSNR {report['baseline_psnr']:.3f} -> {report['photo_psnr']:.3f} dB")
+    if not inspect:
+        print(f"Mean per-view PSNR {report['baseline_psnr']:.3f} -> {report['photo_psnr']:.3f} dB")
     print(output)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", type=Path, default=DEFAULT_RUN)
-    parser.add_argument("--all-held-out", action="store_true",
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--inspect-warps", action="store_true",
+                      help="Show each training-photo warp on the latest held-out previews before detail transfer")
+    mode.add_argument("--all-held-out", action="store_true",
                         help="Compare all held-out frames after the run finishes rendering")
     run(parser.parse_args())
