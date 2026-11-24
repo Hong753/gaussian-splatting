@@ -60,6 +60,12 @@ def mapper_component(source, index, old):
                      f"{work}/map.*/. See {work}/mapper.log for mapping progress.")
 
 
+def native_matcher(source):
+    method = source / "spirula-method.txt"
+    name = method.read_text().strip() if method.is_file() else None
+    return name if name in ("flexglue", "loma-b") else None
+
+
 def prepare(args):
     source, run = args.source, args.run
     stage, model = run / "scene", run / "model"
@@ -67,6 +73,9 @@ def prepare(args):
     protocol_path = run / "protocol.json"
     old = json.loads(protocol_path.read_text()) if protocol_path.exists() else None
     raw = args.mapper_model is not None
+    native = native_matcher(source)
+    if args.native and args.native != native:
+        raise ValueError(f"Expected the native {args.native} scene at {source}. Run orange4f_spirula_sfm.sh --{args.native} first.")
     method_file = source / "sparse/superglue_lidar.json"
     learned = not raw and method_file.is_file()
     if raw:
@@ -106,8 +115,9 @@ def prepare(args):
         hashes[name] = digest(sparse / name)
     records = read_colmap_records(stage)
     names = sorted(records, key=natural_key)
-    capture_names = sorted(registered_names(source), key=natural_key) if raw else names
-    if raw and not set(names).issubset(capture_names):
+    capture = Path((source / "spirula-input.txt").read_text().strip()).parent if native else source
+    capture_names = sorted(registered_names(capture), key=natural_key) if raw or native else names
+    if (raw or native) and not set(names).issubset(capture_names):
         raise ValueError(f"Unexpected registered image names in {sparse}")
     if len(capture_names) != args.expected_frames:
         raise ValueError(f"Expected {args.expected_frames} registered images, got {len(capture_names)} from {source}")
@@ -132,7 +142,7 @@ def prepare(args):
         selection = next((p for p in PRIOR_SPLITS if p.is_file() and
                           json.loads(p.read_text()).get("registered_names_sha256") == fingerprint), None)
     if selection is None:
-        selection = (select_keyframes(source, "images", run / "capture_split", 3, False)
+        selection = (select_keyframes(capture, "images", run / "capture_split", 3, False)
                      if len(names) < len(capture_names) else select_keyframes(stage, "images", model, 3, False))
     manifest = json.loads(selection.read_text())
     chosen = manifest["selected_images"]
@@ -154,6 +164,9 @@ def prepare(args):
     provenance = "Spirula RGB SfM on all registered views; poses fixed"
     if raw:
         provenance = "SuperPoint + indoor SuperGlue, Spirula mapper poses before LiDAR BA; poses fixed in GS"
+    elif native:
+        frontend = "ALIKED-N16ROT + FlexGlue" if native == "flexglue" else "LoMa-B detector/descriptor and matcher"
+        provenance = f"Spirula v2026.11.12 native {frontend}, flat mapper, RGB-only; poses fixed in GS"
     elif learned:
         provenance = "SuperPoint + indoor SuperGlue, Spirula mapping, LiDAR-anchored bundle adjustment on all registered views; poses fixed in GS"
     report = dict(source=str(source), images=str((stage/"images").resolve()), sfm_sha256=hashes,
@@ -167,7 +180,9 @@ def prepare(args):
     if not old:
         report["revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
         if raw:
-            report.update(mapper_model=str(sparse), unregistered=unregistered, capture_frames=len(capture_names))
+            report["mapper_model"] = str(sparse)
+        if raw or native:
+            report.update(unregistered=unregistered, capture_frames=len(capture_names))
         if unregistered:
             atomic_json(run / "capture_split/keyframes.json", manifest)
             manifest = {**manifest, "selection_capture": str(selection), "selected_images": chosen,
@@ -226,8 +241,12 @@ def evaluate(args, step, videos):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--source", type=Path, default=SOURCE)
-    p.add_argument("--mapper-model", type=int, help="Train from this numbered SuperGlue mapper component before LiDAR BA")
+    p.add_argument("--source", type=Path)
+    backend = p.add_mutually_exclusive_group()
+    for name in ("flexglue", "loma-b"):
+        backend.add_argument("--" + name, dest="native", action="store_const", const=name,
+                             help=f"Test native {name} model 0")
+    backend.add_argument("--mapper-model", type=int, help="Train from this numbered SuperGlue mapper component before LiDAR BA")
     p.add_argument("--run", type=Path)
     p.add_argument("--keyframes", type=Path)
     p.add_argument("--gpu", default=os.environ.get("CUDA_VISIBLE_DEVICES", "0"))
@@ -237,6 +256,11 @@ def main():
     mode.add_argument("--prepare-only", action="store_true")
     mode.add_argument("--evaluate-iteration", type=int)
     args = p.parse_args()
+    if args.source is None:
+        args.source = SOURCE.with_name(f"spirula_sfm_{args.native}_w1600") if args.native else SOURCE
+    native = args.native or native_matcher(args.source.expanduser())
+    if args.run is None and native:
+        args.run = RUN.with_name(f"{native}_3dgs_stride3_w1600")
     if args.mapper_model is not None and args.mapper_model < 0:
         p.error("--mapper-model must be a nonnegative component number")
     if args.run is None and args.mapper_model is not None:

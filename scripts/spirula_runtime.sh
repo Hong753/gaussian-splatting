@@ -1,5 +1,6 @@
 # Shared by the Orange4F SfM launchers. Sets the spirula command array.
-bin=${SPIRULA_BIN:-$(command -v spirula || true)}
+bin=${SPIRULA_BIN:-}
+if [[ -z "$bin" && ${spirula_use_pinned_release:-0} != 1 ]]; then bin=$(command -v spirula || true); fi
 if [[ -z "$bin" ]]; then
     version=2026.11.12
     cache="${XDG_CACHE_HOME:-$HOME/.cache}/orange4f/spirula-$version"

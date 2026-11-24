@@ -16,6 +16,26 @@ This estimates fresh extrinsics and pinhole intrinsics from the full image seque
 
 Set `SPIRULA_DEVICE` to a Vulkan device selector on a shared host. The default is `auto`. The launcher uses `SPIRULA_BIN`, then searches PATH, then installs the checksum-verified official Linux x86-64 binary in the user cache. The launcher probes the executable and reuses working system or Vulkan-only setups. On older hosts (including glibc 2.35), it downloads checksum-pinned Ubuntu 24.04 libraries and starts Spirula through their matching dynamic linker. This runtime lives in the user cache. The host supplies the Vulkan GPU driver. The Vulkan device listing in `sfm.log` shows which GPU the installed driver exposes. Rerun the same command to reuse native SfM caches after an interruption. Optional positional arguments are the source and output scene roots.
 
+## Native FlexGlue and LoMa-B SfM on Orange4F
+
+```bash
+conda activate 3dgs &&
+cd ~/gaussian-splatting-orange4f &&
+SPIRULA_DEVICE=0 bash scripts/orange4f_spirula_sfm.sh --flexglue
+```
+
+The pinned Linux v2026.11.12 binary detects up to 2,048 ALIKED-N16ROT keypoints per image at a 1,600 px long-edge limit, matches with native FlexGlue, and estimates pinhole cameras with its flat incremental mapper. Full-sequence RGB, video/high settings and disabled sensor pose constraints follow the native SIFT run. On first use the binary presents the FlexGlue weight terms in the terminal and fetches the weights. The Vulkan index refers to Spirula’s device list. The model is `spirula_sfm_flexglue_w1600/sparse/0` under the Orange4F output root; see `sfm.log` there for the registered camera count, reprojection error, effective options and timing. A retry reuses the separate FlexGlue workspace.
+
+For the same 1,600 px vanilla 3DGS test, run:
+
+```bash
+conda activate 3dgs &&
+cd ~/gaussian-splatting-orange4f &&
+CUDA_VISIBLE_DEVICES=0 python -u -m scripts.orange4f_spirula_3dgs --flexglue
+```
+
+The output is `flexglue_3dgs_stride3_w1600`, including `model/debug_previews/index.html` and `evaluation/iteration_30000/psnr.json`. A partial model uses the original split intersected with its registered images. Its protocol lists the missing images. The final eval includes both trajectory videos and the GT/render gallery. SfM uses images also held out of Gaussian training.
+
 ## Train vanilla Graphdeco 3DGS using the completed Spirula poses
 
 ```bash
@@ -29,6 +49,8 @@ CUDA_VISIBLE_DEVICES=0 python -u -m scripts.orange4f_spirula_3dgs
 This uses the fork's native 3DGS trainer with SH degree 3, Adam, standard densification, default RGB loss and AA off. The camera adapter passes Spirula's focal lengths and principal points to the rasterizer. The run links the original photos and three new SfM binaries into its own scene directory. It initializes Gaussians from all Spirula XYZ/RGB points in this reconstruction's coordinates. Each of the 5,009 RGBs participated in SfM. Gaussian optimization uses the 1,670 sharp stride-3 keyframes, and the other 3,339 supply the held-out image scores. The previous split is reused when its registered name list matches. Otherwise the sharpest frame in each successive group of three is selected. Training, previews and scoring use 1,600-pixel width.
 
 The output root is `/data/3dgs_outputs/orange4f/3dgs_finetuning/spirula_3dgs_stride3_w1600`. Open `model/debug_previews/index.html` for fixed train and held-out views at step 1, every 500 steps and step 30,000. Direct file viewing and HTTP viewing are supported. `protocol.json` records the split, source fingerprints and seed count. `model/point_cloud/iteration_7000` and `iteration_30000` contain the Gaussian PLYs. The final `evaluation/iteration_30000/` contains `psnr.json`, a gallery at `index.html`, per-frame GT/render comparisons, and `videos/recorded.mp4`, `videos/gt_render.mp4` and `videos/random/render.mp4`. PSNR is per-channel, averaged over channels and then images. The random path uses a centered virtual camera, seed 42 and smooth offsets from the recovered trajectory. It has no reference RGB.
+
+For LoMa-B, use `--loma-b` in both the native SfM and 3DGS commands above. The SfM launcher selects `--features loma-b --matcher loma-b`. Both learned runs use the same 2,048 keypoint cap, high/video preset, 1,600 px detector limit and flat mapper. Their detector descriptors can yield different pair shortlists. LoMa writes to `spirula_sfm_loma-b_w1600/sparse/0` and its 3DGS output goes to `loma-b_3dgs_stride3_w1600`.
 
 To train from SuperGlue mapper model 0 before LiDAR bundle adjustment finishes, run:
 
