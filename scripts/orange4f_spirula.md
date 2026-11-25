@@ -177,3 +177,17 @@ SuperPoint extracts up to 2,048 features at a maximum image side of 1,600 px. Th
 The candidate is reopened and checked for registration of the full input set before exchanging `spirula_sfm_rgb_w1600/sparse/` with the complete new model. The old folder is retained at `spirula_sfm_rgb_w1600/sparse_sift_backup/`. Existing Gaussian training scene links are pinned to the old files before the switch. Interrupted runs reuse the feature and verified match caches in `spirula_sfm_rgb_w1600/superpoint_superglue_lidar/`. Look at `learned.log`, `mapper.log`, and `lidar-ba.log` there. The exact input fingerprints, final statistics, and solver report are in `sparse/superglue_lidar.json`. A new invocation of the vanilla 3DGS launcher picks a separate output directory for the learned/LiDAR model.
 
 The launcher reuses the pinned SuperGlue repository when already cached, otherwise it downloads the models into the SfM workspace. When the required pycolmap 3.11.1 bindings are missing, it places their wheel in an isolated subdirectory of the active Conda environment.
+
+## Train on 240 keyframes with both camera solutions
+
+```bash
+conda activate 3dgs &&
+cd ~/gaussian-splatting-orange4f &&
+CUDA_VISIBLE_DEVICES=0 python -u -m scripts.orange4f_keyframe_trial --arm both
+```
+
+The launcher prints the selected stride-3 reference run and output directory. It defaults to the most recently prepared eligible Spirula 3DGS split. To pin a specific existing run, pass its directory with `--baseline`. If only the full SfM workspace exists, the launcher prepares the reference split first. The 240 images are evenly spaced ranks in the naturally ordered, registered stride-3 sharp keyframes, including the first and last. Full coverage gives 240 train and 4,769 held-out frames.
+
+The `fixed` run reuses the reference cameras and sparse point cloud, including the original SfM image support. The `remap` run maps only symlinks to the same 240 RGB images, then freezes the resulting cameras and landmarks. It uses the reference's native LoMa-B or FlexGlue frontend when available and otherwise defaults to LoMa-B. Override with `--matcher flexglue` or `--matcher loma-b`. Other frames get an independent PnP pose using their supplied pinhole intrinsics and forward/backward optical flow from up to four nearby mapped keyframes. Only keyframe observations appear in the fit point cloud. The remap changes both camera calibration and point initialization. Its `localization.json` lists any missing frames and its SQLite file records the per-query evidence. Either arm can run independently with `--arm fixed` or `--arm remap`.
+
+Each arm writes `model/debug_previews/index.html` during training. After the 7k snapshot becomes ready, the same launcher with the corresponding `--arm` and `--evaluate-iteration 7000` scores it in a second process. Final galleries, PSNR and recorded, comparison and seeded random videos are under each arm's `evaluation/iteration_30000/`. Recorded videos include the posed frames in capture order. The paired report `paired_psnr_30000.json` compares identical image names, records the coverage denominator, and includes the stride-3 score on the same original held-out frames when that baseline evaluation is available.

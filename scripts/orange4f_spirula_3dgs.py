@@ -239,6 +239,21 @@ def evaluate(args, step, videos):
                     destination.rename(video/"random")
 
 
+def train_prepared(args):
+    model = args.run / "model"
+    done = args.run / "trained.json"
+    if not done.is_file():
+        steps = sorted({min(7000, args.iterations), args.iterations})
+        checkpoints = [step for step in steps if (model/f"chkpnt{step}.pth").is_file()]
+        resume = ["--start_checkpoint", model/f"chkpnt{max(checkpoints)}.pth"] if checkpoints else []
+        invoke(REPO, args.run, "train", ["train.py", "-s", args.run/"scene", "-m", model,
+               "--keyframe_manifest", model/"keyframes.json", "-r", 1600, "--data_device", "cpu",
+               "--colmap_principal_point", "--disable_viewer", "--iterations", args.iterations,
+               "--checkpoint_iterations", *steps, "--save_iterations", *steps, *resume])
+        atomic_json(done, dict(iteration=args.iterations))
+    evaluate(args, args.iterations, True)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--source", type=Path)
@@ -285,18 +300,7 @@ def main():
             prepare(args)
         if args.prepare_only:
             return
-        model = args.run / "model"
-        done = args.run / "trained.json"
-        if not done.is_file():
-            steps = sorted({min(7000, args.iterations), args.iterations})
-            checkpoints = [step for step in steps if (model/f"chkpnt{step}.pth").is_file()]
-            resume = ["--start_checkpoint", model/f"chkpnt{max(checkpoints)}.pth"] if checkpoints else []
-            invoke(REPO, args.run, "train", ["train.py", "-s", args.run/"scene", "-m", model,
-                   "--keyframe_manifest", model/"keyframes.json", "-r", 1600, "--data_device", "cpu",
-                   "--colmap_principal_point", "--disable_viewer", "--iterations", args.iterations,
-                   "--checkpoint_iterations", *steps, "--save_iterations", *steps, *resume])
-            atomic_json(done, dict(iteration=args.iterations))
-        evaluate(args, args.iterations, True)
+        train_prepared(args)
 
 
 if __name__ == "__main__":
