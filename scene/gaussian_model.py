@@ -654,7 +654,7 @@ class GaussianModel:
         else:
             self.max_radii2D = torch.cat((self.max_radii2D, new_max_radii))
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, preserve_radii=False):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, preserve_radii=False,\n                         forced_mask=None, scale_policy=None):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -663,11 +663,27 @@ class GaussianModel:
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
-        stds = self.get_scaling[selected_pts_mask].repeat(N,1)
-        means =torch.zeros((stds.size(0), 3),device="cuda")
-        samples = torch.normal(mean=means, std=stds)
-        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
-        offsets = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1)
+        if forced_mask is not None:
+            # The original rows remain first after cloning.
+            selected_pts_mask[:len(forced_mask)] |= forced_mask
+        longest_axis = scale_policy is not None and scale_policy['native_longest_axis_split']
+        if longest_axis:
+            if N != 2 or self.surface_refs is not None:
+                raise ValueError('Longest-axis split requires two children and native unconstrained geometry')
+            from utils.native_scale_control import longest_axis_children
+            offsets, new_scaling, new_opacity = longest_axis_children(
+                self._scaling[selected_pts_mask],
+                build_rotation(self._rotation[selected_pts_mask]),
+                self._opacity[selected_pts_mask],
+                scale_policy['native_split_offset_fraction'])
+        else:
+            stds = self.get_scaling[selected_pts_mask].repeat(N,1)
+            means = torch.zeros((stds.size(0), 3),device="cuda")
+            samples = torch.normal(mean=means, std=stds)
+            rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
+            offsets = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1)
+            new_scaling = self.scaling_inverse_activation(stds / (0.8*N))
+            new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_surface_refs = None
         if self.surface_refs is not None:
             new_surface_refs = {k: v[selected_pts_mask].repeat((N,) + (1,) * (v.ndim - 1)) for k, v in self.surface_refs.items()}
@@ -686,7 +702,6 @@ class GaussianModel:
             normal_component = (delta * new_surface_refs["normal"]).sum(dim=1, keepdim=True) * new_surface_refs["normal"]
             inside = (delta - normal_component).norm(dim=1) <= new_surface_refs["support"]
             new_surface_refs["confidence"] = new_surface_refs["confidence"] * inside
-        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
         if new_surface_refs is not None:
             # Keep normal thickness on split; shrink only tangential scales.
             trusted = new_surface_refs["confidence"] > 0
@@ -694,7 +709,6 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
-        new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
 
         # Split children have new positions/covariances: measure their projected
@@ -729,7 +743,7 @@ class GaussianModel:
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, max_grad_abs=None,
                          record_stats=False, prune=True, max_world_size=None, preserve_radii=False,
-                         protect_nonempty=False):
+                         protect_nonempty=False, scale_policy=None):
         if self.surface_mode == 'view_tangent':
             if not prune:
                 raise ValueError('Disabling pruning is currently supported only for native densification')
@@ -749,12 +763,21 @@ class GaussianModel:
             stats = growth_window_stats(self.get_scaling, clone_grads, split_grads, self.max_radii2D,
                                         extent, self.percent_dense, max_grad, split_threshold)
             stats['points_before'] = len(self._xyz)
+        forced = None
+        if scale_policy is not None and scale_policy['native_forced_split_sigma'] > 0:
+            from utils.native_scale_control import forced_mask
+            forced, extra_stats = forced_mask(self._scaling, self.get_opacity, self.denom,
+                clone_grads, split_grads, max_grad, split_threshold, self.percent_dense*extent,
+                scale_policy)
+            if record_stats:
+                stats.update(extra_stats)
         self.tmp_radii = radii
         if not self.freeze_lidar_positions:
             self.densify_and_clone(clone_grads, max_grad, extent, preserve_radii=preserve_radii)
         if record_stats: after_clone = len(self._xyz)
         if not self.freeze_lidar_positions:
-            self.densify_and_split(split_grads, split_threshold, extent, preserve_radii=preserve_radii)
+            self.densify_and_split(split_grads, split_threshold, extent, preserve_radii=preserve_radii,
+                                   forced_mask=forced, scale_policy=scale_policy)
         if record_stats: after_split = len(self._xyz)
 
         if self.freeze_lidar_positions and not preserve_radii:
