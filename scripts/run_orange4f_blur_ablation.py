@@ -116,13 +116,35 @@ def validate_source(reference, cfg, extent):
         raise ValueError('Current COLMAP camera set does not match all 5009 saved reference views')
     for name, record in records.items():
         camera = saved[name]
-        R = np.asarray(record['R'])
-        C = -R @ np.asarray(record['T'])
-        if not (np.allclose(camera['rotation'], R, rtol=1e-6, atol=1e-5)
-                and np.allclose(camera['position'], C, rtol=1e-6, atol=1e-5)
-                and all(np.isclose(camera[k],record[k],rtol=1e-6,atol=1e-4)
-                        for k in ('width','height','fx','fy','cx','cy'))):
-            raise ValueError(f'Saved and current camera differ: {name}')
+        # Match camera_to_JSON exactly: it inverts the homogeneous
+        # world-to-camera matrix, rather than assuming R is orthonormal.
+        # COLMAP files exported from LiDAR may contain rounded quaternions.
+        world_to_camera = np.eye(4, dtype=np.float64)
+        world_to_camera[:3, :3] = np.asarray(record['R'], dtype=np.float64).T
+        world_to_camera[:3, 3] = np.asarray(record['T'], dtype=np.float64)
+        camera_to_world = np.linalg.inv(world_to_camera)
+        expected = dict(rotation=camera_to_world[:3, :3],
+                        position=camera_to_world[:3, 3],
+                        width=record['width'], height=record['height'],
+                        fx=record['width']/(2*math.tan(record['fov_x']/2)),
+                        fy=record['height']/(2*math.tan(record['fov_y']/2)),
+                        cx=record['width']*(record['cx']/record['width']),
+                        cy=record['height']*(record['cy']/record['height']))
+        differences = {}
+        for key, value in expected.items():
+            if key not in camera:
+                differences[key] = {'error': 'missing from saved camera'}
+                continue
+            actual = np.asarray(camera[key], dtype=np.float64)
+            value = np.asarray(value, dtype=np.float64)
+            atol = 1e-5 if key in ('rotation','position') else 1e-4
+            if actual.shape != value.shape or not np.allclose(actual, value, rtol=1e-6, atol=atol):
+                differences[key] = dict(saved=actual.tolist(), current=value.tolist())
+                if actual.shape == value.shape:
+                    differences[key]['max_abs_difference'] = float(np.max(np.abs(actual-value)))
+        if differences:
+            raise ValueError(f'Saved and current camera differ: {name}\\n'
+                             + json.dumps(differences, indent=2))
         if not Path(record['image_path']).is_file():
             raise FileNotFoundError(record['image_path'])
     current_extent = training_extent(records, set(records))
