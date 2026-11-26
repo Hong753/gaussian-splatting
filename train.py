@@ -46,6 +46,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         raise ValueError('Published snapshots require matching PLY and optimizer checkpoint iterations')
     from utils.fixed_lidar import configure_training, project_scales, audit as audit_fixed_lidar
     configure_training(opt, dataset)
+    from utils.native_scale_control import options as native_scale_options, scale_loss as native_scale_loss
+    native_scale_policy = native_scale_options(opt)
     pose_policy=None
     if getattr(opt,'pose_refinement',''):
         import json
@@ -421,6 +423,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss = loss + surface_loss
             if tb_writer and iteration % 100 == 0:
                 tb_writer.add_scalar('train_loss_patches/surface_loss', surface_loss.item(), iteration)
+        if native_scale_policy['native_scale_loss_weight'] > 0:
+            resolution_loss = native_scale_loss(gaussians._scaling,
+                                                native_scale_policy['native_scale_soft_sigma'])
+            loss = loss + native_scale_policy['native_scale_loss_weight'] * resolution_loss
+            if tb_writer and (iteration == 1 or iteration % 100 == 0):
+                tb_writer.add_scalar('train_loss_patches/native_scale_loss', resolution_loss.detach().item(), iteration)
         loss.backward()
         scale_stats = None
         if opt.fixed_lidar and opt.scale_control in ('regularize', 'hybrid'):
@@ -554,7 +562,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                                 record_stats=True, prune=not getattr(opt, 'disable_pruning', False),
                                                 max_world_size=world_threshold,
                                                 preserve_radii=getattr(opt, 'preserve_densification_radii', False),
-                                                protect_nonempty=True)
+                                                protect_nonempty=True, scale_policy=native_scale_policy)
                     except PruningWouldEmptyScene as exc:
                         from pathlib import Path
                         from utils.checkpoint_snapshots import atomic_json, atomic_write
