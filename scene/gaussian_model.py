@@ -654,7 +654,8 @@ class GaussianModel:
         else:
             self.max_radii2D = torch.cat((self.max_radii2D, new_max_radii))
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, preserve_radii=False,\n                         forced_mask=None, scale_policy=None):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, preserve_radii=False,
+                         forced_mask=None, scale_policy=None):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
