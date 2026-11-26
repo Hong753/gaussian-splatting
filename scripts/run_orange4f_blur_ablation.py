@@ -99,6 +99,9 @@ def training_arguments(cfg, opt, initial_point_cloud, output):
     pipe_keys = vars(pipe.extract(defaults))
     values = {k: cfg[k] for k in model_keys}
     values.update({k:cfg.get(k, v) for k,v in pipe_keys.items()})
+    # Legacy reference cfg_args predates the optional native scale controls.
+    from utils.native_scale_control import DEFAULTS as native_scale_defaults
+    values.update({k:v for k,v in native_scale_defaults.items() if k in vars(defaults)})
     values.update(opt)
     values.update(model_path=str(output), initial_point_cloud=str(initial_point_cloud))
     return reproduce_arguments(parser, values)
