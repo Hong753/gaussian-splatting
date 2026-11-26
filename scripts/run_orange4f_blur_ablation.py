@@ -12,6 +12,7 @@ import sys
 
 REFERENCE = Path('/data/3dgs_outputs/orange4f/3dgs_finetuning/original_lidar_full_200k')
 VARIANTS = {
+    'baseline': (False, False, False),
     'split3cm': (True, False, False),
     'noreset': (False, True, False),
     'split3cm_noreset': (True, True, False),
@@ -87,7 +88,7 @@ def reproduce_arguments(parser, values):
     return argv
 
 
-def training_arguments(cfg, opt, reference, output):
+def training_arguments(cfg, opt, initial_point_cloud, output):
     from arguments import ModelParams, OptimizationParams, PipelineParams
     parser = argparse.ArgumentParser(add_help=False)
     model = ModelParams(parser)
@@ -99,7 +100,7 @@ def training_arguments(cfg, opt, reference, output):
     values = {k: cfg[k] for k in model_keys}
     values.update({k:cfg.get(k, v) for k,v in pipe_keys.items()})
     values.update(opt)
-    values.update(model_path=str(output), initial_point_cloud=str(reference/'input.ply'))
+    values.update(model_path=str(output), initial_point_cloud=str(initial_point_cloud))
     return reproduce_arguments(parser, values)
 
 
@@ -153,11 +154,59 @@ def validate_source(reference, cfg, extent):
     print(f'Validated {len(records)} original training cameras; extent={current_extent:.8f}', flush=True)
 
 
+def alternate_source(cfg, source, explicit_cloud, output):
+    """Use the new dataset's own camera model and initialization, never old poses."""
+    from scripts.view_comparisons import read_colmap_records
+    from utils.colmap_paths import colmap_model_dir
+    from utils.densification_diagnostics import training_extent
+    source = source.expanduser().resolve()
+    records = read_colmap_records(source, 'images')
+    for record in records.values():
+        if not Path(record['image_path']).is_file():
+            raise FileNotFoundError(record['image_path'])
+    extent = training_extent(records, set(records))
+    if not math.isfinite(extent) or extent <= 0:
+        raise ValueError('Invalid new dataset scene extent')
+    sparse = colmap_model_dir(source)
+    convert = None
+    if explicit_cloud is not None:
+        cloud = explicit_cloud.expanduser().resolve()
+        if not cloud.is_file():
+            raise FileNotFoundError(cloud)
+    elif (sparse/'points3D.ply').is_file():
+        cloud = sparse/'points3D.ply'
+    else:
+        convert = next((p for p in (sparse/'points3D.bin', sparse/'points3D.txt') if p.is_file()), None)
+        if convert is None:
+            raise FileNotFoundError(f'No points3D.ply, points3D.bin or points3D.txt in {sparse}')
+        # Convert inside the new model directory; never write to the shared
+        # source or make concurrent runs race to create the dataset PLY.
+        cloud = output/'input.ply'
+    new_cfg = dict(cfg, source_path=str(source), images='images', depths='',
+                   keyframe_manifest='', loss_mask_dir='', eval=False,
+                   train_test_exp=False, initial_point_cloud=str(cloud),
+                   training_scene_extent=extent)
+    print(f'New source: {source}; {len(records)} registered training views; '
+          f'extent={extent:.8f}; initialization={convert or cloud}', flush=True)
+    return new_cfg, extent, cloud, convert, len(records)
+
+
+def convert_initial_cloud(source, output):
+    from scene.colmap_loader import read_points3D_binary, read_points3D_text
+    from scene.dataset_readers import storePly
+    from utils.checkpoint_snapshots import atomic_write
+    reader = read_points3D_binary if source.suffix == '.bin' else read_points3D_text
+    xyz, rgb, _ = reader(str(source))
+    atomic_write(output, lambda path: storePly(str(path), xyz, rgb))
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--variant', choices=VARIANTS, required=True)
     p.add_argument('--gpu', type=int, required=True, help='Physical GPU index')
     p.add_argument('--reference', type=Path, default=REFERENCE)
+    p.add_argument('--source', type=Path, help='Alternate COLMAP dataset; defaults to the saved reference source')
+    p.add_argument('--initial-point-cloud', type=Path, help='Optional PLY aligned with --source; default is the new source points3D')
     p.add_argument('--output', type=Path)
     p.add_argument('--render-max-views', type=int, default=0, help='0 renders all saved views after training')
     p.add_argument('--dry-run', action='store_true', help='Print and validate arguments without allocating CUDA or launching training')
@@ -165,13 +214,28 @@ def main(argv=None):
     if args.gpu < 0 or args.render_max_views < 0:
         p.error('GPU and max views must be nonnegative')
     reference = args.reference.expanduser().resolve()
-    output = (args.output or reference.with_name('original_lidar_full_200k_'+args.variant)).expanduser().resolve()
+    if args.initial_point_cloud is not None and args.source is None:
+        p.error('--initial-point-cloud requires --source')
+    prefix = ('colmap_'+args.source.expanduser().resolve().name+'_full_200k_' if args.source is not None
+              else 'original_lidar_full_200k_')
+    output = (args.output or reference.with_name(prefix+args.variant)).expanduser().resolve()
     if output == reference or reference in output.parents or output in reference.parents or output.exists():
         p.error(f'Output must be a fresh separate directory: {output}')
     cfg, extent = read_reference(reference)
+    reference_source = cfg['source_path']
+    reference_extent = extent
+    conversion = None
+    count = 5009
+    initial_cloud = reference/'input.ply'
+    if args.source is not None:
+        new_source = args.source.expanduser().resolve()
+        if output == new_source or new_source in output.parents or output in new_source.parents:
+            p.error('Output must be outside the source dataset')
+        cfg, extent, initial_cloud, conversion, count = alternate_source(
+            cfg, new_source, args.initial_point_cloud, output)
     opt = variant_options(cfg['optimization_settings'], args.variant, extent)
     changes = {k: v for k,v in opt.items() if v != cfg['optimization_settings'][k]}
-    command = [sys.executable, '-u', 'train.py', *training_arguments(cfg,opt,reference,output),
+    command = [sys.executable, '-u', 'train.py', *training_arguments(cfg,opt,initial_cloud,output),
                '--test_iterations', *map(str,STEPS), '--save_iterations', *map(str,STEPS),
                '--checkpoint_iterations', *map(str,STEPS), '--debug_preview_every', '500',
                '--debug_preview_train', '2', '--debug_preview_test', '2', '--debug_preview_seed', '0',
@@ -182,12 +246,20 @@ def main(argv=None):
              '--iteration', '200000', '--views', '12', '--history']
     plan = dict(reference=str(reference), output=str(output), variant=args.variant, gpu=args.gpu,
                 scene_extent=extent, split_sigma=opt['percent_dense']*extent, changed_optimization_settings=changes,
-                commands=[command,render,audit], note='Fresh training from the saved input.ply, not a trained checkpoint.')
+                reference_source=reference_source, reference_extent=reference_extent,
+                source=cfg['source_path'], training_views=count,
+                initial_point_cloud=str(initial_cloud), converted_from=str(conversion) if conversion else None,
+                same_source_as_reference=args.source is None,
+                commands=[command,render,audit],
+                note='Fresh training from unoptimized input points. Alternate source uses its own calibration and points; old reference supplies hyperparameters only.')
     print(json.dumps(plan,indent=2),flush=True)
     if args.dry_run:
         return 0
-    validate_source(reference,cfg,extent)
+    if args.source is None:
+        validate_source(reference,cfg,extent)
     output.mkdir(parents=True,exist_ok=False)
+    if conversion is not None:
+        convert_initial_cloud(conversion, initial_cloud)
     (output/'blur_ablation_plan.json').write_text(json.dumps(plan,indent=2)+'\n')
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(args.gpu))
     for cmd in (command,render,audit):
