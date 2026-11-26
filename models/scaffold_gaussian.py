@@ -20,6 +20,7 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from utils.scaffold_growth import candidate_offsets, new_voxel_mask
+from utils.scaffold_offset_constraints import project_offsets_, validate_offset_radius
 
     
 class ScaffoldGaussianModel:
@@ -92,6 +93,7 @@ class ScaffoldGaussianModel:
         self.optimizer = None
         self.freeze_anchors = False
         self.disable_anchor_growth = False
+        self.offset_max_radius = 0.0
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
@@ -159,6 +161,7 @@ class ScaffoldGaussianModel:
                     spatial_lr_scale=self.spatial_lr_scale, voxel_size=self.voxel_size,
                     exposure_mapping=self.exposure_mapping, freeze_anchors=self.freeze_anchors,
                     disable_anchor_growth=self.disable_anchor_growth,
+                    offset_max_radius=self.offset_max_radius,
                     training_state=getattr(self, 'training_state', None))
 
     def restore(self, model_args, training_args):
@@ -167,6 +170,10 @@ class ScaffoldGaussianModel:
         for name in ('freeze_anchors', 'disable_anchor_growth'):
             if model_args[name] != getattr(training_args, name, False):
                 raise ValueError(f'Checkpoint geometry policy changed: {name}')
+        saved_radius = validate_offset_radius(model_args.get('offset_max_radius', 0.))
+        requested_radius = validate_offset_radius(getattr(training_args, 'offset_max_radius', 0.))
+        if saved_radius != requested_radius:
+            raise ValueError('Checkpoint geometry policy changed: offset_max_radius')
         device = next(self.mlp_color.parameters()).device
         for name, value in model_args['tensors'].items():
             if name.startswith('_'):
@@ -287,6 +294,7 @@ class ScaffoldGaussianModel:
 
 
     def training_setup(self, training_args):
+        self.offset_max_radius = validate_offset_radius(getattr(training_args, 'offset_max_radius', 0.))
         self.freeze_anchors = getattr(training_args, 'freeze_anchors', False)
         self.disable_anchor_growth = getattr(training_args, 'disable_anchor_growth', False)
         self._anchor.requires_grad_(not self.freeze_anchors)
@@ -697,7 +705,13 @@ class ScaffoldGaussianModel:
                 
 
 
+    def project_offsets(self, record_stats=False, chunk_size=65536):
+        """Enforce the optional child radius after Adam and before anchor growth."""
+        return project_offsets_(self._offset, self._scaling, self.offset_max_radius,
+                                record_stats=record_stats, chunk_size=chunk_size)
+
     def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005):
+        anchors_before = len(self.get_anchor)
         # # adding anchors
         grads = self.offset_gradient_accum / self.offset_denom # [N*k, 1]
         grads[grads.isnan()] = 0.0
@@ -706,6 +720,7 @@ class ScaffoldGaussianModel:
         
         if not self.disable_anchor_growth:
             self.anchor_growing(grads_norm, grad_threshold, offset_mask)
+        anchors_after_growth = len(self.get_anchor)
         
         # update offset_denom
         self.offset_denom[offset_mask] = 0
@@ -755,6 +770,10 @@ class ScaffoldGaussianModel:
             self.prune_anchor(prune_mask)
         
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+        self.last_anchor_update = dict(anchors_before=anchors_before,
+            anchors_added=anchors_after_growth - anchors_before,
+            anchors_pruned=anchors_after_growth - len(self.get_anchor),
+            anchors_after=len(self.get_anchor), anchor_growth_enabled=not self.disable_anchor_growth)
 
     def save_mlp_checkpoints(self, path, mode = 'split'):#split or unite
         mkdir_p(os.path.dirname(path))

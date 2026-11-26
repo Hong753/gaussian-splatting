@@ -72,6 +72,8 @@ def preview_render(camera, gaussians, pipe, background, membership=None, **unuse
 
 def train(dataset, opt, pipe, save_iterations, test_iterations, preview_config=None,
           publish=False, start_checkpoint=None):
+    from utils.scaffold_offset_constraints import validate_offset_radius
+    dataset.offset_max_radius = validate_offset_radius(getattr(opt, 'offset_max_radius', 0.))
     sensed_path = getattr(opt, 'sensed_membership', '')
     static = getattr(opt, 'disable_anchor_pruning', False)
     hard = getattr(opt, 'indexed_forward_only', False)
@@ -166,6 +168,9 @@ def train(dataset, opt, pipe, save_iterations, test_iterations, preview_config=N
             loss = loss + weight * hit_loss
         loss.backward()
         with torch.no_grad():
+            anchor_update_due = (adjust and opt.update_from < iteration < opt.update_until
+                                 and iteration % opt.update_interval == 0)
+            log_training = iteration == 1 or iteration % 100 == 0 or iteration == opt.iterations or anchor_update_due
             if adjust and opt.start_stat < iteration < opt.update_until:
                 gaussians.training_statis(result["viewspace_points"], result["neural_opacity"],
                                           result["visibility_filter"], result["selection_mask"], visible)
@@ -177,11 +182,12 @@ def train(dataset, opt, pipe, save_iterations, test_iterations, preview_config=N
                     sensed_step(gaussians.optimizer, active)
             else:
                 gaussians.optimizer.step()
+            projection_stats = gaussians.project_offsets(record_stats=log_training)
             gaussians.optimizer.zero_grad(set_to_none=True)
             if dataset.train_test_exp:
                 gaussians.exposure_optimizer.step()
                 gaussians.exposure_optimizer.zero_grad(set_to_none=True)
-            if adjust and opt.update_from < iteration < opt.update_until and iteration % opt.update_interval == 0:
+            if anchor_update_due:
                 gaussians.adjust_anchor(check_interval=opt.update_interval,
                                          success_threshold=opt.success_threshold,
                                          grad_threshold=opt.densify_grad_threshold,
@@ -194,7 +200,7 @@ def train(dataset, opt, pipe, save_iterations, test_iterations, preview_config=N
                 if hit_alpha is not None:
                     stats.update(hit_alpha=f'{hit_alpha.detach().mean().item():.3f}')
                 bar.set_postfix(stats)
-            if iteration == 1 or iteration % 100 == 0 or iteration == opt.iterations:
+            if log_training:
                 with (Path(dataset.model_path)/'scaffold_training.jsonl').open('a') as stream:
                     coverage = {} if not membership else dict(image=cam.image_name, observation_source=membership.kind,
                         frustum_parents=int(visible.sum()), eligible_parents_in_frustum=int((selected & visible).sum()),
@@ -204,6 +210,9 @@ def train(dataset, opt, pipe, save_iterations, test_iterations, preview_config=N
                     if weight:
                         coverage.update(hit_count=hit_ids.numel(), hit_alpha=hit_alpha.mean().item() if hit_alpha is not None else None,
                                         hit_opacity_loss=hit_loss.item() if hit_loss is not None else None)
+                    coverage.update(projection_stats or {})
+                    if anchor_update_due:
+                        coverage['anchor_update'] = gaussians.last_anchor_update
                     stream.write(json.dumps(dict(**coverage, iteration=iteration, anchors=len(gaussians.get_anchor),
                         active_gaussians=int(result['visibility_filter'].sum()), loss=loss.item(),
                         freeze_anchors=gaussians.freeze_anchors, anchor_growth=not gaussians.disable_anchor_growth))+'\n')

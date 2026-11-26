@@ -89,7 +89,9 @@ def discover_checkpoints(suite):
             ply = folder/'point_cloud.ply'
             if not number.isdecimal() or not ply.is_file() or not ply.stat().st_size:
                 continue
-            if (root/'periodic_evaluation/plan.json').is_file() and not (folder/'ready.json').is_file():
+            publishes = ((root/'periodic_evaluation/plan.json').is_file()
+                         or (root/'scaffold_exposure_plan.json').is_file())
+            if publishes and not (folder/'ready.json').is_file():
                 continue
             # A traced MLP is a zip archive. Its closing directory is written last.
             if all((folder/n).is_file() and zipfile.is_zipfile(folder/n) for n in MLP_FILES):
@@ -272,7 +274,7 @@ class Viewer:
                     self.step.value = str(number)
                     self.load(latest)
             elif self.backend is None and not steps:
-                self.status.content = "Waiting for a saved 3D checkpoint. Orange4F saves at 10k, 20k and 30k."
+                self.status.content = "Waiting for a complete saved checkpoint. The first save depends on this run's schedule."
 
     def refresh_steps(self):
         with self.catalog_lock:

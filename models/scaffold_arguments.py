@@ -6,6 +6,7 @@ class ScaffoldOptimizationParams(ParamGroup):
         self.freeze_anchors = False
         self.disable_anchor_growth = False
         self.disable_anchor_pruning = False
+        self.offset_max_radius = 0.0  # World-space child displacement; 0 leaves offsets unconstrained.
         self.sensed_membership = ""
         self.indexed_forward_only = False
         self.indexed_opacity_weight = 0.0

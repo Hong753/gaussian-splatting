@@ -21,7 +21,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--indexed-opacity', action='store_true')
     parser.add_argument('--offset-sh-degree', type=int, choices=(-1, 0, 1, 2, 3), default=-1)
+    parser.add_argument('--offset-max-radius', type=float, default=0.,
+                        help='Check an optional world-space child displacement limit (0: disabled)')
     args = parser.parse_args()
+    from utils.scaffold_offset_constraints import validate_offset_radius
+    try:
+        validate_offset_radius(args.offset_max_radius)
+    except ValueError as exc:
+        parser.error(str(exc))
     check_opacity = args.indexed_opacity
     from models.scaffold_offset_sh import scaffold_model_class
     model_class = scaffold_model_class(ScaffoldGaussianModel, args.offset_sh_degree)
@@ -40,6 +47,7 @@ def main():
     for fixed in (False, True):
         parser = argparse.ArgumentParser(); params = ScaffoldOptimizationParams(parser)
         opt = params.extract(parser.parse_args(['--position_lr_init', '.00016', '--position_lr_final', '.0000016',
+            '--offset_max_radius', str(args.offset_max_radius),
             *(['--freeze_anchors', '--disable_anchor_growth'] if fixed else [])]))
         model = model_class(feat_dim=8, n_offsets=2, voxel_size=.02, appearance_dim=0, update_init_factor=16)
         model.create_from_pcd(cloud, [camera], 1.)
@@ -47,6 +55,13 @@ def main():
             model.mlp_opacity[2].weight.zero_(); model.mlp_opacity[2].bias.fill_(.5)
         model.training_setup(opt)
         before = model.get_anchor.detach().clone()
+        if args.offset_max_radius:
+            with torch.no_grad():
+                # Force a real violation before testing the rendering path.
+                model._offset[:, 0, 0] = 4 * args.offset_max_radius / model.get_scaling[:, 0]
+            projected = model.project_offsets(record_stats=True)
+            assert projected['offset_projected_children'] == len(before)
+            assert projected['offset_radius_after_projection_max'] <= args.offset_max_radius * (1 + 1e-6)
         for iteration in range(1, 4):
             model.update_learning_rate(iteration)
             result = render(camera, model, pipe, bg, visible_mask=prefilter_voxel(camera, model, pipe, bg), retain_grad=True)
@@ -59,7 +74,9 @@ def main():
             assert all(torch.isfinite(p.grad).all() for g in model.optimizer.param_groups for p in g['params'] if p.grad is not None)
             model.training_statis(result['viewspace_points'], result['neural_opacity'],
                 result['visibility_filter'], result['selection_mask'], prefilter_voxel(camera, model, pipe, bg))
-            model.optimizer.step(); model.optimizer.zero_grad(set_to_none=True)
+            model.optimizer.step()
+            model.project_offsets()
+            model.optimizer.zero_grad(set_to_none=True)
         assert torch.equal(before, model.get_anchor) == fixed
         assert model._offset.abs().max() > 0
         if fixed:
@@ -77,6 +94,7 @@ def main():
             active = torch.zeros_like(visible)
             active[gated['active_parents']] = True
             sensed_step(model.optimizer, active)
+            model.project_offsets()
             model.optimizer.zero_grad(set_to_none=True)
             assert torch.equal(model._offset[~active], rows[~active])
             assert torch.equal(model.optimizer.state[model._offset]['exp_avg'][~active], moment[~active])
@@ -93,6 +111,10 @@ def main():
             model.optimizer.zero_grad(set_to_none=True)
         restored = model_class(feat_dim=8, n_offsets=2, voxel_size=.02, appearance_dim=0, update_init_factor=16)
         restored.restore(model.capture(), opt)
+        assert restored.offset_max_radius == args.offset_max_radius
+        if args.offset_max_radius:
+            radius = torch.linalg.vector_norm(model._offset * model.get_scaling[:, None, :3], dim=-1)
+            assert radius.max() <= args.offset_max_radius * (1 + 1e-6)
         model.eval(); restored.eval()
         with torch.no_grad():
             expected = render(camera, model, pipe, bg)['render']
@@ -108,7 +130,8 @@ def main():
         assert len(empty['radii']) == 0 and torch.isfinite(empty['render']).all()
         empty['render'].sum().backward()
     print(json.dumps(dict(passed=True, antialiasing=False, fixed_and_learnable_anchors=True,
-        learned_offsets=True, optimizer_checkpoint=True, saved_render_parity=True, empty_view_backward=True)))
+        learned_offsets=True, optimizer_checkpoint=True, saved_render_parity=True, empty_view_backward=True,
+        offset_max_radius=args.offset_max_radius, world_offset_projection=bool(args.offset_max_radius))))
     return 0
 
 

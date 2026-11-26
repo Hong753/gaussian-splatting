@@ -83,6 +83,10 @@ GPU 0-3 launch commands. They use this export's `corrected/` directory while
 retaining the original scene calibration and scale-control experiments, with
 new outputs under `scale_control_exposure_v1`.
 
+[ORANGE4F_SCAFFOLD_EXPOSURE.md](ORANGE4F_SCAFFOLD_EXPOSURE.md) provides a matched
+Scaffold-GS suite on the same corrected images: anchor growth on/off crossed
+with unconstrained/bounded child-center displacement, on GPUs 0-3.
+
 ## CPU validation
 
 ```bash
