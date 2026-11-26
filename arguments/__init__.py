@@ -169,6 +169,9 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
+        from utils.native_scale_control import DEFAULTS as native_scale_defaults
+        for name, value in native_scale_defaults.items():
+            setattr(self, name, value)
         self.absgs = False
         self.absgs_split_threshold = 0.0004
         self.surface_mode = "off"
