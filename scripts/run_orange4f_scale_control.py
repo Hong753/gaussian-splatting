@@ -10,6 +10,7 @@ import sys
 
 SOURCE = Path('/data/colmap_scenes/orange4f')
 OUTPUT_ROOT = Path('/data/3dgs_outputs/orange4f/scale_control_v1')
+EXPOSURE_OUTPUT_ROOT = Path('/data/3dgs_outputs/orange4f/scale_control_exposure_v1')
 ROOT = Path(__file__).resolve().parents[1]
 VARIANTS = ('baseline', 'split3cm_noreset', 'size_driven_split', 'size_driven_split_regularized')
 STEPS = [5000,6000,10000,15000,20000,30000,60000,100000,120000]
@@ -50,21 +51,37 @@ def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--variant',choices=VARIANTS,required=True)
     p.add_argument('--gpu',type=int,required=True,help='Physical GPU index')
+    p.add_argument('--exposure-dir',type=Path,
+                   help='Completed normalize_image_exposure output; use its corrected/ images')
+    p.add_argument('--output-root',type=Path,
+                   help='Parent of the variant folder (default: scale_control_exposure_v1 with --exposure-dir, '
+                        'otherwise scale_control_v1)')
     p.add_argument('--initial-point-cloud',type=Path,help='Optional shared PLY already aligned with the source')
     p.add_argument('--render-max-views',type=int,default=0,help='0: all registered training views')
     p.add_argument('--dry-run',action='store_true')
     args=p.parse_args(argv)
     if args.gpu<0 or args.render_max_views<0:
         p.error('GPU and render view count must be nonnegative')
-    out=OUTPUT_ROOT/args.variant
+    output_root=args.output_root or (EXPOSURE_OUTPUT_ROOT if args.exposure_dir else OUTPUT_ROOT)
+    out=(output_root.expanduser()/args.variant).resolve()
+    if out==SOURCE.resolve() or SOURCE.resolve() in out.parents:
+        p.error('Run output must be outside the source dataset')
     if out.exists():
         p.error(f'Refusing to overwrite existing run: {out}')
     from scripts.run_orange4f_blur_ablation import alternate_source,convert_initial_cloud
     from utils.native_scale_control import self_test
     self_test()
     cfg,extent,cloud,conversion,count=alternate_source({},SOURCE,args.initial_point_cloud,out)
+    exposure=None
+    if args.exposure_dir is not None:
+        from utils.exposure_training import validate_exposure_export
+        images,exposure=validate_exposure_export(args.exposure_dir,SOURCE)
+        if out==images or images in out.parents:
+            p.error('Run output must be outside the corrected image directory')
+        cfg['images']=str(images)
     opt=command_options(args.variant,extent)
     command=[sys.executable,'-u','train.py','-s',cfg['source_path'],'-m',str(out),
+             '--images',cfg['images'],
              '-r','1600','--data_device','cpu','--colmap_principal_point',
              '--initial_point_cloud',str(cloud),'--training_scene_extent',str(extent),
              *flags(opt),
@@ -76,7 +93,8 @@ def main(argv=None):
             '--iteration','120000','--gpu',str(args.gpu),'--max-views',str(args.render_max_views)]
     audit=[sys.executable,'-u','-m','scripts.audit_splat_blur','--model',str(out),
            '--iteration','120000','--views','12','--history']
-    plan=dict(source=cfg['source_path'],training_views=count,scene_extent=extent,
+    plan=dict(source=cfg['source_path'],images=cfg['images'],training_views=count,scene_extent=extent,
+              learned_exposure=False,exposure_preprocessing=exposure,
               initial_point_cloud=str(cloud),converted_from=str(conversion) if conversion else None,
               variant=args.variant,gpu=args.gpu,split_sigma=opt['percent_dense']*extent,
               options=opt,commands=[command,render,audit],
@@ -87,6 +105,9 @@ def main(argv=None):
     if args.dry_run:
         return 0
     out.mkdir(parents=True,exist_ok=False)
+    if exposure is not None:
+        from utils.exposure_training import snapshot_exposure_metadata
+        snapshot_exposure_metadata(exposure,out/'exposure_preprocessing')
     if conversion is not None:
         convert_initial_cloud(conversion,cloud)
     (out/'scale_control_plan.json').write_text(json.dumps(plan,indent=2)+'\n')

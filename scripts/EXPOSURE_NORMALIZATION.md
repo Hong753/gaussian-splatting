@@ -76,6 +76,13 @@ Pose-only camera exports are insufficient. Input image dimensions must match
 the model. `--allow-resized` is available only for a known full-frame resize;
 do not use it to disguise a crop or a mismatched image set.
 
+## Train with the completed export
+
+[ORANGE4F_EXPOSURE_TRAINING.md](ORANGE4F_EXPOSURE_TRAINING.md) contains the four
+GPU 0-3 launch commands. They use this export's `corrected/` directory while
+retaining the original scene calibration and scale-control experiments, with
+new outputs under `scale_control_exposure_v1`.
+
 ## CPU validation
 
 ```bash
